@@ -1966,6 +1966,7 @@ monitor = [
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
+    { name = "packaging" },
     { name = "pip-audit" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -1986,6 +1987,7 @@ provides-extras = ["monitor"]
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=1.15,<2" },
+    { name = "packaging", specifier = ">=24,<27" },
     { name = "pip-audit", specifier = ">=2.8,<3" },
     { name = "pytest", specifier = ">=8.0,<10.0" },
     { name = "pytest-cov", specifier = ">=6,<8" },
