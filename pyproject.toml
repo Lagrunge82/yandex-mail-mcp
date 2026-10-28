@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-monitor = ["openai>=2.0,<3.0"]
+monitor = ["openai>=3.37.0,<4.0"]
 
 [dependency-groups]
 dev = [
