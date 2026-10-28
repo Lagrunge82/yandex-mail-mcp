@@ -54,6 +54,27 @@ The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a b
 
 ## Run background monitoring with Docker
 
+CI publishes `ghcr.io/lagrunge82/yandex-mail-mcp` for Linux amd64 and arm64 after
+the checks pass on `main` or a `v*` tag. When a push to `main` increases
+`project.version` in `pyproject.toml`, CI creates the matching Git tag (for
+example `v0.1.1`) and publishes the image with that tag. A conflicting existing
+Git tag fails the workflow instead of being moved. The GitHub Actions token does
+not trigger another workflow for the new tag, so the same run publishes the
+versioned image. Versions must be valid Docker tags (PEP 440 local versions with
+`+` are unsupported). The `main` image also has the `latest` and commit-SHA tags;
+manually pushed `v*` tags produce matching image tags. Each publication
+also gets a unique `build-<run_id>-<run_attempt>` tag. Registry tags can still be
+overwritten; for a strictly immutable deployment, use the `image@sha256:...` digest
+reference recorded in the workflow run summary. Package visibility
+is managed in GitHub Packages; access to a private image requires registry login.
+For example, after the first publication:
+
+```bash
+docker pull ghcr.io/lagrunge82/yandex-mail-mcp:latest
+```
+
+The Compose commands below build the image locally.
+
 ```bash
 cp .env.example .env
 # Edit the credentials. For the monitor, set OPENAI_API_KEY as well.
