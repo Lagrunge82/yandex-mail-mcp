@@ -22,7 +22,7 @@ monitor = ["openai>=2.0,<3.0"]
 
 [dependency-groups]
 dev = [
-    "mypy>=1.15,<2",
+    "mypy>=2.4.0,<3",
     "packaging>=24,<27",
     "pip-audit>=2.8,<3",
     "pytest>=8.0,<10.0",
