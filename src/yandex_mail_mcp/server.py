@@ -51,7 +51,7 @@ from .auth_server import (
     YandexAuthProvider,
 )
 from .config import ConfigurationError, Settings, env_int
-from .credentials import OAuthCredentials, StaticTokenSource
+from .credentials import OAuthCredentials, ReauthenticationRequired, StaticTokenSource
 from .crypto import TokenCipher
 from .mail import Draft, Mailbox, MailError, MailSummary, ThreadMessage
 from .yandex_oauth import YandexOAuth, YandexOAuthError, can_write
@@ -200,6 +200,9 @@ def tool_errors(fn: F) -> F:
             return {}
 
     def translate(exc: Exception) -> ToolError | None:
+        if isinstance(exc, ReauthenticationRequired):
+            # Written for the user: the reason and how to sign in again.
+            return ToolError(str(exc))
         if isinstance(exc, LoginError):
             return ToolError(
                 "IMAP authentication failed; check your credentials and whether IMAP is enabled"
@@ -337,6 +340,7 @@ def build_oauth_app(
 
 
 HTTP_REAUTH_HINT = "reconnect this server in your MCP client and allow full mail access"
+HTTP_RELOGIN_HINT = "sign in again by reconnecting this server in your MCP client"
 
 
 def _signed_in() -> tuple[AccessToken | None, dict[str, Any]]:
@@ -368,6 +372,7 @@ def _mailbox() -> Mailbox:
             str(claims["yandex_email"]),
             StaticTokenSource(str(claims["yandex_access_token"]), str(claims["yandex_scope"])),
             reauth_hint=HTTP_REAUTH_HINT,
+            relogin_hint=HTTP_RELOGIN_HINT,
         )
         key = ("user", str(claims["yandex_login"]))
         with _mailboxes_lock:

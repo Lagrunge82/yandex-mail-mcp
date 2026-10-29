@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- When a Yandex OAuth token stops working, tools report why and how to sign in again (`yandex-mail-mcp login`, a fresh `YANDEX_OAUTH_TOKEN`, or reconnecting the server in the MCP client) instead of the generic "IMAP authentication failed" message meant for passwords.
+
 ## 0.5.0
 
 ### Added
