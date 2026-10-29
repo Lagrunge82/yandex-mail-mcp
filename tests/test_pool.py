@@ -46,8 +46,10 @@ class FakeIMAP:
         self._imap.state = "SELECTED"
 
     def unselect_folder(self):
+        # Like IMAPClient: sends UNSELECT but leaves imaplib's state as it was.
         self.calls.append("unselect")
-        self._imap.state = "AUTH"
+        if self._imap.state != "SELECTED":
+            raise imaplib.IMAP4.error("UNSELECT command error: BAD [b'No mailbox selected']")
 
     def search(self, criteria, charset=None):
         return [3]
@@ -198,3 +200,37 @@ def test_server_lifespan_closes_pools(monkeypatch, fake_imap):
     asyncio.run(run())
     assert fake_imap[0].closed
     assert server._mailboxes == {}
+
+
+def test_unselect_then_call_without_select_keeps_connection(fake_imap):
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    with box.connect() as imap:
+        imap.select_folder("INBOX", readonly=True)
+    box.folders()
+    box.folders()
+    assert len(fake_imap) == 1
+    assert fake_imap[0].calls.count("unselect") == 1
+    assert not fake_imap[0].closed
+
+
+def test_mail_error_keeps_healthy_connection(fake_imap):
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    for _ in range(3):
+        with pytest.raises(MailError, match="not found"):
+            box.move(3, "Missing")
+    assert len(fake_imap) == 1
+    assert fake_imap[0].logins == 1
+
+
+def test_checkin_failure_does_not_replace_the_result(fake_imap):
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+
+    def capability(name):
+        raise imaplib.IMAP4.abort("socket error: EOF")
+
+    with box.connect() as imap:
+        imap.has_capability = capability
+        imap.select_folder("INBOX", readonly=False)
+    assert fake_imap[0].closed
+    box.folders()
+    assert len(fake_imap) == 2

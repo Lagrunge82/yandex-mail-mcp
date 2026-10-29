@@ -83,6 +83,8 @@ class ThreadMessage(MailSummary):
 
 
 _MESSAGE_ID = re.compile(r"<[^<>\s]+>")
+# Printable ASCII without IMAP atom-specials, so a SEARCH can send the id as an atom.
+_SEARCHABLE_ID = re.compile(r"<[!#$&'+,\-./0-9:;=?@A-Z\[^_`a-z|}~]+>")
 
 
 class MailError(Exception):
@@ -482,6 +484,10 @@ class ConnectionPool:
             imap = self._checkout()
             try:
                 yield imap
+            except MailError:
+                # Raised by this package between complete commands: the session is fine.
+                self._checkin(imap)
+                raise
             except BaseException:
                 _close(imap)
                 raise
@@ -507,19 +513,27 @@ class ConnectionPool:
             return imap
 
     def _checkin(self, imap: IMAPClient) -> None:
+        """Return a connection to the pool, or close it; never raise.
+
+        The caller's command has already completed, so a failure here must not
+        replace its result.
+        """
         if self._closed:
             _close(imap)
             return
-        if _selected(imap):
-            # CLOSE would expunge messages marked deleted, so only UNSELECT is safe.
-            if not imap.has_capability("UNSELECT"):
-                _close(imap)
-                return
-            try:
+        try:
+            if _selected(imap):
+                # CLOSE would expunge messages marked deleted, so only UNSELECT is safe.
+                if not imap.has_capability("UNSELECT"):
+                    _close(imap)
+                    return
                 imap.unselect_folder()
-            except (imaplib.IMAP4.error, OSError):
-                _close(imap)
-                return
+                # IMAPClient sends UNSELECT without updating imaplib's state.
+                imap._imap.state = "AUTH"
+        except Exception as exc:
+            LOG.info("Closing an IMAP connection that could not be reset: %s", exc)
+            _close(imap)
+            return
         self._idle.put((imap, self._clock()))
 
     def close(self) -> None:
@@ -785,10 +799,7 @@ class Mailbox:
             origin = self._headers(imap, uid, folder)
             folders = [folder]
             for flags, _, name in imap.list_folders():
-                special = {
-                    str(flag.decode() if isinstance(flag, bytes) else flag) for flag in flags
-                }
-                if (name.upper() == "INBOX" or "\\Sent" in special) and all(
+                if (name.upper() == "INBOX" or "\\sent" in _flag_names(flags)) and all(
                     name.casefold() != known.casefold() for known in folders
                 ):
                     folders.append(name)
@@ -799,13 +810,20 @@ class Mailbox:
             searched: set[str] = set()
             while len(found) < limit and (pending := sorted(known - searched)):
                 searched.update(pending)
+                # IMAPClient sends other ids unquoted or as us-ascii; skipping them
+                # loses only links that no other id in the thread provides.
+                pending = [value for value in pending if _SEARCHABLE_ID.fullmatch(value)]
                 for name in folders:
+                    if not pending or len(found) >= limit:
+                        break
                     imap.select_folder(name, readonly=True)
                     uids: set[int] = set()
                     for start in range(0, len(pending), 10):
                         uids.update(imap.search(_thread_criteria(pending[start : start + 10])))
                     new = sorted(u for u in uids if (name, u) not in found)
-                    for message in self._fetch(imap, new, max_body_chars=2000):
+                    for message in self._fetch(
+                        imap, new[: limit - len(found)], max_body_chars=2000
+                    ):
                         found[(name, message["uid"])] = {**message, "folder": name}
                         known |= _thread_ids(message)
         unique: dict[str, ThreadMessage] = {}
@@ -872,10 +890,7 @@ class Mailbox:
             raise MailValueError("Promotions folder name is ambiguous")
         if matching:
             flags, _, folder = matching[0]
-            special = {
-                str(flag.decode() if isinstance(flag, bytes) else flag).casefold() for flag in flags
-            }
-            if special & {
+            if _flag_names(flags) & {
                 "\\trash",
                 "\\junk",
                 "\\drafts",
@@ -891,11 +906,12 @@ class Mailbox:
         return folder, bool(matching)
 
     @staticmethod
-    def _destination(imap: IMAPClient, folder: str) -> str:
+    def _destination(imap: IMAPClient, folder: str, listing: Any = None) -> str:
         """Check that mail may be moved into an existing folder; return its server name.
 
         Moves never create folders and never target Trash, Spam, Drafts, Sent,
         virtual folders, or folders nested inside Trash, Spam, Drafts or Sent.
+        listing is a LIST result the caller already has, to avoid a second LIST.
         """
         folder = folder.strip()
         if not folder:
@@ -906,7 +922,7 @@ class Mailbox:
                 delimiter.decode() if isinstance(delimiter, bytes) else delimiter,
                 str(name),
             )
-            for flags, delimiter, name in imap.list_folders()
+            for flags, delimiter, name in (imap.list_folders() if listing is None else listing)
         }
         if folder.casefold() not in folders:
             raise MailLookupError(f"Folder {folder!r} not found; moves do not create folders")
@@ -930,11 +946,12 @@ class Mailbox:
         return name
 
     def _archive_destination(self, imap: IMAPClient) -> str:
+        listing = imap.list_folders()
         if self.config.archive_folder:
-            return self._destination(imap, self.config.archive_folder)
-        for flags, _, name in imap.list_folders():
+            return self._destination(imap, self.config.archive_folder, listing)
+        for flags, _, name in listing:
             if "\\archive" in _flag_names(flags):
-                return self._destination(imap, str(name))
+                return self._destination(imap, str(name), listing)
         raise MailLookupError(
             "No archive folder found: the server marks no folder \\Archive. "
             "Set YANDEX_ARCHIVE_FOLDER to an existing folder"
@@ -1107,8 +1124,7 @@ class Mailbox:
 
     def move_to_promotions(self, uid: int, confirm: bool = False) -> dict[str, Any]:
         valid_uid(uid)
-        if not self.config.allow_write:
-            raise MailPermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
+        self._require_write()
         if confirm is not True:
             raise MailPermissionError("Explicit confirm=true is required to move a message")
         self._promotions_folder_name()
@@ -1116,8 +1132,6 @@ class Mailbox:
             folder, exists = self.validate_promotions_folder(imap)
             if not exists:
                 imap.create_folder(folder)
-            imap.select_folder("INBOX", readonly=False)
-            if uid not in imap.search(["UID", str(uid)]):
-                raise MailLookupError(f"Message UID {uid} not found in INBOX")
+            self._select_message(imap, uid, "INBOX")
             imap.move([uid], folder)
         return {"uid": uid, "moved_to": folder, "deleted_permanently": False}

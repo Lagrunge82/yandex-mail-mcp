@@ -277,3 +277,15 @@ def test_tools_have_mutation_annotations():
         annotations = tools[name]
         assert annotations.read_only_hint is False, name
         assert annotations.destructive_hint is False, name
+
+
+def test_archive_lists_folders_once_per_connection():
+    imap = WriteIMAP()
+    calls = []
+    folders = imap.list_folders
+    imap.list_folders = lambda: calls.append(1) or folders()
+    box = box_with(imap, allow_write=True)
+    box.preview_move(3, None)
+    assert len(calls) == 1
+    box.move(3, None)
+    assert len(calls) == 2
