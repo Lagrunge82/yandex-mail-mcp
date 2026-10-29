@@ -32,10 +32,11 @@ from mcp.server.auth.provider import (
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .crypto import TokenCipher
-from .yandex_oauth import YandexOAuth, YandexOAuthError, can_write, requested_scope
+from .yandex_oauth import YandexOAuth, YandexOAuthError, YandexUser, can_write, requested_scope
 
 LOG = logging.getLogger(__name__)
 
@@ -100,6 +101,51 @@ class ClientStore:
         self._db.close()
 
 
+class RateLimit:
+    """At most `limit` requests per client IP and minute to the given paths.
+
+    In memory, like the rest of the server's state: a restart resets the counts.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        paths: frozenset[str],
+        limit: int,
+        window: float = 60,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.app = app
+        self.paths = paths
+        self.limit = limit
+        self.window = window
+        self._clock = clock
+        self._hits: dict[str, tuple[float, int]] = {}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("path") in self.paths:
+            now = self._clock()
+            if len(self._hits) > 10_000:
+                self._hits = {
+                    ip: hit for ip, hit in self._hits.items() if now - hit[0] < self.window
+                }
+            ip = str((scope.get("client") or ("unknown",))[0])
+            started, count = self._hits.get(ip, (now, 0))
+            if now - started >= self.window:
+                started, count = now, 0
+            self._hits[ip] = (started, count + 1)
+            if count + 1 > self.limit:
+                retry = max(1, int(self.window - (now - started)))
+                response = JSONResponse(
+                    {"error": "too_many_requests", "error_description": "Retry later"},
+                    status_code=429,
+                    headers={"Retry-After": str(retry)},
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 class YandexAuthorizationCode(AuthorizationCode):
     grant: dict[str, Any]
     jti: str
@@ -130,6 +176,7 @@ class YandexAuthProvider(
         oauth: YandexOAuth,
         public_url: str,
         allow_write: bool,
+        allowed_users: frozenset[str] = frozenset(),
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.cipher = cipher
@@ -138,6 +185,8 @@ class YandexAuthProvider(
         self.public_url = public_url.rstrip("/")
         self.resource = f"{self.public_url}/mcp"
         self.allow_write = allow_write
+        # Casefolded Yandex logins or addresses; empty lets nobody in.
+        self.allowed_users = frozenset(user.casefold() for user in allowed_users)
         self._clock = clock
         # jti of exchanged authorization codes, until they expire anyway.
         self._used_codes: dict[str, float] = {}
@@ -206,9 +255,26 @@ class YandexAuthProvider(
         response.delete_cookie(NONCE_COOKIE, path=CALLBACK_PATH)
         return response
 
-    async def check_user(self, login: str, yandex_token: str) -> str | None:
-        """An error message when this Yandex user may not sign in, else None."""
-        return None
+    async def check_user(self, user: YandexUser, yandex_token: str) -> str | None:
+        """An error message when this Yandex user may not sign in, else None.
+
+        A refused user's Yandex token is revoked at once and goes nowhere.
+        """
+        if not self.allowed_users:
+            message = (
+                "This server lets no one sign in yet: its operator must list the allowed "
+                "Yandex logins in MCP_ALLOWED_USERS."
+            )
+        elif {user.login.casefold(), user.email.casefold()} & self.allowed_users:
+            return None
+        else:
+            message = f"The Yandex account {user.login} is not allowed on this server."
+        LOG.warning("Refused sign-in for Yandex login %s", user.login)
+        try:
+            await anyio.to_thread.run_sync(lambda: self.oauth.revoke(yandex_token))
+        except YandexOAuthError as exc:
+            LOG.warning("Could not revoke the refused user's token: %s", exc.error)
+        return message
 
     async def callback(self, request: Request) -> Response:
         payload = self.cipher.open(request.query_params.get("state", ""), "state")
@@ -235,7 +301,7 @@ class YandexAuthProvider(
             return self._client_redirect(
                 payload, error="server_error", error_description="Yandex rejected the sign-in"
             )
-        if (denied := await self.check_user(user.login, tokens.access_token)) is not None:
+        if (denied := await self.check_user(user, tokens.access_token)) is not None:
             return _page(denied, status=403)
         grant = {
             "yandex_access_token": tokens.access_token,
