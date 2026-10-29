@@ -564,6 +564,23 @@ class ConnectionPool:
 
 
 MAX_DRAFT_BODY = 100 * 1024
+# Messages one move_emails call may take: enough to clear a backlog, few enough that
+# the confirmation list is still read rather than skimmed.
+MAX_BATCH_MOVE = 25
+
+
+def batch_uids(uids: list[int]) -> list[int]:
+    """Validate a batch of UIDs: positive integers, no duplicates, 1 to MAX_BATCH_MOVE."""
+    if not isinstance(uids, list) or not uids:
+        raise MailValueError("uids must list at least one message UID")
+    unique: list[int] = []
+    for uid in uids:
+        valid_uid(uid, "uids")
+        if uid not in unique:
+            unique.append(uid)
+    if len(unique) > MAX_BATCH_MOVE:
+        raise MailValueError(f"uids may list at most {MAX_BATCH_MOVE} messages per call")
+    return unique
 
 
 @dataclass(frozen=True)
@@ -1109,6 +1126,60 @@ class Mailbox:
         imap.select_folder(folder, readonly=False)
         if uid not in imap.search(["UID", str(uid)]):
             raise MailLookupError(f"Message UID {uid} not found in {folder}")
+
+    @staticmethod
+    def _select_messages(imap: IMAPClient, uids: list[int], folder: str) -> None:
+        imap.select_folder(folder, readonly=False)
+        present = set(imap.search(["UID", ",".join(str(uid) for uid in uids)]))
+        missing = [uid for uid in uids if uid not in present]
+        if missing:
+            raise MailLookupError(
+                f"Messages not found in {folder}: UID {', '.join(map(str, missing))}"
+            )
+
+    @staticmethod
+    def _headers_many(imap: IMAPClient, uids: list[int], folder: str) -> list[MailSummary]:
+        """The headers of every UID, in the given order; any missing one is an error."""
+        imap.select_folder(folder, readonly=True)
+        fetched = imap.fetch(uids, ["BODY.PEEK[HEADER]"])
+        summaries: list[MailSummary] = []
+        missing: list[int] = []
+        for uid in uids:
+            raw = fetched.get(uid, {}).get(b"BODY[HEADER]")
+            if isinstance(raw, bytes):
+                summaries.append(parse_message(raw, uid, max_body_chars=0))
+            else:
+                missing.append(uid)
+        if missing:
+            raise MailLookupError(
+                f"Messages not found in {folder}: UID {', '.join(map(str, missing))}"
+            )
+        return summaries
+
+    def preview_moves(
+        self, uids: list[int], folder: str, source_folder: str = "INBOX"
+    ) -> tuple[list[MailSummary], str]:
+        """Validate a batch move and read every message's headers for the confirmation."""
+        uids = batch_uids(uids)
+        with self.connect() as imap:
+            destination = self._destination(imap, folder)
+            if destination.casefold() == source_folder.strip().casefold():
+                raise MailValueError("The messages are already in that folder")
+            return self._headers_many(imap, uids, source_folder), destination
+
+    def move_many(
+        self, uids: list[int], folder: str, source_folder: str = "INBOX"
+    ) -> dict[str, Any]:
+        """Move a batch of messages with one MOVE; all of them, or none."""
+        uids = batch_uids(uids)
+        self._require_write()
+        with self.connect() as imap:
+            destination = self._destination(imap, folder)
+            if destination.casefold() == source_folder.strip().casefold():
+                raise MailValueError("The messages are already in that folder")
+            self._select_messages(imap, uids, source_folder)
+            imap.move(uids, destination)
+        return {"uids": uids, "folder": destination, "action": "move", "reversible": True}
 
     def preview_move(
         self, uid: int, folder: str | None = None, source_folder: str = "INBOX"

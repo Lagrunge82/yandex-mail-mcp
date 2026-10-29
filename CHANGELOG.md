@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `move_emails`: move up to 25 messages from one folder to another with a single confirmation that lists every message's sender and subject. One IMAP `MOVE` moves the whole batch or nothing; the same folder rules, write checks and audit apply as for `move_email`.
+
 ## 0.6.0
 
 ### Deprecated
