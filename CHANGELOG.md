@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
+
+### Deprecated
+
+- `YANDEX_APP_PASSWORD` and `MCP_AUTH_TOKEN` stay for one more release and will be removed in 0.7.0, not 0.6.0 as announced earlier.
 
 ### Fixed
 
@@ -39,8 +43,8 @@
 
 ### Deprecated
 
-- `YANDEX_APP_PASSWORD`: works only with the stdio transport and logs a warning. It will be removed in 0.6.0; use `yandex-mail-mcp login`.
-- `MCP_AUTH_TOKEN` and its single shared bearer token: will be removed in 0.6.0; use `MCP_PUBLIC_URL`.
+- `YANDEX_APP_PASSWORD`: works only with the stdio transport and logs a warning. It will be removed in 0.7.0 (originally announced for 0.6.0); use `yandex-mail-mcp login`.
+- `MCP_AUTH_TOKEN` and its single shared bearer token: will be removed in 0.7.0 (originally announced for 0.6.0); use `MCP_PUBLIC_URL`.
 
 ### Removed
 
