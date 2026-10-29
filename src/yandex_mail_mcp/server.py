@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import logging
 import imaplib
@@ -9,6 +10,7 @@ import hmac
 import inspect
 import json
 import re
+import socket
 import ssl
 from functools import lru_cache, wraps
 
@@ -46,6 +48,23 @@ def _imap_address() -> str:
     return f"IMAP server {settings.imap_host}:{settings.imap_port}"
 
 
+NETWORK_ERRNOS = {
+    errno.ENETDOWN,
+    errno.ENETUNREACH,
+    errno.EHOSTDOWN,
+    errno.EHOSTUNREACH,
+    errno.EADDRNOTAVAIL,
+}
+
+
+RESET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError)
+
+
+def _os_reason(exc: OSError) -> str:
+    """The OS or TLS error text, which carries no secrets."""
+    return exc.strerror or " ".join(map(str, exc.args)) or type(exc).__name__
+
+
 def tool_errors(fn):
     def translate(exc):
         if isinstance(exc, LoginError):
@@ -61,15 +80,20 @@ def tool_errors(fn):
             return ToolError(str(exc))
         if isinstance(exc, TimeoutError):
             return ToolError("IMAP connection timed out; please retry")
+        # imaplib does not wrap read errors, so a dropped session surfaces here.
+        if isinstance(exc, RESET_ERRORS):
+            return ToolError("IMAP connection was reset; please retry")
         if isinstance(exc, ssl.SSLError):
             return ToolError(
-                f"TLS handshake with {_imap_address()} failed; "
+                f"TLS error with {_imap_address()} ({_os_reason(exc)}); "
                 "check YANDEX_IMAP_HOST and the certificate chain"
             )
-        if isinstance(exc, OSError):
+        if isinstance(exc, (ConnectionError, socket.gaierror, socket.herror)) or (
+            isinstance(exc, OSError) and exc.errno in NETWORK_ERRNOS
+        ):
             return ToolError(
-                f"Cannot connect to {_imap_address()}; "
-                "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access"
+                f"Connection to {_imap_address()} failed ({_os_reason(exc)}); "
+                "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access, then retry"
             )
         return None
 

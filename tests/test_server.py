@@ -53,13 +53,13 @@ def test_imap_error_reaches_client(monkeypatch):
 @pytest.mark.parametrize(
     ("error", "message"),
     [
-        (ConnectionRefusedError(111, "Connection refused"), "Cannot connect to IMAP server"),
-        (socket.gaierror(-2, "Name or service not known"), "Cannot connect to IMAP server"),
-        (ssl.SSLCertVerificationError("certificate verify failed"), "TLS handshake"),
-        (TimeoutError(), "timed out"),
+        (ConnectionRefusedError(111, "Connection refused"), r"failed \(Connection refused\)"),
+        (socket.gaierror(-2, "Name or service not known"), "Name or service not known"),
+        (OSError(113, "No route to host"), "No route to host"),
+        (ssl.SSLCertVerificationError("certificate verify failed"), "certificate verify failed"),
     ],
 )
-def test_connection_errors_reach_client(monkeypatch, error, message):
+def test_connection_errors_reach_client_with_reason(monkeypatch, error, message):
     class Box:
         def folders(self):
             raise error
@@ -72,8 +72,47 @@ def test_connection_errors_reach_client(monkeypatch, error, message):
     )
     with pytest.raises(ToolError, match=message) as raised:
         asyncio.run(server.mcp.call_tool("list_folders", {}))
-    if isinstance(error, OSError) and not isinstance(error, TimeoutError):
-        assert "imap.example:993" in str(raised.value)
+    assert "imap.example:993" in str(raised.value)
+    assert "YANDEX_IMAP_HOST" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        BrokenPipeError(32, "Broken pipe"),
+        ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+    ],
+)
+def test_dropped_session_is_reported_as_reset(monkeypatch, error):
+    class Box:
+        def folders(self):
+            raise error
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match="IMAP connection was reset; please retry$") as raised:
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
+    assert "YANDEX_IMAP" not in str(raised.value)
+
+
+def test_timeout_reaches_client(monkeypatch):
+    class Box:
+        def folders(self):
+            raise TimeoutError()
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match="timed out"):
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
+
+
+def test_non_network_oserror_is_not_reported_as_connection_error(monkeypatch):
+    class Box:
+        def folders(self):
+            raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(PermissionError):
+        server.list_folders()
 
 
 def test_mail_permission_error_is_not_reported_as_connection_error(monkeypatch):
@@ -96,7 +135,9 @@ def test_connection_error_without_settings_reaches_client(monkeypatch):
 
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
     monkeypatch.setattr(server, "_settings", settings)
-    with pytest.raises(ToolError, match="Cannot connect to the IMAP server; check"):
+    with pytest.raises(
+        ToolError, match=r"Connection to the IMAP server failed \(Connection refused\)"
+    ):
         server.list_folders()
 
 
