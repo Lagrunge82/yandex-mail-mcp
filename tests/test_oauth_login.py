@@ -459,11 +459,21 @@ def loopback():
 
 
 def visit(url):
+    """Fetch url like a browser tab and return the status, or the error as text.
+
+    Returning instead of raising keeps a browser thread's failure visible in the
+    test's assertions rather than lost in a dead thread.
+    """
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with urllib.request.urlopen(url, timeout=30) as response:
             return response.status
     except urllib.error.HTTPError as exc:
+        # Close now: an unread body closed by the garbage collector resets the
+        # connection at an arbitrary moment.
+        exc.close()
         return exc.code
+    except OSError as exc:  # URLError is an OSError
+        return f"error: {exc}"
 
 
 def browser_returning(**params):
@@ -529,7 +539,8 @@ def test_wrong_state_is_refused_and_the_real_callback_still_works(tmp_path):
         callback = query["redirect_uri"]
 
         def browse():
-            # A stale tab with another attempt's state arrives first.
+            # A stale tab with another attempt's state arrives first; the real
+            # callback follows only after that tab has its answer.
             statuses.append(visit(f"{callback}?state=forged&code=stolen"))
             real = urllib.parse.urlencode({"state": query["state"], "code": "real"})
             statuses.append(visit(f"{callback}?{real}"))
@@ -546,8 +557,10 @@ def test_wrong_state_is_refused_and_the_real_callback_still_works(tmp_path):
         server=loopback(),
     )
     assert [code for code, _ in oauth.exchanged] == ["real"]
-    # login returns once the server has answered; the browser may still be reading.
-    browsers[0].join(timeout=5)
+    # login returns once the server has answered; the browser may still be reading
+    # the answer, so wait for it rather than for a fixed time.
+    browsers[0].join(timeout=30)
+    assert not browsers[0].is_alive(), "the browser thread did not finish"
     assert statuses == [400, 200]
 
 
