@@ -1,9 +1,10 @@
+import imaplib
 from contextlib import contextmanager
 
 import pytest
 
 from yandex_mail_mcp.config import Settings
-from yandex_mail_mcp.mail import Mailbox, MailValueError, parse_message
+from yandex_mail_mcp.mail import Mailbox, MailValueError, _base_subject, parse_message
 
 TEXT = (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"7BIT", 4, 1, None, None)
 
@@ -20,10 +21,13 @@ def header(message_id, date, in_reply_to="", references=""):
 class ThreadIMAP:
     """Evaluates the SEARCH keys get_thread and pagination use over in-memory folders."""
 
-    def __init__(self, folders):
+    def __init__(self, folders, message_id_error=False):
         self.folders = folders
         self.selected = None
         self.searches = []
+        # Like Yandex, which can fail HEADER Message-ID while other headers work.
+        self.message_id_error = message_id_error
+        self.header_field_fetches = []
 
     def list_folders(self):
         return [
@@ -38,6 +42,8 @@ class ThreadIMAP:
 
     def search(self, criteria, charset=None):
         self.searches.append((self.selected, criteria))
+        if self.message_id_error and "Message-ID" in criteria:
+            raise imaplib.IMAP4.error("SEARCH failed: [UNAVAILABLE] UID SEARCH Backend error.")
         tokens = list(criteria)
         predicates = []
         while tokens:
@@ -62,6 +68,12 @@ class ThreadIMAP:
         if token == "UID":
             low, high = map(int, tokens.pop(0).split(":"))
             return lambda uid, raw: low <= uid <= high
+        if token == "SUBJECT":
+            value = tokens.pop(0).casefold()
+            return lambda uid, raw: any(
+                line.lower().startswith("subject:") and value in line.casefold()
+                for line in raw.decode().splitlines()
+            )
         if token == "TEXT":
             value = tokens.pop(0)
             return lambda uid, raw: value in raw.decode()
@@ -75,6 +87,20 @@ class ThreadIMAP:
         folder = self.folders[self.selected]
         if fields == ["BODY.PEEK[HEADER]"]:
             return {uid: {b"BODY[HEADER]": folder[uid]} for uid in uids if uid in folder}
+        if fields == ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"]:
+            self.header_field_fetches.append(list(uids))
+            return {
+                uid: {
+                    # Spelled as some servers echo it, with the field name quoted.
+                    b'BODY[HEADER.FIELDS ("MESSAGE-ID")]': b"".join(
+                        line + b"\r\n"
+                        for line in folder[uid].splitlines()
+                        if line.lower().startswith(b"message-id:")
+                    )
+                }
+                for uid in uids
+                if uid in folder
+            }
         if fields == ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"]:
             return {
                 uid: {b"BODY[HEADER]": folder[uid], b"BODYSTRUCTURE": TEXT}
@@ -128,17 +154,13 @@ def test_thread_is_collected_from_any_message(folder, uid):
     assert result[2]["references"] == ["<a@x>", "<b@x>"]
 
 
-def test_thread_searches_identifiers_with_one_or_chain_per_folder():
+def test_thread_searches_replies_and_parents_separately():
     imap = ThreadIMAP(conversation())
     mailbox(imap).thread(1)
-    folder, criteria = imap.searches[0]
+    (folder, replies), (_, parents) = imap.searches[:2]
     assert folder == "INBOX"
-    assert criteria == [
+    assert replies == [
         "OR",
-        "OR",
-        "HEADER",
-        "Message-ID",
-        "<a@x>",
         "HEADER",
         "In-Reply-To",
         "<a@x>",
@@ -146,6 +168,7 @@ def test_thread_searches_identifiers_with_one_or_chain_per_folder():
         "References",
         "<a@x>",
     ]
+    assert parents == ["HEADER", "Message-ID", "<a@x>"]
     assert {folder for folder, _ in imap.searches} == {"INBOX", "Отправленные"}
 
 
@@ -241,3 +264,63 @@ def test_thread_fetches_at_most_limit_messages():
     imap.fetch = recording_fetch
     assert len(mailbox(imap).thread(1, limit=5)) == 5
     assert fetched == [4]
+
+
+@pytest.mark.parametrize(("folder", "uid"), [("INBOX", 1), ("Отправленные", 7), ("INBOX", 2)])
+def test_thread_survives_yandex_message_id_backend_error(folder, uid):
+    imap = ThreadIMAP(conversation(), message_id_error=True)
+    result = mailbox(imap).thread(uid, folder=folder)
+    assert [(item["folder"], item["uid"]) for item in result] == [
+        ("INBOX", 1),
+        ("Отправленные", 7),
+        ("INBOX", 2),
+    ]
+    # Message-ID is tried once per call; then parents are found by subject.
+    assert sum("Message-ID" in criteria for _, criteria in imap.searches) == 1
+    assert ["SUBJECT", "Договор"] in [criteria for _, criteria in imap.searches]
+
+
+def test_subject_fallback_matches_message_ids_not_subjects():
+    imap = ThreadIMAP(conversation(), message_id_error=True)
+    result = mailbox(imap).thread(2)
+    # <other@x> has the same subject but is not part of the thread.
+    assert "<other@x>" not in [item["message_id"] for item in result]
+
+
+def test_subject_fallback_reads_at_most_200_candidates():
+    folders = {"INBOX": {uid: header(f"<{uid}@x>", "") for uid in range(1, 301)}}
+    folders |= {"Отправленные": {}, "Other": {}}
+    folders["INBOX"][301] = header("<child@x>", "", "<parent@x>", "<parent@x>")
+    imap = ThreadIMAP(folders, message_id_error=True)
+    mailbox(imap).thread(301)
+    assert imap.header_field_fetches
+    assert all(len(batch) <= 200 for batch in imap.header_field_fetches)
+    assert max(max(batch) for batch in imap.header_field_fetches) == 301
+
+
+@pytest.mark.parametrize(
+    ("subject", "base"),
+    [
+        ("Re: Договор", "Договор"),
+        ("RE: Fwd: re[2]: Счёт  за\r\n октябрь", "Счёт за октябрь"),
+        ("Ответ: Отв: Встреча", "Встреча"),
+        ("Договор", "Договор"),
+        ("", ""),
+    ],
+)
+def test_base_subject(subject, base):
+    assert _base_subject(subject) == base
+
+
+def test_subject_fallback_searches_and_fetches_once_per_folder():
+    ancestors = {uid: header(f"<{uid}@x>", "") for uid in range(1, 26)}
+    references = " ".join(f"<{uid}@x>" for uid in range(1, 26))
+    child = header("<child@x>", "", "<25@x>", references)
+    folders = {"INBOX": {**ancestors, 26: child}, "Отправленные": {}, "Other": {}}
+    imap = ThreadIMAP(folders, message_id_error=True)
+    result = mailbox(imap).thread(26, limit=100)
+    assert len(result) == 26
+    subject_searches = [folder for folder, criteria in imap.searches if criteria[0] == "SUBJECT"]
+    # 25 ids are three chunks of ten, but each folder is searched and read once.
+    assert sorted(subject_searches) == ["INBOX", "Отправленные"]
+    assert len(imap.header_field_fetches) == 1

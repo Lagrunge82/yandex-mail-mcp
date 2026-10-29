@@ -320,15 +320,23 @@ def _thread_ids(message: MailSummary) -> set[str]:
     return set(ids) | set(message["references"])
 
 
-def _thread_criteria(ids: list[str]) -> list[str]:
-    """SEARCH criteria matching any message that has or refers to one of the ids."""
-    keys = [
-        ["HEADER", header, message_id]
-        for message_id in ids
-        for header in ("Message-ID", "In-Reply-To", "References")
-    ]
+def _thread_criteria(ids: list[str], headers: tuple[str, ...]) -> list[str]:
+    """SEARCH criteria matching any message whose given headers name one of the ids."""
+    keys = [["HEADER", header, message_id] for message_id in ids for header in headers]
     # Prefix notation: n keys need n - 1 leading ORs.
     return ["OR"] * (len(keys) - 1) + [token for key in keys for token in key]
+
+
+# Reply and forward prefixes, as mail clients in English and Russian write them.
+_SUBJECT_PREFIX = re.compile(r"^\s*(?:re|fwd?|aw|отв|ответ|пересл)\s*(?:\[\d+\])?\s*:\s*", re.I)
+
+
+def _base_subject(subject: str) -> str:
+    """The subject without reply and forward prefixes, on one line."""
+    subject = re.sub(r"\s+", " ", subject).strip()
+    while (stripped := _SUBJECT_PREFIX.sub("", subject, count=1)) != subject:
+        subject = stripped
+    return subject
 
 
 def _date_key(message: MailSummary) -> tuple[int, datetime]:
@@ -859,6 +867,12 @@ class Mailbox:
             }
             known = _thread_ids(origin)
             searched: set[str] = set()
+            subject = _base_subject(origin["subject"])
+            # Yandex can answer HEADER Message-ID with "[UNAVAILABLE] UID SEARCH Backend
+            # error"; after that, find parents by subject for the rest of this call.
+            by_message_id = True
+            # Message-ID -> UID of the subject's matches, built once per folder.
+            by_subject: dict[str, dict[str, int]] = {}
             while len(found) < limit and (pending := sorted(known - searched)):
                 searched.update(pending)
                 # IMAPClient sends other ids unquoted or as us-ascii; skipping them
@@ -870,7 +884,28 @@ class Mailbox:
                     imap.select_folder(name, readonly=True)
                     uids: set[int] = set()
                     for start in range(0, len(pending), 10):
-                        uids.update(imap.search(_thread_criteria(pending[start : start + 10])))
+                        chunk = pending[start : start + 10]
+                        # Replies: messages that refer to a known id.
+                        uids.update(
+                            imap.search(_thread_criteria(chunk, ("In-Reply-To", "References")))
+                        )
+                        # Parents: messages that carry a known id as their own.
+                        if by_message_id:
+                            try:
+                                uids.update(imap.search(_thread_criteria(chunk, ("Message-ID",))))
+                                continue
+                            except imaplib.IMAP4.abort:
+                                raise
+                            except imaplib.IMAP4.error as exc:
+                                LOG.info("HEADER Message-ID search failed (%s); using subject", exc)
+                                by_message_id = False
+                        if name not in by_subject:
+                            by_subject[name] = self._message_ids_by_subject(imap, subject)
+                        uids.update(
+                            uid
+                            for message_id, uid in by_subject[name].items()
+                            if message_id in chunk
+                        )
                     new = sorted(u for u in uids if (name, u) not in found)
                     for message in self._fetch(
                         imap, new[: limit - len(found)], max_body_chars=2000
@@ -882,6 +917,34 @@ class Mailbox:
             # The same message can be in two folders, such as mail sent to oneself.
             unique.setdefault(message["message_id"] or f"{key}", message)
         return sorted(unique.values(), key=_date_key)[:limit]
+
+    @staticmethod
+    def _message_ids_by_subject(imap: IMAPClient, subject: str) -> dict[str, int]:
+        """Message-ID -> UID for the 200 newest messages in the selected folder whose
+        subject contains this one: thread parents found without HEADER Message-ID."""
+        if not subject:
+            return {}
+        try:
+            candidates = sorted(imap.search(["SUBJECT", subject], charset="UTF-8"))[-200:]
+        except imaplib.IMAP4.abort:
+            raise
+        except imaplib.IMAP4.error as exc:
+            LOG.info("SUBJECT search for thread parents failed: %s", exc)
+            return {}
+        if not candidates:
+            return {}
+        fetched = imap.fetch(candidates, ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
+        found: dict[str, int] = {}
+        for uid, item in fetched.items():
+            # Servers echo the field list in their own spelling, so match the prefix.
+            raw = next(
+                (value for key, value in item.items() if key.startswith(b"BODY[HEADER.FIELDS")),
+                None,
+            )
+            if isinstance(raw, bytes):
+                for message_id in _MESSAGE_ID.findall(raw.decode(errors="replace")):
+                    found.setdefault(message_id, uid)
+        return found
 
     def headers(self, uid: int, folder: str = "INBOX") -> MailSummary:
         valid_uid(uid)
