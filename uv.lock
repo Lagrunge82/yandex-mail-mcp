@@ -1839,7 +1839,6 @@ dependencies = [
     { name = "mcp" },
     { name = "pydantic" },
     { name = "python-dotenv" },
-    { name = "typing-extensions" },
 ]
 
 [package.dev-dependencies]

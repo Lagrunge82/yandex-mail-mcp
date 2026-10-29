@@ -16,8 +16,14 @@ from contextlib import contextmanager
 from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
-from typing import Iterator
-from typing_extensions import TypedDict
+import sys
+from typing import Iterator, NotRequired
+
+if sys.version_info >= (3, 12):
+    from typing import TypedDict
+else:
+    # pydantic's output-schema generation requires the typing_extensions TypedDict on Python < 3.12.
+    from typing_extensions import TypedDict
 
 from imapclient import IMAPClient
 
