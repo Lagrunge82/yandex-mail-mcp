@@ -513,6 +513,9 @@ def search_emails(
     unread and flagged select by the Seen and Flagged flags when true or false.
     has_attachments filters by MIME structure on this server, checking at most the
     500 newest messages that match the other criteria. Maximum 100 results.
+    Yandex indexes text for query, sender, to and subject with a delay: mail that
+    arrived minutes ago may not match them yet, although since, unread and flagged
+    find it; for the newest mail use list_recent_emails or since.
     For the next page, pass the smallest uid of the previous page as before_uid.
     """
     return _mailbox().search(
