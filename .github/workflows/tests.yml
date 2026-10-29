@@ -28,7 +28,7 @@ jobs:
       - name: Install
         run: uv sync --locked --all-extras --python ${{ matrix.python-version }}
       - name: Run tests
-        run: uv run --locked --no-sync --python ${{ matrix.python-version }} pytest -q --cov=yandex_mail_mcp --cov-fail-under=75
+        run: uv run --locked --no-sync --python ${{ matrix.python-version }} pytest -q --cov=yandex_mail_mcp --cov-fail-under=85
 
   quality:
     runs-on: ubuntu-latest

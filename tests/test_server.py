@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import anyio.to_thread
 import pytest
+from imapclient.exceptions import LoginError
 from mcp.server.mcpserver.exceptions import ToolError
 
 from yandex_mail_mcp import server
@@ -403,3 +404,31 @@ def test_healthz_is_public_but_mcp_still_requires_token():
     assert asyncio.run(get("/healthz")) == (200, b"ok")
     assert asyncio.run(get("/mcp"))[0] == 401
     assert asyncio.run(get("/healthz/"))[0] == 401
+
+
+def test_login_error_reaches_client_without_details(monkeypatch):
+    class Box:
+        def folders(self):
+            raise LoginError("[AUTHENTICATIONFAILED] Invalid credentials for user@yandex.ru")
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match="IMAP authentication failed") as raised:
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
+    assert "user@yandex.ru" not in str(raised.value)
+
+
+def test_bearer_auth_passes_lifespan_without_token():
+    # StreamableHTTPSessionManager starts in the lifespan, which carries no headers.
+    calls = []
+
+    async def app(scope, receive, send):
+        calls.append(scope["type"])
+
+    async def receive():
+        return {"type": "lifespan.startup"}
+
+    async def send(message):
+        raise AssertionError(f"unexpected response: {message}")
+
+    asyncio.run(server.BearerAuth(app, "secret")({"type": "lifespan"}, receive, send))
+    assert calls == ["lifespan"]
