@@ -2,6 +2,7 @@ import base64
 import imaplib
 import quopri
 from contextlib import contextmanager
+from datetime import date
 from email.message import EmailMessage
 
 import pytest
@@ -13,6 +14,7 @@ from yandex_mail_mcp.mail import (
     MailLookupError,
     MailValueError,
     parse_message,
+    search_criteria,
     valid_uid,
 )
 
@@ -604,3 +606,143 @@ def test_search_falls_back_to_previews_when_server_search_fails():
     assert [message["uid"] for message in found] == [400, 300]
     assert max(fetched) == 400
     assert min(fetched) > 100  # Only the 300 newest messages are scanned.
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"query": "счёт"}, ["TEXT", "счёт"]),
+        (
+            {"sender": "bank@example.com", "to": "me", "subject": "Выписка"},
+            ["FROM", "bank@example.com", "TO", "me", "SUBJECT", "Выписка"],
+        ),
+        (
+            {"since": "2026-10-01", "before": " 2026-10-08 "},
+            ["SINCE", date(2026, 10, 1), "BEFORE", date(2026, 10, 8)],
+        ),
+        ({"unread": True, "flagged": False}, ["UNSEEN", "UNFLAGGED"]),
+        ({"unread": False, "flagged": True}, ["SEEN", "FLAGGED"]),
+        (
+            {"query": "invoice", "sender": "Иванов", "since": "2026-01-31", "unread": True},
+            ["TEXT", "invoice", "FROM", "Иванов", "SINCE", date(2026, 1, 31), "UNSEEN"],
+        ),
+        ({}, []),
+    ],
+)
+def test_search_criteria(kwargs, expected):
+    assert search_criteria(**kwargs) == expected
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"since": "01.10.2026"}, "since must be a date"),
+        ({"before": "2026-02-30"}, "before must be a date"),
+        ({"since": "2026-10-08", "before": "2026-10-08"}, "since must be earlier"),
+        ({"sender": " "}, "sender cannot be empty"),
+        ({"query": ""}, "query cannot be empty"),
+    ],
+)
+def test_search_criteria_rejects_invalid_input(kwargs, message):
+    with pytest.raises(MailValueError, match=message):
+        search_criteria(**kwargs)
+
+
+class SearchIMAP:
+    """Answers SEARCH with fixed UIDs and records the criteria and fetches."""
+
+    def __init__(self, uids, attachments=(), error=None):
+        self.uids = list(uids)
+        self.attachments = set(attachments)
+        self.error = error
+        self.searches = []
+        self.structure_fetches = []
+
+    def select_folder(self, name, readonly):
+        assert readonly
+
+    def search(self, criteria, charset=None):
+        self.searches.append((criteria, charset))
+        if self.error and criteria != ["ALL"]:
+            raise self.error
+        return self.uids
+
+    def fetch(self, uids, fields):
+        assert fields == ["BODYSTRUCTURE"]
+        self.structure_fetches.append(list(uids))
+        text = (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"7BIT", 5, 1, None, None)
+        pdf = (b"APPLICATION", b"PDF", (b"NAME", b"a.pdf"), None, None, b"BASE64", 9, None, None)
+        return {
+            uid: {b"BODYSTRUCTURE": ([text, pdf], b"MIXED") if uid in self.attachments else text}
+            for uid in uids
+        }
+
+
+def search_box(imap, monkeypatch, fetched=None):
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+
+    @contextmanager
+    def connect():
+        yield imap
+
+    def fetch(imap, uids, max_body_chars=4000):
+        if fetched is not None:
+            fetched.append(list(uids))
+        return [{"uid": uid} for uid in uids]
+
+    box.connect = connect
+    monkeypatch.setattr(Mailbox, "_fetch", staticmethod(fetch))
+    return box
+
+
+def test_search_sends_structured_criteria_newest_first(monkeypatch):
+    imap = SearchIMAP([5, 9, 7])
+    box = search_box(imap, monkeypatch)
+    result = box.search(sender="bank", since="2026-10-01", flagged=True, limit=2)
+    assert [message["uid"] for message in result] == [9, 7]
+    assert imap.searches == [(["FROM", "bank", "SINCE", date(2026, 10, 1), "FLAGGED"], "UTF-8")]
+
+
+def test_search_requires_a_criterion(monkeypatch):
+    box = search_box(SearchIMAP([]), monkeypatch)
+    with pytest.raises(MailValueError, match="at least one"):
+        box.search()
+    with pytest.raises(MailValueError, match="at least one"):
+        box.search(query=None, limit=5)
+
+
+def test_search_with_other_criteria_does_not_fall_back(monkeypatch):
+    imap = SearchIMAP(range(1, 10), error=imaplib.IMAP4.error("BAD"))
+    box = search_box(imap, monkeypatch)
+    with pytest.raises(imaplib.IMAP4.error, match="BAD"):
+        box.search(query="счёт", sender="bank")
+    assert [criteria for criteria, _ in imap.searches] == [["TEXT", "счёт", "FROM", "bank"]]
+
+
+def test_has_attachments_filters_in_batches_until_limit(monkeypatch):
+    with_attachments = {120, 100, 61, 30}
+    imap = SearchIMAP(range(1, 121), attachments=with_attachments)
+    fetched = []
+    box = search_box(imap, monkeypatch, fetched)
+    result = box.search(has_attachments=True, limit=3)
+    assert [message["uid"] for message in result] == [120, 100, 61]
+    assert imap.searches == [(["ALL"], "UTF-8")]
+    # The newest 50 hold two matches, the next 50 the third; the last 20 are not read.
+    assert imap.structure_fetches == [list(range(120, 70, -1)), list(range(70, 20, -1))]
+    assert fetched == [[120, 100], [61]]
+
+
+def test_has_attachments_false_keeps_messages_without_attachments(monkeypatch):
+    imap = SearchIMAP([1, 2, 3, 4], attachments={2, 4})
+    box = search_box(imap, monkeypatch)
+    result = box.search(has_attachments=False, unread=True)
+    assert [message["uid"] for message in result] == [3, 1]
+    assert imap.searches == [(["UNSEEN"], "UTF-8")]
+
+
+def test_has_attachments_scans_at_most_500_messages(monkeypatch):
+    imap = SearchIMAP(range(1, 1001))
+    box = search_box(imap, monkeypatch)
+    assert box.search(has_attachments=True) == []
+    assert sum(len(batch) for batch in imap.structure_fetches) == 500
+    assert min(min(batch) for batch in imap.structure_fetches) == 501

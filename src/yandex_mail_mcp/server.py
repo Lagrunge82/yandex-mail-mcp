@@ -216,9 +216,41 @@ def list_recent_emails(
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
-def search_emails(query: str, limit: int = 20, folder: str = "INBOX") -> list[MailSummary]:
-    """Find sender, subject or content matches in a folder."""
-    return _mailbox().search(query=query, limit=limit, folder=folder)
+def search_emails(
+    query: str | None = None,
+    sender: str | None = None,
+    to: str | None = None,
+    subject: str | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    unread: bool | None = None,
+    flagged: bool | None = None,
+    has_attachments: bool | None = None,
+    limit: int = 20,
+    folder: str = "INBOX",
+) -> list[MailSummary]:
+    """Search a folder, newest first. Give at least one criterion; all must match.
+
+    query matches headers and body text; sender, to and subject match substrings of
+    those headers. since (inclusive) and before (exclusive) take YYYY-MM-DD dates and
+    compare the message's internal date without time, in the mail server's time zone.
+    unread and flagged select by the Seen and Flagged flags when true or false.
+    has_attachments filters by MIME structure on this server, checking at most the
+    500 newest messages that match the other criteria. Maximum 100 results.
+    """
+    return _mailbox().search(
+        query=query,
+        sender=sender,
+        to=to,
+        subject=subject,
+        since=since,
+        before=before,
+        unread=unread,
+        flagged=flagged,
+        has_attachments=has_attachments,
+        limit=limit,
+        folder=folder,
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))

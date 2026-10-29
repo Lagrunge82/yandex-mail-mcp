@@ -432,3 +432,34 @@ def test_bearer_auth_passes_lifespan_without_token():
 
     asyncio.run(server.BearerAuth(app, "secret")({"type": "lifespan"}, receive, send))
     assert calls == ["lifespan"]
+
+
+def test_search_tool_passes_structured_criteria(monkeypatch):
+    calls = []
+
+    class Box:
+        def search(self, **kwargs):
+            calls.append(kwargs)
+            return []
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    asyncio.run(
+        server.mcp.call_tool(
+            "search_emails", {"sender": "bank", "since": "2026-10-01", "has_attachments": True}
+        )
+    )
+    assert calls == [
+        {
+            "query": None,
+            "sender": "bank",
+            "to": None,
+            "subject": None,
+            "since": "2026-10-01",
+            "before": None,
+            "unread": None,
+            "flagged": None,
+            "has_attachments": True,
+            "limit": 20,
+            "folder": "INBOX",
+        }
+    ]
