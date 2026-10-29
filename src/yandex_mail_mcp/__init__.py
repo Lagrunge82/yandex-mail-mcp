@@ -1,3 +1,3 @@
-"""Yandex Mail tools for MCP and optional inbox monitoring."""
+"""Yandex Mail tools for MCP."""
 
 __version__ = "0.1.0"

@@ -1,28 +1,6 @@
 services:
-  monitor:
-    build: .
-    restart: unless-stopped
-    stop_grace_period: 45s
-    read_only: true
-    tmpfs: ["/tmp"]
-    cap_drop: ["ALL"]
-    security_opt: ["no-new-privileges:true"]
-    healthcheck:
-      test: ["CMD", "python", "-m", "yandex_mail_mcp.healthcheck"]
-      interval: 60s
-      timeout: 5s
-      start_period: 60s
-      retries: 3
-    env_file: .env
-    environment:
-      STATE_DB: /data/mail_state.sqlite3
-    volumes:
-      - monitor_state:/data
-
-  # Optional local HTTP MCP endpoint. The host port is NOT exposed publicly.
-  # Run: docker compose --profile mcp up -d
+  # Local HTTP MCP endpoint. The host port is NOT exposed publicly.
   mcp:
-    profiles: ["mcp"]
     build: .
     restart: unless-stopped
     read_only: true
@@ -38,7 +16,3 @@ services:
       MCP_ALLOW_UNAUTHENTICATED_REMOTE: "${MCP_ALLOW_UNAUTHENTICATED_REMOTE:-false}"
     ports:
       - "127.0.0.1:8000:8000"
-    command: ["yandex-mail-mcp"]
-
-volumes:
-  monitor_state:

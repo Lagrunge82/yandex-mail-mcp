@@ -12,17 +12,6 @@ class ConfigurationError(ValueError):
     """An actionable configuration error."""
 
 
-DEFAULT_STATE_DB = "./data/mail_state.sqlite3"
-
-
-def state_db_path() -> str:
-    return os.getenv("STATE_DB", DEFAULT_STATE_DB)
-
-
-def poll_interval() -> int:
-    return max(60, env_int("POLL_INTERVAL_SECONDS", 180))
-
-
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
