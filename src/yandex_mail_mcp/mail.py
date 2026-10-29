@@ -398,6 +398,15 @@ class Mailbox:
             raise MailValueError("Choose a safe dedicated promotions folder")
         with self.connect() as imap:
             folders = imap.list_folders()
+            delimiters = {
+                delimiter.decode() if isinstance(delimiter, bytes) else delimiter
+                for _, delimiter, _ in folders
+                if delimiter
+            }
+            if any(delimiter in folder for delimiter in delimiters):
+                raise MailValueError(
+                    "Choose a safe dedicated top-level promotions folder; nested folders are not allowed"
+                )
             matching = [
                 (flags, delimiter, name)
                 for flags, delimiter, name in folders
