@@ -46,11 +46,14 @@ class Settings:
             raise ConfigurationError(
                 "Set YANDEX_EMAIL and YANDEX_APP_PASSWORD in the environment (see .env.example)"
             )
+        promotions_folder = os.getenv("YANDEX_PROMOTIONS_FOLDER", "AI-Promotions").strip()
+        if not promotions_folder:
+            raise ConfigurationError("YANDEX_PROMOTIONS_FOLDER cannot be empty")
         return cls(
             email=email,
             app_password=password,
             imap_host=os.getenv("YANDEX_IMAP_HOST", "imap.yandex.com"),
             imap_port=env_int("YANDEX_IMAP_PORT", 993),
             allow_write=env_bool("YANDEX_ALLOW_WRITE"),
-            promotions_folder=os.getenv("YANDEX_PROMOTIONS_FOLDER", "AI-Promotions"),
+            promotions_folder=promotions_folder,
         )
