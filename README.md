@@ -2,14 +2,14 @@
 
 A small, self-hosted **MCP server for Yandex Mail**. Built with Python and IMAP.
 
-**Project status:** initial MVP. Not deployed or connected to a mailbox yet.
+**Project status:** early development (0.x). Tagged releases and container images are published, but tool names, parameters and configuration may still change between minor versions.
 
 ## What it does
 
 MCP tools:
 - `list_folders`: list Yandex IMAP folders.
 - `list_recent_emails`: inspect recent messages (optionally unread only).
-- `search_emails`: search the folder on the server; if unsupported, search previews of the 300 newest emails.
+- `search_emails`: search a folder with IMAP `SEARCH TEXT`, which matches headers and body as the server indexes them. If the server rejects the search, it falls back to the 300 newest messages and matches only the sender, subject and the first 2000 characters of the text preview, so results can differ from a server search.
 - `get_email`: inspect one message by IMAP UID.
 - `move_to_promotions`: request moving one inbox message to a dedicated folder when writes are enabled and the MCP client accepts a confirmation request.
 
@@ -49,8 +49,8 @@ The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a b
 
 CI publishes `ghcr.io/lagrunge82/yandex-mail-mcp` for Linux amd64 and arm64 after
 the checks pass on `main` or a `v*` tag. When a push to `main` increases
-`project.version` in `pyproject.toml`, CI creates the matching Git tag (for
-example `v0.1.1`) and publishes the image with that tag. A conflicting existing
+`project.version` in `pyproject.toml`, CI creates the matching Git tag
+(`v<version>`) and publishes the image with that tag. A conflicting existing
 Git tag fails the workflow instead of being moved. The GitHub Actions token does
 not trigger another workflow for the new tag, so the same run publishes the
 versioned image. Versions must be valid Docker tags (PEP 440 local versions with
