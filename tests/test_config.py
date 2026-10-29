@@ -3,7 +3,7 @@ from dataclasses import asdict
 from pydantic import SecretStr
 import pytest
 
-from yandex_mail_mcp.config import Settings
+from yandex_mail_mcp.config import ConfigurationError, Settings
 
 
 def test_settings_repr_does_not_expose_password():
@@ -31,3 +31,19 @@ def test_blank_port_uses_default(monkeypatch):
     monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
     monkeypatch.setenv("YANDEX_IMAP_PORT", "  ")
     assert Settings.from_env().imap_port == 993
+
+
+def test_promotions_folder_is_stripped(monkeypatch):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", " AI-Promotions ")
+    assert Settings.from_env().promotions_folder == "AI-Promotions"
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_blank_promotions_folder_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", value)
+    with pytest.raises(ConfigurationError, match="YANDEX_PROMOTIONS_FOLDER"):
+        Settings.from_env()

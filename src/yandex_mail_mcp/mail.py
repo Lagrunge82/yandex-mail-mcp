@@ -377,7 +377,7 @@ class Mailbox:
             raise MailPermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
         if confirm is not True:
             raise MailPermissionError("Explicit confirm=true is required to move a message")
-        folder = self.config.promotions_folder
+        folder = self.config.promotions_folder.strip()
         forbidden_names = {
             "inbox",
             "trash",
@@ -394,7 +394,7 @@ class Mailbox:
             "отправленные",
             "исходящие",
         }
-        if not folder.strip() or folder.strip().casefold() in forbidden_names:
+        if not folder or folder.casefold() in forbidden_names:
             raise MailValueError("Choose a safe dedicated promotions folder")
         with self.connect() as imap:
             folders = imap.list_folders()

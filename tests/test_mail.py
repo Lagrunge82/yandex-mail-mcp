@@ -130,6 +130,45 @@ def test_system_folder_flag_is_rejected():
         box.move_to_promotions(3, confirm=True)
 
 
+def test_promotions_folder_with_whitespace_uses_existing_folder():
+    box = Mailbox(
+        Settings(
+            email="test@yandex.com",
+            app_password="x",
+            allow_write=True,
+            promotions_folder=" AI-Promotions ",
+        )
+    )
+    calls = []
+
+    class IMAP:
+        def list_folders(self):
+            return [((b"\\HasNoChildren",), b"|", "AI-Promotions")]
+
+        def has_capability(self, name):
+            return True
+
+        def create_folder(self, name):
+            calls.append(("create", name))
+
+        def select_folder(self, name, readonly):
+            pass
+
+        def search(self, criteria):
+            return [3]
+
+        def move(self, uids, folder):
+            calls.append(("move", folder))
+
+    @contextmanager
+    def connect():
+        yield IMAP()
+
+    box.connect = connect
+    assert box.move_to_promotions(3, confirm=True)["moved_to"] == "AI-Promotions"
+    assert calls == [("move", "AI-Promotions")]
+
+
 @pytest.mark.parametrize("name", ["Черновики", "Удалённые", "Sent", "Spam"])
 def test_system_folder_name_is_rejected(name):
     box = Mailbox(
