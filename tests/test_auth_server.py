@@ -296,6 +296,16 @@ def test_full_flow_lists_tools_with_bearer_and_401_without():
     assert "ya-access" not in json.dumps(tokens)
 
 
+def test_healthz_is_public_on_the_oauth_server():
+    async def scenario(flow):
+        return await flow.client.get("/healthz"), await flow.client.get("/healthz/")
+
+    (health, other), _ = run_flow(scenario)
+    assert (health.status_code, health.text) == (200, "ok")
+    # Starlette may answer the trailing slash with a redirect; it never serves it.
+    assert other.status_code in {307, 404}
+
+
 def test_code_cannot_be_exchanged_twice():
     async def scenario(flow):
         client_id = await flow.register()
@@ -544,7 +554,7 @@ def test_public_url_requires_keys_and_client_id(monkeypatch):
     with pytest.raises(ConfigurationError, match="YANDEX_OAUTH_CLIENT_ID"):
         server.main([])
     monkeypatch.setenv("MCP_AUTH_TOKEN", "secret")
-    with pytest.raises(ConfigurationError, match="not both"):
+    with pytest.raises(ConfigurationError, match="MCP_AUTH_TOKEN is no longer supported"):
         server.main([])
 
 

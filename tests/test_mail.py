@@ -150,14 +150,14 @@ def test_invalid_uid_rejected():
 
 
 def test_no_mutation_without_explicit_opt_in():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="not-a-real-password"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="not-a-real-password"))
     with pytest.raises(PermissionError, match="disabled"):
         box.move_to_promotions(3, confirm=True)
 
 
 def test_no_mutation_without_confirmation():
     box = Mailbox(
-        Settings(email="test@yandex.com", app_password="not-a-real-password", allow_write=True)
+        Settings(email="test@yandex.com", oauth_token="not-a-real-password", allow_write=True)
     )
     with pytest.raises(PermissionError, match="confirm"):
         box.move_to_promotions(3)
@@ -166,7 +166,7 @@ def test_no_mutation_without_confirmation():
 def test_system_folder_flag_is_rejected():
     box = Mailbox(
         Settings(
-            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder="Archive"
+            email="test@yandex.com", oauth_token="x", allow_write=True, promotions_folder="Archive"
         )
     )
 
@@ -187,7 +187,7 @@ def test_promotions_folder_with_whitespace_uses_existing_folder():
     box = Mailbox(
         Settings(
             email="test@yandex.com",
-            app_password="x",
+            oauth_token="x",
             allow_write=True,
             promotions_folder=" AI-Promotions ",
         )
@@ -225,9 +225,7 @@ def test_promotions_folder_with_whitespace_uses_existing_folder():
 @pytest.mark.parametrize("name", ["Черновики", "Удалённые", "Sent", "Spam"])
 def test_system_folder_name_is_rejected(name):
     box = Mailbox(
-        Settings(
-            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder=name
-        )
+        Settings(email="test@yandex.com", oauth_token="x", allow_write=True, promotions_folder=name)
     )
     with pytest.raises(ValueError, match="safe"):
         box.move_to_promotions(3, confirm=True)
@@ -239,9 +237,7 @@ def test_system_folder_name_is_rejected(name):
 )
 def test_nested_promotions_folder_is_rejected(name, delimiter):
     box = Mailbox(
-        Settings(
-            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder=name
-        )
+        Settings(email="test@yandex.com", oauth_token="x", allow_write=True, promotions_folder=name)
     )
 
     class IMAP:
@@ -307,7 +303,7 @@ def test_preview_fetches_only_bounded_text_section():
 
 
 def test_get_email_rejects_large_message_before_body_fetch():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     calls = []
 
     class IMAP:
@@ -329,7 +325,7 @@ def test_get_email_rejects_large_message_before_body_fetch():
 
 
 def test_search_uses_server_results_without_300_message_cap(monkeypatch):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
 
     class IMAP:
         def select_folder(self, *args, **kwargs):
@@ -387,7 +383,7 @@ def test_fetch_batches_sections_and_handles_incomplete_base64_and_missing_struct
 
 
 def test_search_does_not_fallback_on_aborted_connection():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
 
     class IMAP:
         def select_folder(self, *args, **kwargs):
@@ -406,7 +402,7 @@ def test_search_does_not_fallback_on_aborted_connection():
 
 
 def test_headers_does_not_fetch_full_message():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
 
     class IMAP:
         def select_folder(self, *args, **kwargs):
@@ -428,7 +424,7 @@ def test_preview_validates_folder_and_reads_headers_in_one_connection():
     box = Mailbox(
         Settings(
             email="test@yandex.com",
-            app_password="x",
+            oauth_token="x",
             allow_write=True,
             promotions_folder="ai-promotions",
         )
@@ -461,7 +457,7 @@ def test_preview_validates_folder_and_reads_headers_in_one_connection():
 
 
 def test_preview_rejects_server_without_move():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
 
     class IMAP:
         def list_folders(self):
@@ -511,7 +507,7 @@ class MoveIMAP:
 
 
 def writable_box(imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
 
     @contextmanager
     def connect():
@@ -582,7 +578,7 @@ def test_fetch_extracts_text_from_html_section():
 
 
 def test_search_falls_back_to_previews_when_server_search_fails():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     fetched = []
 
     class IMAP:
@@ -684,7 +680,7 @@ class SearchIMAP:
 
 
 def search_box(imap, monkeypatch, fetched=None):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
 
     @contextmanager
     def connect():

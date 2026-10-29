@@ -23,7 +23,7 @@ class FakeIMAP:
         self._imap = type("State", (), {"state": "NONAUTH"})()
         FakeIMAP.instances.append(self)
 
-    def login(self, user, password):
+    def oauth2_login(self, user, token):
         self.logins += 1
         self._imap.state = "AUTH"
 
@@ -69,7 +69,7 @@ def fake_imap(monkeypatch):
 
 
 def test_sequential_calls_reuse_one_login(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     box.folders()
     box.folders()
     assert len(fake_imap) == 1
@@ -81,7 +81,7 @@ def test_sequential_calls_reuse_one_login(fake_imap):
     "error", [imaplib.IMAP4.abort("socket error: EOF"), ConnectionResetError(104, "reset")]
 )
 def test_connection_failing_noop_is_replaced(fake_imap, error):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     box.folders()
     fake_imap[0].noop_error = error
     box.folders()
@@ -110,7 +110,7 @@ def test_idle_connection_is_replaced_without_noop():
 
 
 def test_move_returns_connection_without_selected_folder(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
     box.move_to_promotions(3, confirm=True)
     imap = fake_imap[0]
     assert ("select", "INBOX", False) in imap.calls
@@ -122,7 +122,7 @@ def test_move_returns_connection_without_selected_folder(fake_imap):
 
 
 def test_move_email_returns_connection_without_selected_folder(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
     assert box.move(3, "AI-Promotions")["folder"] == "AI-Promotions"
     imap = fake_imap[0]
     assert imap.calls[-2:] == [("move", [3], "AI-Promotions"), "unselect"]
@@ -133,7 +133,7 @@ def test_move_email_returns_connection_without_selected_folder(fake_imap):
 
 
 def test_selected_connection_without_unselect_is_closed(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     with box.connect() as imap:
         imap.capabilities.discard("UNSELECT")
         imap.select_folder("INBOX", readonly=False)
@@ -143,7 +143,7 @@ def test_selected_connection_without_unselect_is_closed(fake_imap):
 
 
 def test_connection_is_closed_after_an_error(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     with pytest.raises(KeyError), box.connect():
         raise KeyError("boom")
     assert fake_imap[0].closed
@@ -153,12 +153,12 @@ def test_connection_is_closed_after_an_error(fake_imap):
 
 def test_failed_login_closes_the_socket_and_frees_the_slot(monkeypatch):
     class BadLogin(FakeIMAP):
-        def login(self, user, password):
+        def oauth2_login(self, user, token):
             raise imaplib.IMAP4.error("AUTHENTICATIONFAILED")
 
     FakeIMAP.instances = []
     monkeypatch.setattr(mail, "IMAPClient", BadLogin)
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", imap_pool_size=1))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", imap_pool_size=1))
     for _ in range(2):
         with pytest.raises(imaplib.IMAP4.error):
             box.folders()
@@ -186,7 +186,7 @@ def test_close_logs_out_idle_connections_and_later_returns():
 
 
 def test_server_lifespan_closes_pools(monkeypatch, fake_imap):
-    settings = Settings(email="test@yandex.com", app_password="x")
+    settings = Settings(email="test@yandex.com", oauth_token="x")
     monkeypatch.setattr(server, "_settings", lambda: settings)
     monkeypatch.setattr(server, "_mailboxes", {})
     box = server._mailbox()
@@ -203,7 +203,7 @@ def test_server_lifespan_closes_pools(monkeypatch, fake_imap):
 
 
 def test_unselect_then_call_without_select_keeps_connection(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     with box.connect() as imap:
         imap.select_folder("INBOX", readonly=True)
     box.folders()
@@ -214,7 +214,7 @@ def test_unselect_then_call_without_select_keeps_connection(fake_imap):
 
 
 def test_mail_error_keeps_healthy_connection(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
     for _ in range(3):
         with pytest.raises(MailError, match="not found"):
             box.move(3, "Missing")
@@ -223,7 +223,7 @@ def test_mail_error_keeps_healthy_connection(fake_imap):
 
 
 def test_checkin_failure_does_not_replace_the_result(fake_imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
 
     def capability(name):
         raise imaplib.IMAP4.abort("socket error: EOF")

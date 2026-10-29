@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass, field
 
 from pydantic import SecretStr
 
 from .credentials import TokenStore
-
-LOG = logging.getLogger(__name__)
 
 # Names a promotions folder must never take, compared case-insensitively.
 RESERVED_FOLDER_NAMES = frozenset(
@@ -63,12 +60,10 @@ class Settings:
     """Server configuration.
 
     IMAP credentials come from one source, in priority order: oauth_token
-    (YANDEX_OAUTH_TOKEN), stored_tokens (saved by `yandex-mail-mcp login`), then
-    app_password (YANDEX_APP_PASSWORD, deprecated).
+    (YANDEX_OAUTH_TOKEN) or stored_tokens (saved by `yandex-mail-mcp login`).
     """
 
     email: str = ""
-    app_password: SecretStr | None = field(default=None, repr=False)
     oauth_token: SecretStr | None = field(default=None, repr=False)
     stored_tokens: bool = False
     oauth_client_id: str = ""
@@ -83,7 +78,7 @@ class Settings:
     confirm_reversible: bool = True
 
     def __post_init__(self) -> None:
-        for name in ("app_password", "oauth_token", "oauth_client_secret"):
+        for name in ("oauth_token", "oauth_client_secret"):
             if isinstance(getattr(self, name), str):
                 object.__setattr__(self, name, SecretStr(getattr(self, name)))
 
@@ -95,9 +90,14 @@ class Settings:
         not an error and the tokens saved by `yandex-mail-mcp login` are not looked
         up: a keyring lookup in a container is slow and logs warnings for nothing.
         """
+        if os.getenv("YANDEX_APP_PASSWORD", "").strip():
+            # Removed in 0.7.0; a silent fallback to "no credentials" would be confusing.
+            raise ConfigurationError(
+                "YANDEX_APP_PASSWORD is no longer supported: run `yandex-mail-mcp login`, or "
+                "set YANDEX_OAUTH_TOKEN and YANDEX_EMAIL, and remove the password"
+            )
         email = os.getenv("YANDEX_EMAIL", "").strip()
         token = os.getenv("YANDEX_OAUTH_TOKEN", "").strip()
-        password = os.getenv("YANDEX_APP_PASSWORD", "").strip()
         credentials: dict[str, object] = {}
         if token:
             if not email:
@@ -105,12 +105,6 @@ class Settings:
             credentials = {"email": email, "oauth_token": SecretStr(token)}
         elif require_credentials and (stored := TokenStore().load()) is not None:
             credentials = {"email": stored.email, "stored_tokens": True}
-        elif password and email:
-            LOG.warning(
-                "YANDEX_APP_PASSWORD is deprecated; run `yandex-mail-mcp login` to sign in "
-                "with Yandex OAuth instead"
-            )
-            credentials = {"email": email, "app_password": SecretStr(password)}
         elif require_credentials:
             raise ConfigurationError(
                 "No Yandex credentials: run `yandex-mail-mcp login`, or set YANDEX_OAUTH_TOKEN "

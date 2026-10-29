@@ -111,7 +111,7 @@ class ThreadIMAP:
 
 
 def mailbox(imap):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
 
     @contextmanager
     def connect():
@@ -210,7 +210,7 @@ def test_before_uid_scopes_search():
 
 
 def test_before_uid_of_one_returns_nothing_without_connecting():
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     box.connect = None  # Any connection attempt would fail.
     assert box.recent(before_uid=1) == []
     assert box.search(query="x", before_uid=1) == []
@@ -218,7 +218,7 @@ def test_before_uid_of_one_returns_nothing_without_connecting():
 
 @pytest.mark.parametrize("value", [0, -5, True])
 def test_invalid_before_uid_is_rejected(value):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
     with pytest.raises(MailValueError, match="before_uid must be a positive integer"):
         box.recent(before_uid=value)
 

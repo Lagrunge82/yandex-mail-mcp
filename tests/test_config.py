@@ -7,7 +7,7 @@ from yandex_mail_mcp.config import ConfigurationError, Settings
 
 
 def test_settings_repr_does_not_expose_password():
-    settings = Settings(email="test@yandex.com", app_password=SecretStr("SUPERSECRET"))
+    settings = Settings(email="test@yandex.com", oauth_token=SecretStr("SUPERSECRET"))
 
     assert "SUPERSECRET" not in repr(settings)
     assert "test@yandex.com" in repr(settings)
@@ -15,12 +15,12 @@ def test_settings_repr_does_not_expose_password():
     assert "SUPERSECRET" not in f"{settings}"
     assert "SUPERSECRET" not in str(asdict(settings))
     assert "SUPERSECRET" not in str(vars(settings))
-    assert settings.app_password.get_secret_value() == "SUPERSECRET"
+    assert settings.oauth_token.get_secret_value() == "SUPERSECRET"
 
 
 def test_invalid_port_identifies_variable(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "SUPERSECRET")
     monkeypatch.setenv("YANDEX_IMAP_PORT", "bad")
     with pytest.raises(ValueError, match="YANDEX_IMAP_PORT"):
         Settings.from_env()
@@ -28,14 +28,14 @@ def test_invalid_port_identifies_variable(monkeypatch):
 
 def test_blank_port_uses_default(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("YANDEX_IMAP_PORT", "  ")
     assert Settings.from_env().imap_port == 993
 
 
 def test_promotions_folder_is_stripped(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", " AI-Promotions ")
     assert Settings.from_env().promotions_folder == "AI-Promotions"
 
@@ -43,7 +43,7 @@ def test_promotions_folder_is_stripped(monkeypatch):
 @pytest.mark.parametrize("value", ["", "   "])
 def test_blank_promotions_folder_is_rejected(monkeypatch, value):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", value)
     with pytest.raises(ConfigurationError, match="YANDEX_PROMOTIONS_FOLDER"):
         Settings.from_env()
@@ -51,7 +51,7 @@ def test_blank_promotions_folder_is_rejected(monkeypatch, value):
 
 def test_imap_host_is_stripped(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("YANDEX_IMAP_HOST", " imap.yandex.com ")
     assert Settings.from_env().imap_host == "imap.yandex.com"
 
@@ -59,7 +59,7 @@ def test_imap_host_is_stripped(monkeypatch):
 @pytest.mark.parametrize("value", ["", "   "])
 def test_blank_imap_host_uses_default(monkeypatch, value):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("YANDEX_IMAP_HOST", value)
     assert Settings.from_env().imap_host == "imap.yandex.com"
 
@@ -67,7 +67,7 @@ def test_blank_imap_host_uses_default(monkeypatch, value):
 @pytest.mark.parametrize("value", ["INBOX", " spam ", "Черновики"])
 def test_system_promotions_folder_is_rejected_at_startup(monkeypatch, value):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", value)
     with pytest.raises(ConfigurationError, match="YANDEX_PROMOTIONS_FOLDER"):
         Settings.from_env()
@@ -75,7 +75,7 @@ def test_system_promotions_folder_is_rejected_at_startup(monkeypatch, value):
 
 def test_pool_settings_from_env(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "SUPERSECRET")
     monkeypatch.delenv("YANDEX_IMAP_POOL_SIZE", raising=False)
     monkeypatch.delenv("YANDEX_IMAP_IDLE_TIMEOUT", raising=False)
     settings = Settings.from_env()
@@ -91,7 +91,7 @@ def test_pool_settings_from_env(monkeypatch):
 )
 def test_invalid_pool_settings_are_rejected(monkeypatch, name, value):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "SUPERSECRET")
     monkeypatch.setenv(name, value)
     with pytest.raises(ConfigurationError, match=name):
         Settings.from_env()
@@ -99,7 +99,7 @@ def test_invalid_pool_settings_are_rejected(monkeypatch, name, value):
 
 def test_archive_and_confirmation_settings_from_env(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "SUPERSECRET")
     monkeypatch.delenv("YANDEX_ARCHIVE_FOLDER", raising=False)
     monkeypatch.delenv("MCP_CONFIRM_REVERSIBLE", raising=False)
     settings = Settings.from_env()
@@ -112,7 +112,7 @@ def test_archive_and_confirmation_settings_from_env(monkeypatch):
 
 def test_blank_boolean_uses_default(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "SUPERSECRET")
     monkeypatch.setenv("MCP_CONFIRM_REVERSIBLE", " ")
     monkeypatch.setenv("YANDEX_ALLOW_WRITE", "")
     settings = Settings.from_env()
@@ -123,7 +123,7 @@ def test_blank_boolean_uses_default(monkeypatch):
 @pytest.mark.parametrize("value", ["0", "-1", "70000"])
 def test_port_outside_the_valid_range_is_rejected(monkeypatch, value):
     monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
     monkeypatch.setenv("YANDEX_IMAP_PORT", value)
     with pytest.raises(ConfigurationError, match="YANDEX_IMAP_PORT must be a port number"):
         Settings.from_env()

@@ -1,4 +1,4 @@
-"""How the server logs in to IMAP: an app password, or an OAuth token via XOAUTH2."""
+"""How the server logs in to IMAP: a Yandex OAuth token via XOAUTH2."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ import keyring
 import keyring.errors
 from imapclient import IMAPClient
 from imapclient.exceptions import LoginError
-from pydantic import SecretStr
 
 from .yandex_oauth import YandexOAuth, YandexOAuthError, YandexTokens, can_write
 
@@ -37,18 +36,6 @@ class Credentials(Protocol):
     def read_only_reason(self) -> str | None:
         """Why these credentials cannot change mail, when they are known to be read-only."""
         ...
-
-
-@dataclass(frozen=True)
-class PasswordCredentials:
-    email: str
-    password: SecretStr
-
-    def login(self, imap: IMAPClient) -> None:
-        imap.login(self.email, self.password.get_secret_value())
-
-    def read_only_reason(self) -> str | None:
-        return None
 
 
 class TokenSource(Protocol):

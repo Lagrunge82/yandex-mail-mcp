@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Removed
+
+- `YANDEX_APP_PASSWORD` and `MCP_AUTH_TOKEN`, deprecated in 0.5.0. The server signs in to IMAP only with Yandex OAuth (`yandex-mail-mcp login` or `YANDEX_OAUTH_TOKEN`), and an HTTP server reachable from other machines needs `MCP_PUBLIC_URL`. A server started with either removed variable stops with a message naming the replacement.
+
 ### Added
 
 - `move_emails`: move up to 25 messages from one folder to another with a single confirmation that lists every message's sender and subject. One IMAP `MOVE` carries the batch, and the result reports which UIDs moved and which did not from the server's `COPYUID` (without UIDPLUS, which are still in the source folder), since a server may move part of a set; the same folder rules, write checks and audit apply as for `move_email`.

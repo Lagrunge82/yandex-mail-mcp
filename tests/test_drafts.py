@@ -62,7 +62,7 @@ class DraftIMAP:
 
 
 def box_with(imap, **settings):
-    box = Mailbox(Settings(email="me@yandex.ru", app_password="x", **settings))
+    box = Mailbox(Settings(email="me@yandex.ru", oauth_token="x", **settings))
 
     @contextmanager
     def connect():

@@ -69,7 +69,7 @@ class WriteIMAP:
 
 
 def box_with(imap, **settings):
-    box = Mailbox(Settings(email="test@yandex.com", app_password="x", **settings))
+    box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", **settings))
 
     @contextmanager
     def connect():

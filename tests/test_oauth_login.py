@@ -20,7 +20,6 @@ from yandex_mail_mcp import login as login_module
 from yandex_mail_mcp.config import ConfigurationError, Settings
 from yandex_mail_mcp.credentials import (
     OAuthCredentials,
-    PasswordCredentials,
     ReauthenticationRequired,
     StaticTokenSource,
     StoredTokens,
@@ -152,7 +151,6 @@ def test_read_only_only_when_scope_is_known_read_only():
     assert "read-only" in OAuthCredentials("a", CountingSource("mail:imap_ro")).read_only_reason()
     assert OAuthCredentials("a", CountingSource("mail:imap_full")).read_only_reason() is None
     assert OAuthCredentials("a", CountingSource(None)).read_only_reason() is None
-    assert PasswordCredentials("a", "x").read_only_reason() is None
 
 
 def test_read_only_token_blocks_writes_with_a_hint():
@@ -175,31 +173,30 @@ def env(monkeypatch):
 def test_environment_token_comes_first(env):
     TokenStore().save(STORED)
     env.setenv("YANDEX_EMAIL", "a@yandex.ru")
-    env.setenv("YANDEX_APP_PASSWORD", "pw")
     env.setenv("YANDEX_OAUTH_TOKEN", "env-token")
     settings = Settings.from_env()
     assert settings.oauth_token.get_secret_value() == "env-token"
-    assert settings.app_password is None
     assert not settings.stored_tokens
 
 
-def test_stored_tokens_come_before_password(env):
+def test_stored_tokens_are_used_without_an_environment_token(env):
     TokenStore().save(STORED)
     env.setenv("YANDEX_EMAIL", "a@yandex.ru")
-    env.setenv("YANDEX_APP_PASSWORD", "pw")
     settings = Settings.from_env()
     assert settings.stored_tokens
     assert settings.email == "ivan@yandex.ru"
-    assert settings.app_password is None
 
 
-def test_password_is_the_deprecated_fallback(env, caplog):
+def test_app_password_is_refused_with_a_hint(env):
+    # Removed in 0.7.0: a set password stops the server instead of being ignored.
     env.setenv("YANDEX_EMAIL", "a@yandex.ru")
     env.setenv("YANDEX_APP_PASSWORD", "pw")
-    settings = Settings.from_env()
-    assert settings.app_password.get_secret_value() == "pw"
-    assert "deprecated" in caplog.text
-    assert "yandex-mail-mcp login" in caplog.text
+    env.setenv("YANDEX_OAUTH_TOKEN", "env-token")
+    with pytest.raises(ConfigurationError, match=r"no longer supported.*yandex-mail-mcp login"):
+        Settings.from_env()
+    with pytest.raises(ConfigurationError, match="YANDEX_APP_PASSWORD"):
+        Settings.from_env(require_credentials=False)
+    assert not hasattr(Settings(), "app_password")
 
 
 def test_token_requires_email_and_something_is_required(env):
@@ -233,9 +230,6 @@ def test_default_credentials_follow_settings():
     token = default_credentials(Settings(email="a@yandex.ru", oauth_token="t"))
     assert isinstance(token, OAuthCredentials)
     assert token.source.access_token() == "t"
-    assert isinstance(
-        default_credentials(Settings(email="a", app_password="p")), PasswordCredentials
-    )
     TokenStore().save(STORED)
     with pytest.raises(ConfigurationError, match="YANDEX_OAUTH_CLIENT_ID"):
         default_credentials(Settings(email="ivan@yandex.ru", stored_tokens=True))

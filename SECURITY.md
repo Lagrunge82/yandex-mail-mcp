@@ -18,7 +18,7 @@ The README's [Safety and permissions](README.md#safety-and-permissions) and [Sec
 - Each change acts on one message and is confirmed by the user through MCP elicitation; the reversible flag and draft changes can be exempted by the operator.
 - Mail contents are treated as untrusted data: headers quoted in confirmation requests are labelled as untrusted, and the server instructs the model never to act on instructions found in mail.
 - The local server signs in with a Yandex OAuth token kept in the system keyring (or a 0600 file); credentials are never logged or returned in errors, and the IMAP connection always uses TLS with certificate verification.
-- The shared HTTP server stores no user tokens, lets only the logins in `MCP_ALLOWED_USERS` sign in, and enables DNS rebinding protection; a non-loopback HTTP server refuses to start without `MCP_PUBLIC_URL` or the deprecated `MCP_AUTH_TOKEN`.
+- The shared HTTP server stores no user tokens, lets only the logins in `MCP_ALLOWED_USERS` sign in, and enables DNS rebinding protection; a non-loopback HTTP server refuses to start without `MCP_PUBLIC_URL`.
 
 A report that shows one of these guarantees broken is a security issue, even if it needs a malicious email to trigger.
 
