@@ -115,6 +115,20 @@ def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
         server.main()
 
 
+def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "   ")
+    monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+    )
+    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
+        server.main()
+
+
 def test_specific_host_is_allowed_by_default(monkeypatch):
     monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
     monkeypatch.setenv("MCP_HOST", "192.168.1.5")

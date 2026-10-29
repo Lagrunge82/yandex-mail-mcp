@@ -47,3 +47,18 @@ def test_blank_promotions_folder_is_rejected(monkeypatch, value):
     monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", value)
     with pytest.raises(ConfigurationError, match="YANDEX_PROMOTIONS_FOLDER"):
         Settings.from_env()
+
+
+def test_imap_host_is_stripped(monkeypatch):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_IMAP_HOST", " imap.yandex.com ")
+    assert Settings.from_env().imap_host == "imap.yandex.com"
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_blank_imap_host_uses_default(monkeypatch, value):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_IMAP_HOST", value)
+    assert Settings.from_env().imap_host == "imap.yandex.com"

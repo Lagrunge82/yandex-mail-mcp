@@ -216,7 +216,7 @@ def main() -> None:
     elif transport == "streamable-http":
         host = os.getenv("MCP_HOST", "127.0.0.1").strip()
         port = env_int("MCP_PORT", 8000)
-        token = os.getenv("MCP_AUTH_TOKEN", "")
+        token = os.getenv("MCP_AUTH_TOKEN", "").strip()
         if host not in {"127.0.0.1", "localhost", "::1"} and not token:
             if not env_bool("MCP_ALLOW_UNAUTHENTICATED_REMOTE"):
                 raise ConfigurationError(

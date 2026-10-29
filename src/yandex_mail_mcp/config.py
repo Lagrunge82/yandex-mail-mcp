@@ -52,7 +52,7 @@ class Settings:
         return cls(
             email=email,
             app_password=password,
-            imap_host=os.getenv("YANDEX_IMAP_HOST", "imap.yandex.com"),
+            imap_host=(os.getenv("YANDEX_IMAP_HOST") or "").strip() or "imap.yandex.com",
             imap_port=env_int("YANDEX_IMAP_PORT", 993),
             allow_write=env_bool("YANDEX_ALLOW_WRITE"),
             promotions_folder=promotions_folder,
