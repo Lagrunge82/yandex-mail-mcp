@@ -564,6 +564,71 @@ class ConnectionPool:
 
 
 MAX_DRAFT_BODY = 100 * 1024
+# Messages one move_emails call may take: enough to clear a backlog, few enough that
+# the confirmation list is still read rather than skimmed.
+MAX_BATCH_MOVE = 25
+# Entries accepted in the uids argument before validation starts, duplicates included.
+MAX_BATCH_INPUT = 4 * MAX_BATCH_MOVE
+
+
+def batch_uids(uids: list[int]) -> list[int]:
+    """Validate a batch of UIDs: positive integers, no duplicates, 1 to MAX_BATCH_MOVE.
+
+    Stops at the first entry that makes the batch invalid, so an oversized list
+    costs no more than a valid one.
+    """
+    if not isinstance(uids, list) or not uids:
+        raise MailValueError("uids must list at least one message UID")
+    if len(uids) > MAX_BATCH_INPUT:
+        raise MailValueError(f"uids may hold at most {MAX_BATCH_INPUT} entries")
+    unique: list[int] = []
+    seen: set[int] = set()
+    for uid in uids:
+        valid_uid(uid, "uids")
+        if uid in seen:
+            continue
+        if len(unique) == MAX_BATCH_MOVE:
+            raise MailValueError(f"uids may list at most {MAX_BATCH_MOVE} messages per call")
+        seen.add(uid)
+        unique.append(uid)
+    return unique
+
+
+# The data of a COPYUID response code as imaplib stores it: "<uidvalidity> <from> <to>",
+# optionally still prefixed with the code name.
+_COPYUID = re.compile(rb"(?:COPYUID\s+)?(\d+)\s+([0-9:,]+)\s+([0-9:,]+)")
+
+
+def copyuid_sources(code: Any) -> set[int] | None:
+    """The source UIDs named in a COPYUID response code, or None if there is none.
+
+    RFC 4315 writes UID sets as 3,5:7; a range may be given high end first.
+    """
+    items = code if isinstance(code, (list, tuple)) else [code]
+    for item in items:
+        text = item if isinstance(item, bytes) else str(item).encode() if item else b""
+        match = _COPYUID.fullmatch(text.strip())
+        if match is None:
+            continue
+        found: set[int] = set()
+        for part in match.group(2).decode().split(","):
+            low, _, high = part.partition(":")
+            try:
+                first, second = int(low), int(high or low)
+            except ValueError:
+                return None
+            start, end = min(first, second), max(first, second)
+            if end - start > 10_000:
+                return None  # Not a batch this server sent; do not expand it.
+            found.update(range(start, end + 1))
+        return found
+    return None
+
+
+def _response_codes(imap: IMAPClient) -> dict[str, Any]:
+    """imaplib's store of response codes such as COPYUID, keyed by code name."""
+    codes = getattr(getattr(imap, "_imap", None), "untagged_responses", None)
+    return codes if isinstance(codes, dict) else {}
 
 
 @dataclass(frozen=True)
@@ -1109,6 +1174,140 @@ class Mailbox:
         imap.select_folder(folder, readonly=False)
         if uid not in imap.search(["UID", str(uid)]):
             raise MailLookupError(f"Message UID {uid} not found in {folder}")
+
+    @staticmethod
+    def _select_messages(imap: IMAPClient, uids: list[int], folder: str) -> None:
+        imap.select_folder(folder, readonly=False)
+        present = set(imap.search(["UID", ",".join(str(uid) for uid in uids)]))
+        missing = [uid for uid in uids if uid not in present]
+        if missing:
+            raise MailLookupError(
+                f"Messages not found in {folder}: UID {', '.join(map(str, missing))}"
+            )
+
+    @staticmethod
+    def _headers_many(imap: IMAPClient, uids: list[int], folder: str) -> list[MailSummary]:
+        """The headers of every UID, in the given order; any missing one is an error."""
+        imap.select_folder(folder, readonly=True)
+        fetched = imap.fetch(uids, ["BODY.PEEK[HEADER]"])
+        summaries: list[MailSummary] = []
+        missing: list[int] = []
+        for uid in uids:
+            raw = fetched.get(uid, {}).get(b"BODY[HEADER]")
+            if isinstance(raw, bytes):
+                summaries.append(parse_message(raw, uid, max_body_chars=0))
+            else:
+                missing.append(uid)
+        if missing:
+            raise MailLookupError(
+                f"Messages not found in {folder}: UID {', '.join(map(str, missing))}"
+            )
+        return summaries
+
+    def preview_moves(
+        self, uids: list[int], folder: str, source_folder: str = "INBOX"
+    ) -> tuple[list[MailSummary], str]:
+        """Validate a batch move and read every message's headers for the confirmation."""
+        uids = batch_uids(uids)
+        with self.connect() as imap:
+            destination = self._destination(imap, folder)
+            if destination.casefold() == source_folder.strip().casefold():
+                raise MailValueError("The messages are already in that folder")
+            return self._headers_many(imap, uids, source_folder), destination
+
+    def move_many(
+        self, uids: list[int], folder: str, source_folder: str = "INBOX"
+    ) -> dict[str, Any]:
+        """Move a batch of messages with one MOVE and report what actually moved.
+
+        RFC 6851 lets a server move part of the set, even when it answers NO, and
+        a message can vanish between the check and the MOVE. The only reliable
+        record of what moved is the COPYUID response code of a UIDPLUS server, so:
+
+        - with COPYUID, ``moved`` and ``not_moved`` are exact;
+        - without it, ``moved`` is None: ``not_moved`` lists the UIDs still in the
+          source folder, and ``left_source`` those that are gone, by this move or
+          otherwise, with a warning to check the destination.
+        """
+        uids = batch_uids(uids)
+        self._require_write()
+        error: str | None = None
+        with self.connect() as imap:
+            destination = self._destination(imap, folder)
+            if destination.casefold() == source_folder.strip().casefold():
+                raise MailValueError("The messages are already in that folder")
+            self._select_messages(imap, uids, source_folder)
+            # A COPYUID from an earlier command on this connection must not be mistaken
+            # for this move's.
+            _response_codes(imap).pop("COPYUID", None)
+            try:
+                imap.move(uids, destination)
+            except imaplib.IMAP4.abort:
+                raise
+            except imaplib.IMAP4.error as exc:
+                # The server may have moved some of the set before refusing the rest;
+                # imaplib keeps the response code of a NO as well.
+                outcome = self._outcome(imap, uids)
+                if outcome.get("moved") == [] or (
+                    outcome.get("moved") is None and outcome.get("left_source") == []
+                ):
+                    raise
+                error = str(exc)
+            else:
+                outcome = self._outcome(imap, uids)
+        result: dict[str, Any] = {
+            "uids": uids,
+            "folder": destination,
+            "action": "move",
+            "reversible": True,
+            **outcome,
+        }
+        warning = outcome.get("warning")
+        if warning is None and result["not_moved"]:
+            warning = (
+                f"The server moved only part of the batch; {len(result['not_moved'])} "
+                f"messages are still in {source_folder}"
+            )
+        if warning is not None:
+            result["warning"] = warning + (f" ({error})" if error else "")
+        elif error:
+            result["warning"] = error
+        return result
+
+    @staticmethod
+    def _outcome(imap: IMAPClient, uids: list[int]) -> dict[str, Any]:
+        """What happened to uids after a MOVE, as reliably as the server lets us know."""
+        codes = _response_codes(imap).pop("COPYUID", None)
+        sources = copyuid_sources(codes[-1]) if codes else None
+        if sources is not None:
+            moved = [uid for uid in uids if uid in sources]
+            return {"moved": moved, "not_moved": [uid for uid in uids if uid not in moved]}
+        try:
+            left = set(imap.search(["UID", ",".join(str(uid) for uid in uids)]))
+        except imaplib.IMAP4.abort:
+            raise
+        except imaplib.IMAP4.error:
+            return {
+                "moved": None,
+                "not_moved": None,
+                "left_source": None,
+                "warning": (
+                    "The server did not report which messages moved (no COPYUID) and the "
+                    "source folder could not be re-read; check both folders before retrying"
+                ),
+            }
+        gone = [uid for uid in uids if uid not in left]
+        return {
+            "moved": None,
+            "not_moved": [uid for uid in uids if uid in left],
+            "left_source": gone,
+            "warning": (
+                "The server did not report which messages moved (no COPYUID): "
+                f"{len(gone)} left the source folder, by this move or another client, "
+                f"and {len(uids) - len(gone)} are still there; check the destination "
+                "before retrying"
+            ),
+        }
 
     def preview_move(
         self, uid: int, folder: str | None = None, source_folder: str = "INBOX"
