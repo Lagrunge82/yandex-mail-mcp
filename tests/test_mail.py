@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import pytest
 
 from yandex_mail_mcp.config import Settings
-from yandex_mail_mcp.mail import Mailbox, parse_message, valid_uid
+from yandex_mail_mcp.mail import Mailbox, MailValueError, parse_message, valid_uid
 
 
 def test_parse_message_decodes_unicode_and_does_not_include_attachment():
@@ -177,6 +177,30 @@ def test_system_folder_name_is_rejected(name):
         )
     )
     with pytest.raises(ValueError, match="safe"):
+        box.move_to_promotions(3, confirm=True)
+
+
+@pytest.mark.parametrize(
+    ("name", "delimiter"),
+    [("Trash/Promo", b"/"), ("Spam|x", b"|"), ("Удалённые|Промо", "|")],
+)
+def test_nested_promotions_folder_is_rejected(name, delimiter):
+    box = Mailbox(
+        Settings(
+            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder=name
+        )
+    )
+
+    class IMAP:
+        def list_folders(self):
+            return [((b"\\HasNoChildren",), delimiter, "INBOX"), ((), None, "Shared")]
+
+    @contextmanager
+    def connect():
+        yield IMAP()
+
+    box.connect = connect
+    with pytest.raises(MailValueError, match="safe"):
         box.move_to_promotions(3, confirm=True)
 
 
