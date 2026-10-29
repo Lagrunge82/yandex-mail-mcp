@@ -46,6 +46,13 @@ def env_int(name: str, default: int) -> int:
         raise ConfigurationError(f"{name} must be an integer") from exc
 
 
+def env_port(name: str, default: int) -> int:
+    port = env_int(name, default)
+    if not 1 <= port <= 65535:
+        raise ConfigurationError(f"{name} must be a port number from 1 to 65535")
+    return port
+
+
 @dataclass(frozen=True)
 class Settings:
     email: str
@@ -88,7 +95,7 @@ class Settings:
             email=email,
             app_password=password,
             imap_host=(os.getenv("YANDEX_IMAP_HOST") or "").strip() or "imap.yandex.com",
-            imap_port=env_int("YANDEX_IMAP_PORT", 993),
+            imap_port=env_port("YANDEX_IMAP_PORT", 993),
             allow_write=env_bool("YANDEX_ALLOW_WRITE"),
             promotions_folder=promotions_folder,
             imap_pool_size=pool_size,
