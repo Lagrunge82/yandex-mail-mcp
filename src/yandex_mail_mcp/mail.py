@@ -90,9 +90,9 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
     html_parts: list[str] = []
     has_attachments = False
 
-    def collect(part):
+    def collect(part, *, root=False):
         nonlocal has_attachments
-        if _is_attachment(
+        if not root and _is_attachment(
             part.get_content_maintype(),
             part.get_content_disposition() or "",
             part.get_filename() is not None,
@@ -116,7 +116,7 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
         else:
             html_parts.append(content)
 
-    collect(msg)
+    collect(msg, root=True)
     if text_parts:
         body = "\n".join(text_parts)
     else:
@@ -155,7 +155,7 @@ def _text_sections(structure):
             return value.decode("ascii", errors="replace")
         return value if isinstance(value, str) else default
 
-    def walk(part, path):
+    def walk(part, path, *, root=False):
         nonlocal has_attachments
         if not isinstance(part, (tuple, list)) or not part:
             return
@@ -174,7 +174,7 @@ def _text_sections(structure):
             has_filename = isinstance(disp_params, (tuple, list)) and any(
                 string(value).lower() == "filename" for value in disp_params[::2]
             )
-            if _is_attachment("multipart", name, has_filename):
+            if not root and _is_attachment("multipart", name, has_filename):
                 has_attachments = True
                 return
             for index, child in enumerate(part[0], 1):
@@ -205,7 +205,7 @@ def _text_sections(structure):
             has_filename |= any(
                 string(value).lower() == "filename" for value in disposition_params[::2]
             )
-        is_attachment = _is_attachment(kind, disposition_name, has_filename)
+        is_attachment = not root and _is_attachment(kind, disposition_name, has_filename)
         if is_attachment:
             has_attachments = True
         if kind == "text" and subtype in {"plain", "html"} and not is_attachment:
@@ -218,7 +218,7 @@ def _text_sections(structure):
                 )
             )
 
-    walk(structure, "")
+    walk(structure, "", root=True)
     sections.sort(key=lambda item: item[1] != "text/plain")
     return sections, has_attachments
 
