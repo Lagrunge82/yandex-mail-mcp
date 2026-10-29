@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 
 from pydantic import SecretStr
+
+from .credentials import TokenStore
+
+LOG = logging.getLogger(__name__)
 
 # Names a promotions folder must never take, compared case-insensitively.
 RESERVED_FOLDER_NAMES = frozenset(
@@ -55,8 +60,19 @@ def env_port(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class Settings:
-    email: str
-    app_password: SecretStr = field(repr=False)
+    """Server configuration.
+
+    IMAP credentials come from one source, in priority order: oauth_token
+    (YANDEX_OAUTH_TOKEN), stored_tokens (saved by `yandex-mail-mcp login`), then
+    app_password (YANDEX_APP_PASSWORD, deprecated).
+    """
+
+    email: str = ""
+    app_password: SecretStr | None = field(default=None, repr=False)
+    oauth_token: SecretStr | None = field(default=None, repr=False)
+    stored_tokens: bool = False
+    oauth_client_id: str = ""
+    oauth_client_secret: SecretStr = field(default=SecretStr(""), repr=False)
     imap_host: str = "imap.yandex.com"
     imap_port: int = 993
     allow_write: bool = False
@@ -67,16 +83,32 @@ class Settings:
     confirm_reversible: bool = True
 
     def __post_init__(self) -> None:
-        if isinstance(self.app_password, str):
-            object.__setattr__(self, "app_password", SecretStr(self.app_password))
+        for name in ("app_password", "oauth_token", "oauth_client_secret"):
+            if isinstance(getattr(self, name), str):
+                object.__setattr__(self, name, SecretStr(getattr(self, name)))
 
     @classmethod
-    def from_env(cls) -> Settings:
+    def from_env(cls, *, require_credentials: bool = True) -> Settings:
         email = os.getenv("YANDEX_EMAIL", "").strip()
-        password = SecretStr(os.getenv("YANDEX_APP_PASSWORD", "").strip())
-        if not email or not password.get_secret_value():
+        token = os.getenv("YANDEX_OAUTH_TOKEN", "").strip()
+        password = os.getenv("YANDEX_APP_PASSWORD", "").strip()
+        credentials: dict[str, object] = {}
+        if token:
+            if not email:
+                raise ConfigurationError("YANDEX_OAUTH_TOKEN requires YANDEX_EMAIL")
+            credentials = {"email": email, "oauth_token": SecretStr(token)}
+        elif (stored := TokenStore().load()) is not None:
+            credentials = {"email": stored.email, "stored_tokens": True}
+        elif password and email:
+            LOG.warning(
+                "YANDEX_APP_PASSWORD is deprecated; run `yandex-mail-mcp login` to sign in "
+                "with Yandex OAuth instead"
+            )
+            credentials = {"email": email, "app_password": SecretStr(password)}
+        elif require_credentials:
             raise ConfigurationError(
-                "Set YANDEX_EMAIL and YANDEX_APP_PASSWORD in the environment (see .env.example)"
+                "No Yandex credentials: run `yandex-mail-mcp login`, or set YANDEX_OAUTH_TOKEN "
+                "and YANDEX_EMAIL (see .env.example)"
             )
         promotions_folder = os.getenv("YANDEX_PROMOTIONS_FOLDER", "AI-Promotions").strip()
         if not promotions_folder:
@@ -92,8 +124,9 @@ class Settings:
         if idle_timeout < 0:
             raise ConfigurationError("YANDEX_IMAP_IDLE_TIMEOUT cannot be negative")
         return cls(
-            email=email,
-            app_password=password,
+            **credentials,  # type: ignore[arg-type]
+            oauth_client_id=os.getenv("YANDEX_OAUTH_CLIENT_ID", "").strip(),
+            oauth_client_secret=SecretStr(os.getenv("YANDEX_OAUTH_CLIENT_SECRET", "").strip()),
             imap_host=(os.getenv("YANDEX_IMAP_HOST") or "").strip() or "imap.yandex.com",
             imap_port=env_port("YANDEX_IMAP_PORT", 993),
             allow_write=env_bool("YANDEX_ALLOW_WRITE"),

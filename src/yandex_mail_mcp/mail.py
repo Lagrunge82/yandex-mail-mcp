@@ -39,7 +39,16 @@ from typing import Any
 from imapclient import IMAPClient
 from typing_extensions import TypedDict
 
-from .config import RESERVED_FOLDER_NAMES, Settings
+from .config import RESERVED_FOLDER_NAMES, ConfigurationError, Settings
+from .credentials import (
+    Credentials,
+    OAuthCredentials,
+    PasswordCredentials,
+    StaticTokenSource,
+    StoredTokenSource,
+    TokenStore,
+)
+from .yandex_oauth import YandexOAuth
 
 LOG = logging.getLogger(__name__)
 
@@ -567,9 +576,34 @@ def _address(field: str, value: str) -> str:
     return formataddr(pairs[0])
 
 
+def default_credentials(config: Settings) -> Credentials:
+    """The IMAP credentials Settings.from_env chose."""
+    if config.oauth_token is not None:
+        return OAuthCredentials(
+            config.email, StaticTokenSource(config.oauth_token.get_secret_value())
+        )
+    if config.stored_tokens:
+        store = TokenStore()
+        tokens = store.load()
+        if tokens is None:
+            raise MailError("The stored Yandex tokens are gone; run `yandex-mail-mcp login`")
+        if not config.oauth_client_id:
+            # Refreshing needs the application that issued the tokens.
+            raise ConfigurationError(
+                "Stored tokens require YANDEX_OAUTH_CLIENT_ID (and YANDEX_OAUTH_CLIENT_SECRET, "
+                "if set at login) in the server's environment"
+            )
+        oauth = YandexOAuth(config.oauth_client_id, config.oauth_client_secret.get_secret_value())
+        return OAuthCredentials(tokens.email, StoredTokenSource(store, tokens, oauth))
+    if config.app_password is not None:
+        return PasswordCredentials(config.email, config.app_password)
+    raise MailError("No Yandex credentials are configured; run `yandex-mail-mcp login`")
+
+
 class Mailbox:
-    def __init__(self, config: Settings):
+    def __init__(self, config: Settings, credentials: Credentials | None = None):
         self.config = config
+        self._credentials = credentials
         self.pool = ConnectionPool(
             self._open, size=config.imap_pool_size, idle_timeout=config.imap_idle_timeout
         )
@@ -582,11 +616,28 @@ class Mailbox:
             timeout=30,
         )
         try:
-            imap.login(self.config.email, self.config.app_password.get_secret_value())
+            self.credentials.login(imap)
         except BaseException:
             _close(imap)
             raise
         return imap
+
+    @property
+    def credentials(self) -> Credentials:
+        # Built on first use, so creating a Mailbox reads no keyring.
+        if self._credentials is None:
+            self._credentials = default_credentials(self.config)
+        return self._credentials
+
+    def use_credentials(self, credentials: Credentials) -> None:
+        """Log in new connections with these credentials from now on."""
+        self._credentials = credentials
+
+    def write_error(self) -> str | None:
+        """Why this mailbox may not change mail, or None when it may."""
+        if not self.config.allow_write:
+            return "Write operations are disabled. Set YANDEX_ALLOW_WRITE=true"
+        return self.credentials.read_only_reason()
 
     @contextmanager
     def connect(self) -> Iterator[IMAPClient]:
@@ -968,8 +1019,8 @@ class Mailbox:
         )
 
     def _require_write(self) -> None:
-        if not self.config.allow_write:
-            raise MailPermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
+        if (error := self.write_error()) is not None:
+            raise MailPermissionError(error)
 
     @staticmethod
     def _select_message(imap: IMAPClient, uid: int, folder: str) -> None:
@@ -1087,7 +1138,7 @@ class Mailbox:
                 original = parse_message(raw, in_reply_to_uid, max_body_chars=0)
                 reply = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
         message = EmailMessage(policy=policy.SMTP)
-        message["From"] = self.config.email
+        message["From"] = self.credentials.email
         if reply is not None and original is not None:
             if not recipients:
                 answer_to = str(reply.get("Reply-To") or reply.get("From") or "")
@@ -1109,7 +1160,7 @@ class Mailbox:
             message["Cc"] = ", ".join(copies)
         message["Subject"] = subject
         message["Date"] = formatdate(localtime=True)
-        message["Message-ID"] = make_msgid(domain=self.config.email.rpartition("@")[2] or None)
+        message["Message-ID"] = make_msgid(domain=self.credentials.email.rpartition("@")[2] or None)
         message.set_content(body, charset="utf-8", cte="quoted-printable")
         return original, Draft(folder=folder, message=message)
 

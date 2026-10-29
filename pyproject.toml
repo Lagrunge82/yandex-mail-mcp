@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "yandex-mail-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "Safe MCP tools for Yandex Mail"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,10 @@ dependencies = [
   "pydantic>=2.12,<3.0",
   # pydantic rejects typing.TypedDict on Python < 3.12; mail.py needs typing_extensions.
   "typing-extensions>=4.13,<5.0",
+  # Stores the tokens from `yandex-mail-mcp login` in the system keyring.
+  "keyring>=25.0,<26.0",
+  # AES-GCM for the tokens the HTTP authorization server issues.
+  "cryptography>=44.0,<51.0",
 ]
 
 [dependency-groups]

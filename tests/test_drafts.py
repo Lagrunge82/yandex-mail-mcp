@@ -235,3 +235,18 @@ def test_create_draft_annotations():
     assert annotations.read_only_hint is False
     assert annotations.destructive_hint is False
     assert annotations.idempotent_hint is False
+
+
+def test_draft_is_from_the_signed_in_user_not_the_server_address():
+    from yandex_mail_mcp.credentials import OAuthCredentials, StaticTokenSource
+
+    box = Mailbox(Settings(), OAuthCredentials("anna@company.ru", StaticTokenSource("t")))
+
+    @contextmanager
+    def connect():
+        yield DraftIMAP()
+
+    box.connect = connect
+    _, draft = box.prepare_draft(["a@example.com"], "s", "b")
+    assert parsed(draft)["From"] == "anna@company.ru"
+    assert draft.message["Message-ID"].endswith("@company.ru>")
