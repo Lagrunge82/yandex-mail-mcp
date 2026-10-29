@@ -623,6 +623,10 @@ class Mailbox:
             self._credentials = default_credentials(self.config)
         return self._credentials
 
+    def use_credentials(self, credentials: Credentials) -> None:
+        """Log in new connections with these credentials from now on."""
+        self._credentials = credentials
+
     def write_error(self) -> str | None:
         """Why this mailbox may not change mail, or None when it may."""
         if not self.config.allow_write:
