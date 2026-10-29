@@ -1,12 +1,20 @@
 import base64
 import imaplib
+import quopri
 from contextlib import contextmanager
 from email.message import EmailMessage
 
 import pytest
 
 from yandex_mail_mcp.config import Settings
-from yandex_mail_mcp.mail import Mailbox, MailError, MailValueError, parse_message, valid_uid
+from yandex_mail_mcp.mail import (
+    Mailbox,
+    MailError,
+    MailLookupError,
+    MailValueError,
+    parse_message,
+    valid_uid,
+)
 
 
 def test_parse_message_decodes_unicode_and_does_not_include_attachment():
@@ -462,3 +470,137 @@ def test_preview_rejects_server_without_move():
     box.connect = connect
     with pytest.raises(MailError, match="MOVE"):
         box.preview_promotions_move(3)
+
+
+class MoveIMAP:
+    """Records the IMAP calls move_to_promotions makes."""
+
+    def __init__(self, folders=(), move=True, inbox=(3,)):
+        self.calls = []
+        self._folders = list(folders)
+        self._move = move
+        self._inbox = list(inbox)
+
+    def list_folders(self):
+        self.calls.append(("list_folders",))
+        return self._folders
+
+    def has_capability(self, name):
+        self.calls.append(("has_capability", name))
+        return self._move
+
+    def create_folder(self, name):
+        self.calls.append(("create_folder", name))
+
+    def select_folder(self, name, readonly):
+        self.calls.append(("select_folder", name, readonly))
+
+    def search(self, criteria):
+        self.calls.append(("search", criteria))
+        return self._inbox
+
+    def move(self, uids, folder):
+        self.calls.append(("move", uids, folder))
+
+
+def writable_box(imap):
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+
+    @contextmanager
+    def connect():
+        yield imap
+
+    box.connect = connect
+    return box
+
+
+def test_move_creates_missing_folder_then_moves():
+    imap = MoveIMAP(folders=[((b"\\HasNoChildren",), b"|", "INBOX")])
+    result = writable_box(imap).move_to_promotions(3, confirm=True)
+    assert result == {"uid": 3, "moved_to": "AI-Promotions", "deleted_permanently": False}
+    assert imap.calls == [
+        ("list_folders",),
+        ("has_capability", "MOVE"),
+        ("create_folder", "AI-Promotions"),
+        ("select_folder", "INBOX", False),
+        ("search", ["UID", "3"]),
+        ("move", [3], "AI-Promotions"),
+    ]
+
+
+def test_move_requires_move_capability():
+    imap = MoveIMAP(move=False)
+    with pytest.raises(MailError, match="MOVE"):
+        writable_box(imap).move_to_promotions(3, confirm=True)
+    assert [call[0] for call in imap.calls] == ["list_folders", "has_capability"]
+
+
+def test_move_of_uid_missing_from_inbox_does_not_move():
+    imap = MoveIMAP(folders=[((b"\\HasNoChildren",), b"|", "AI-Promotions")], inbox=[])
+    with pytest.raises(MailLookupError, match="UID 3 not found in INBOX"):
+        writable_box(imap).move_to_promotions(3, confirm=True)
+    assert not any(call[0] in {"move", "create_folder"} for call in imap.calls)
+
+
+def single_part_imap(subtype, charset, encoding, body):
+    structure = (b"TEXT", subtype, (b"CHARSET", charset), None, None, encoding, len(body), 1)
+    structure += (None, None)
+
+    class IMAP:
+        def fetch(self, uids, fields):
+            if fields == ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"]:
+                header = b"Subject: Test\r\nFrom: a@example.com\r\n\r\n"
+                return {1: {b"BODY[HEADER]": header, b"BODYSTRUCTURE": structure}}
+            assert fields == ["BODY.PEEK[1]<0.16384>"]
+            return {1: {b"BODY[1]<0>": body}}
+
+    return IMAP()
+
+
+def test_fetch_decodes_quoted_printable_cyrillic():
+    body = "Оплатите счёт".encode()
+    imap = single_part_imap(b"PLAIN", b"UTF-8", b"QUOTED-PRINTABLE", quopri.encodestring(body))
+    assert Mailbox._fetch(imap, [1])[0]["preview"] == "Оплатите счёт"
+
+
+def test_fetch_falls_back_to_utf8_for_unknown_charset():
+    imap = single_part_imap(b"PLAIN", b"x-unknown", b"8BIT", "Привет".encode())
+    assert Mailbox._fetch(imap, [1])[0]["preview"] == "Привет"
+
+
+def test_fetch_extracts_text_from_html_section():
+    html = b"<html><style>p {}</style><body><p>Hello</p><p>world</p></body></html>"
+    imap = single_part_imap(b"HTML", b"UTF-8", b"7BIT", html)
+    assert Mailbox._fetch(imap, [1])[0]["preview"] == "Hello world"
+
+
+def test_search_falls_back_to_previews_when_server_search_fails():
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
+    fetched = []
+
+    class IMAP:
+        def select_folder(self, *args, **kwargs):
+            pass
+
+        def search(self, criteria, charset=None):
+            if criteria != ["ALL"]:
+                raise imaplib.IMAP4.error("SEARCH charset not supported")
+            return list(range(1, 401))
+
+    @contextmanager
+    def connect():
+        yield IMAP()
+
+    def fetch(imap, uids, max_body_chars):
+        fetched.extend(uids)
+        return [
+            {"uid": uid, "from": "", "subject": "Счёт" if uid % 100 == 0 else "", "preview": ""}
+            for uid in uids
+        ]
+
+    box.connect = connect
+    box._fetch = fetch
+    found = box.search("счёт", limit=2)
+    assert [message["uid"] for message in found] == [400, 300]
+    assert max(fetched) == 400
+    assert min(fetched) > 100  # Only the 300 newest messages are scanned.
