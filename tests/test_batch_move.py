@@ -1,6 +1,7 @@
 """move_emails: one confirmation that lists every message, one MOVE for the batch."""
 
 import asyncio
+import imaplib
 import json
 import logging
 from contextlib import contextmanager
@@ -15,12 +16,14 @@ from yandex_mail_mcp import server
 from yandex_mail_mcp.config import Settings
 from yandex_mail_mcp.confirmations import PendingActions
 from yandex_mail_mcp.mail import (
+    MAX_BATCH_INPUT,
     MAX_BATCH_MOVE,
     Mailbox,
     MailLookupError,
     MailPermissionError,
     MailValueError,
     batch_uids,
+    copyuid_sources,
 )
 
 FULL = "mail:imap_full login:info login:email"
@@ -41,7 +44,12 @@ def header(subject, sender):
 class BatchIMAP:
     """A folder of distinct messages; records fetches, selections and moves."""
 
-    def __init__(self):
+    def __init__(self, copyuid=True, moves=None, refuse=False):
+        # copyuid: answer MOVE with a UIDPLUS COPYUID line; moves: UIDs the server
+        # actually moves (None: all); refuse: answer NO after moving those.
+        self.copyuid = copyuid
+        self.moves = moves
+        self.refuse = refuse
         self.inbox = {
             3: header("Run failed: CI (0bac95a)", "Lagrunge <notifications@github.com>"),
             4: header("Run failed: Build image", "Lagrunge <notifications@github.com>"),
@@ -77,7 +85,16 @@ class BatchIMAP:
         return [uid for uid in self.inbox if uid in wanted]
 
     def move(self, uids, folder):
+        moved = [uid for uid in uids if self.moves is None or uid in self.moves]
         self.changes.append(("move", list(uids), folder))
+        for uid in moved:
+            del self.inbox[uid]
+        if self.refuse:
+            raise imaplib.IMAP4.error("MOVE failed: [SERVERBUG] Partial move")
+        if not self.copyuid:
+            return [b"Move completed."]
+        sources = ",".join(str(uid) for uid in moved)
+        return [f"[COPYUID 1587 {sources} 100:{99 + len(moved)}] Move completed.".encode()]
 
 
 def box_with(imap, **settings):
@@ -113,6 +130,29 @@ def test_batch_uids_are_validated_deduplicated_and_capped():
     with pytest.raises(MailValueError, match=f"at most {MAX_BATCH_MOVE}"):
         batch_uids(list(range(1, MAX_BATCH_MOVE + 2)))
     assert len(batch_uids(list(range(1, MAX_BATCH_MOVE + 1)))) == MAX_BATCH_MOVE
+    # Duplicates do not count against the cap; too many entries are refused up front.
+    assert batch_uids([7] * MAX_BATCH_INPUT) == [7]
+    with pytest.raises(MailValueError, match=f"at most {MAX_BATCH_INPUT} entries"):
+        batch_uids([7] * (MAX_BATCH_INPUT + 1))
+
+
+def test_batch_validation_stops_at_the_first_excess_uid():
+    class Counting(list):
+        def __iter__(self):
+            yield from (yielded.append(n) or n for n in super().__iter__())
+
+    yielded = []
+    with pytest.raises(MailValueError, match="at most"):
+        batch_uids(Counting(range(1, MAX_BATCH_INPUT + 1)))
+    assert len(yielded) == MAX_BATCH_MOVE + 1
+
+
+def test_copyuid_sources_are_parsed_or_absent():
+    assert copyuid_sources([b"[COPYUID 1587 3,5:7 100:103] Done"]) == {3, 5, 6, 7}
+    assert copyuid_sources(b"[COPYUID 2 4 9] ok") == {4}
+    assert copyuid_sources([b"Move completed."]) is None
+    assert copyuid_sources(None) is None
+    assert copyuid_sources([b"[COPYUID 1 1:99999999 1:99999999] ok"]) is None
 
 
 def test_preview_reads_every_header_at_once_and_names_missing_messages():
@@ -139,12 +179,46 @@ def test_move_many_issues_one_move_for_the_whole_batch():
     result = box.move_many([3, 4], "github|ci/cd")
     assert result == {
         "uids": [3, 4],
+        "moved": [3, 4],
+        "not_moved": [],
         "folder": "github|ci/cd",
         "action": "move",
         "reversible": True,
     }
     assert imap.changes == [("move", [3, 4], "github|ci/cd")]
     assert imap.selected[-1] == ("INBOX", False)
+
+
+def test_partial_move_is_reported_from_copyuid_even_when_the_server_says_no():
+    imap = BatchIMAP(moves=[3], refuse=False)
+    result = box_with(imap, allow_write=True).move_many([3, 4, 5], "github|ci/cd")
+    assert (result["moved"], result["not_moved"]) == ([3], [4, 5])
+    assert "moved only part of the batch; 2 messages are still in INBOX" in result["warning"]
+    refused = BatchIMAP(moves=[4], refuse=True)
+    result = box_with(refused, allow_write=True).move_many([3, 4], "github|ci/cd")
+    assert (result["moved"], result["not_moved"]) == ([4], [3])
+    assert "Partial move" in result["warning"]
+    # Nothing moved before the refusal: the error is the caller's to see.
+    with pytest.raises(imaplib.IMAP4.error, match="Partial move"):
+        box_with(BatchIMAP(moves=[], refuse=True), allow_write=True).move_many([3], "github")
+
+
+def test_without_copyuid_the_source_folder_is_read_again():
+    imap = BatchIMAP(copyuid=False, moves=[4])
+    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
+    assert (result["moved"], result["not_moved"]) == ([4], [3])
+    assert imap.selected[-1] == ("INBOX", False)
+
+    class Unreadable(BatchIMAP):
+        def search(self, criteria):
+            if self.changes:
+                raise imaplib.IMAP4.error("SEARCH failed")
+            return super().search(criteria)
+
+    imap = Unreadable(copyuid=False)
+    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
+    assert result["moved"] is None and result["not_moved"] is None
+    assert "check both folders" in result["warning"]
 
 
 def test_move_many_moves_nothing_when_a_message_is_missing_or_writes_are_off():
@@ -176,7 +250,7 @@ def test_tool_lists_every_message_in_one_confirmation(monkeypatch, caplog):
     assert lines[5].startswith('2. UID 4: sender "Lagrunge <notifications@github.com>"')
     record = json.loads(caplog.records[-1].getMessage())
     assert record["tool"] == "move_emails"
-    assert record["uids"] == [3, 4, 3]
+    assert record["uids"] == [3, 4]
     assert record["folder"] == "github|ci/cd"
     assert record["result"] == "ok"
 
@@ -230,6 +304,8 @@ def test_batch_from_a_client_without_elicitation_waits_for_the_browser(monkeypat
     assert pending.claim(action_id, "ivan", "approve") is waiting
     assert waiting.action() == {
         "uids": [3, 5],
+        "moved": [3, 5],
+        "not_moved": [],
         "folder": "github",
         "action": "move",
         "reversible": True,
@@ -237,8 +313,19 @@ def test_batch_from_a_client_without_elicitation_waits_for_the_browser(monkeypat
     assert imap.changes == [("move", [3, 5], "github")]
 
 
-def test_move_emails_is_listed_as_a_mutation():
-    tools = {tool.name: tool.annotations for tool in asyncio.run(server.mcp.list_tools())}
-    annotations = tools["move_emails"]
-    assert annotations.read_only_hint is False
-    assert annotations.destructive_hint is False
+def test_audit_records_the_batch_as_the_operation_used_it(monkeypatch, caplog):
+    imap = BatchIMAP()
+    monkeypatch.setattr(server, "_mailbox", lambda: box_with(imap, allow_write=True))
+    with caplog.at_level(logging.INFO, logger="yandex_mail_mcp.audit"):
+        asyncio.run(server.move_emails([3] * 25 + [4, 5], "github|ci/cd", Client()))
+    assert imap.changes == [("move", [3, 4, 5], "github|ci/cd")]
+    assert json.loads(caplog.records[-1].getMessage())["uids"] == [3, 4, 5]
+
+
+def test_move_emails_is_listed_as_a_mutation_with_a_bounded_input():
+    tools = {tool.name: tool for tool in asyncio.run(server.mcp.list_tools())}
+    tool = tools["move_emails"]
+    assert tool.annotations.read_only_hint is False
+    assert tool.annotations.destructive_hint is False
+    uids = tool.input_schema["properties"]["uids"]
+    assert (uids["minItems"], uids["maxItems"]) == (1, MAX_BATCH_INPUT)

@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from functools import lru_cache, wraps
-from typing import Any, TypeVar, cast
+from typing import Annotated, Any, TypeVar, cast
 from urllib.parse import urlsplit
 
 import anyio.to_thread
@@ -35,7 +35,7 @@ from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ClientCapabilities, ElicitationCapability, ToolAnnotations
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
@@ -56,7 +56,15 @@ from .config import ConfigurationError, Settings, env_int, env_port
 from .confirmations import ConfirmationFailed, PendingActions
 from .credentials import OAuthCredentials, ReauthenticationRequired, StaticTokenSource
 from .crypto import TokenCipher
-from .mail import MAX_BATCH_MOVE, Draft, Mailbox, MailError, MailSummary, ThreadMessage
+from .mail import (
+    MAX_BATCH_INPUT,
+    MAX_BATCH_MOVE,
+    Draft,
+    Mailbox,
+    MailError,
+    MailSummary,
+    ThreadMessage,
+)
 from .yandex_oauth import YandexOAuth, YandexOAuthError, can_write
 
 # One Mailbox, and so one connection pool, per account: keyed by Settings, or by
@@ -195,7 +203,8 @@ def _audit(tool: str, arguments: dict[str, Any], started: float, result: str) ->
     for field, names in AUDITED.items():
         value = next((arguments[name] for name in names if arguments.get(name) is not None), None)
         if isinstance(value, list) and all(isinstance(item, int) for item in value):
-            record[field] = value[:MAX_BATCH_MOVE]
+            # The list as the operation used it: duplicates dropped, order kept.
+            record[field] = list(dict.fromkeys(value))[:MAX_BATCH_MOVE]
         else:
             record[field] = value if isinstance(value, (int, str)) else None
     if isinstance(record["folder"], str):
@@ -818,17 +827,21 @@ async def move_email(
 @_tool(annotations=MUTATION, structured_output=False)
 @tool_errors
 async def move_emails(
-    uids: list[int], folder: str, ctx: Context, source_folder: str = "INBOX"
+    uids: Annotated[list[int], Field(min_length=1, max_length=MAX_BATCH_INPUT)],
+    folder: str,
+    ctx: Context,
+    source_folder: str = "INBOX",
 ) -> dict[str, Any]:
     """Move up to 25 messages from one folder to another existing folder, after the
     user confirms them all at once.
 
     The confirmation lists every message with its sender and subject, so use this
-    only for a set the user asked to move together; it moves all of them or none.
-    Same rules as move_email: the folder exactly as list_folders shows it ("|"
-    between nested levels on Yandex), YANDEX_ALLOW_WRITE=true, write access for this
-    connection, confirmation in the client or through confirm_url, never into Trash,
-    Spam, Drafts, Sent or folders inside them.
+    only for a set the user asked to move together. The result says which UIDs
+    moved and which did not: a server may move part of a batch. Same rules as
+    move_email: the folder exactly as list_folders shows it ("|" between nested
+    levels on Yandex), YANDEX_ALLOW_WRITE=true, write access for this connection,
+    confirmation in the client or through confirm_url, never into Trash, Spam,
+    Drafts, Sent or folders inside them.
     """
     mailbox = _mailbox()
     return await _confirmed_mutation(

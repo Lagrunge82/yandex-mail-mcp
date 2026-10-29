@@ -567,20 +567,56 @@ MAX_DRAFT_BODY = 100 * 1024
 # Messages one move_emails call may take: enough to clear a backlog, few enough that
 # the confirmation list is still read rather than skimmed.
 MAX_BATCH_MOVE = 25
+# Entries accepted in the uids argument before validation starts, duplicates included.
+MAX_BATCH_INPUT = 4 * MAX_BATCH_MOVE
 
 
 def batch_uids(uids: list[int]) -> list[int]:
-    """Validate a batch of UIDs: positive integers, no duplicates, 1 to MAX_BATCH_MOVE."""
+    """Validate a batch of UIDs: positive integers, no duplicates, 1 to MAX_BATCH_MOVE.
+
+    Stops at the first entry that makes the batch invalid, so an oversized list
+    costs no more than a valid one.
+    """
     if not isinstance(uids, list) or not uids:
         raise MailValueError("uids must list at least one message UID")
+    if len(uids) > MAX_BATCH_INPUT:
+        raise MailValueError(f"uids may hold at most {MAX_BATCH_INPUT} entries")
     unique: list[int] = []
+    seen: set[int] = set()
     for uid in uids:
         valid_uid(uid, "uids")
-        if uid not in unique:
-            unique.append(uid)
-    if len(unique) > MAX_BATCH_MOVE:
-        raise MailValueError(f"uids may list at most {MAX_BATCH_MOVE} messages per call")
+        if uid in seen:
+            continue
+        if len(unique) == MAX_BATCH_MOVE:
+            raise MailValueError(f"uids may list at most {MAX_BATCH_MOVE} messages per call")
+        seen.add(uid)
+        unique.append(uid)
     return unique
+
+
+_COPYUID = re.compile(rb"COPYUID \d+ ([0-9:,]+) [0-9:,]+")
+
+
+def copyuid_sources(response: Any) -> set[int] | None:
+    """The source UIDs a UIDPLUS server reports in COPYUID, or None without one."""
+    items = response if isinstance(response, (list, tuple)) else [response]
+    for item in items:
+        text = item if isinstance(item, bytes) else str(item).encode() if item else b""
+        match = _COPYUID.search(text)
+        if match is None:
+            continue
+        found: set[int] = set()
+        for part in match.group(1).decode().split(","):
+            low, _, high = part.partition(":")
+            try:
+                start, end = int(low), int(high or low)
+            except ValueError:
+                return None
+            if end - start > 10_000:
+                return None  # Not a batch this server sent; do not expand it.
+            found.update(range(start, end + 1))
+        return found
+    return None
 
 
 @dataclass(frozen=True)
@@ -1170,16 +1206,65 @@ class Mailbox:
     def move_many(
         self, uids: list[int], folder: str, source_folder: str = "INBOX"
     ) -> dict[str, Any]:
-        """Move a batch of messages with one MOVE; all of them, or none."""
+        """Move a batch of messages with one MOVE and report what actually moved.
+
+        RFC 6851 lets a server move part of the set, even when it answers NO, and
+        a message can vanish between the check and the MOVE. The result therefore
+        says which UIDs moved (from the server's COPYUID when it has UIDPLUS, else
+        by re-reading the source folder) and which did not; moved is None when
+        neither could be learned.
+        """
         uids = batch_uids(uids)
         self._require_write()
+        error: str | None = None
         with self.connect() as imap:
             destination = self._destination(imap, folder)
             if destination.casefold() == source_folder.strip().casefold():
                 raise MailValueError("The messages are already in that folder")
             self._select_messages(imap, uids, source_folder)
-            imap.move(uids, destination)
-        return {"uids": uids, "folder": destination, "action": "move", "reversible": True}
+            try:
+                moved = self._moved(imap, uids, imap.move(uids, destination))
+            except imaplib.IMAP4.abort:
+                raise
+            except imaplib.IMAP4.error as exc:
+                # The server may have moved some of the set before refusing the rest.
+                moved = self._moved(imap, uids, None)
+                if not moved:
+                    raise
+                error = str(exc)
+        result: dict[str, Any] = {
+            "uids": uids,
+            "moved": moved,
+            "not_moved": None if moved is None else [uid for uid in uids if uid not in moved],
+            "folder": destination,
+            "action": "move",
+            "reversible": True,
+        }
+        if moved is None:
+            result["warning"] = (
+                f"The server did not say which messages moved and {source_folder} could not "
+                "be re-read; check both folders before retrying"
+            )
+        elif result["not_moved"]:
+            result["warning"] = (
+                f"The server moved only part of the batch; {len(result['not_moved'])} "
+                f"messages are still in {source_folder}" + (f" ({error})" if error else "")
+            )
+        return result
+
+    @staticmethod
+    def _moved(imap: IMAPClient, uids: list[int], response: Any) -> list[int] | None:
+        """Which of uids left the selected folder: by COPYUID, else by searching again."""
+        sources = copyuid_sources(response) if response is not None else None
+        if sources is not None:
+            return [uid for uid in uids if uid in sources]
+        try:
+            left = set(imap.search(["UID", ",".join(str(uid) for uid in uids)]))
+        except imaplib.IMAP4.abort:
+            raise
+        except imaplib.IMAP4.error:
+            return None
+        return [uid for uid in uids if uid not in left]
 
     def preview_move(
         self, uid: int, folder: str | None = None, source_folder: str = "INBOX"
