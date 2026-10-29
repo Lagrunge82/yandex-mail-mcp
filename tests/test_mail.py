@@ -76,6 +76,44 @@ def test_inline_image_without_filename_counts_as_attachment_in_both_paths():
     assert _text_sections(structure)[1] is True
 
 
+def test_root_message_with_name_or_attachment_disposition_is_body_in_both_paths():
+    from yandex_mail_mcp.mail import _text_sections
+
+    raw = (
+        b"Subject: Report\r\n"
+        b'Content-Type: text/plain; charset="utf-8"; name="body.txt"\r\n'
+        b'Content-Disposition: attachment; filename="body.txt"\r\n'
+        b"\r\n"
+        b"Daily report body\r\n"
+    )
+    parsed = parse_message(raw, 1)
+    assert parsed["has_attachments"] is False
+    assert parsed["preview"] == "Daily report body"
+    structure = (
+        b"TEXT",
+        b"PLAIN",
+        (b"CHARSET", b"utf-8", b"NAME", b"body.txt"),
+        None,
+        None,
+        b"7BIT",
+        19,
+        1,
+        None,
+        (b"ATTACHMENT", (b"FILENAME", b"body.txt")),
+        None,
+    )
+    assert _text_sections(structure) == ([("1", "text/plain", "utf-8", "7BIT")], False)
+
+
+def test_root_message_of_non_text_type_is_still_an_attachment():
+    from yandex_mail_mcp.mail import _text_sections
+
+    raw = b"Subject: Scan\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.7\r\n"
+    assert parse_message(raw, 1)["has_attachments"] is True
+    structure = (b"APPLICATION", b"PDF", None, None, None, b"BASE64", 10, None, None, None)
+    assert _text_sections(structure) == ([], True)
+
+
 def test_html_blocks_and_entities_are_separated():
     msg = EmailMessage()
     msg.set_content(
