@@ -89,12 +89,14 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
     html_parts: list[str] = []
     has_attachments = False
 
-    def collect(part):
+    def collect(part, root=False):
         nonlocal has_attachments
+        # A name or attachment disposition on the message itself does not make its body
+        # an attachment; only a non-text root type does.
         if _is_attachment(
             part.get_content_maintype(),
-            part.get_content_disposition() or "",
-            part.get_filename() is not None,
+            "" if root else part.get_content_disposition() or "",
+            not root and part.get_filename() is not None,
         ):
             has_attachments = True
             return
@@ -115,7 +117,7 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
         else:
             html_parts.append(content)
 
-    collect(msg)
+    collect(msg, root=True)
     if text_parts:
         body = "\n".join(text_parts)
     else:
@@ -173,7 +175,7 @@ def _text_sections(structure):
             has_filename = isinstance(disp_params, (tuple, list)) and any(
                 string(value).lower() == "filename" for value in disp_params[::2]
             )
-            if _is_attachment("multipart", name, has_filename):
+            if path and _is_attachment("multipart", name, has_filename):
                 has_attachments = True
                 return
             for index, child in enumerate(part[0], 1):
@@ -204,7 +206,11 @@ def _text_sections(structure):
             has_filename |= any(
                 string(value).lower() == "filename" for value in disposition_params[::2]
             )
-        is_attachment = _is_attachment(kind, disposition_name, has_filename)
+        # As in parse_message, the root part is judged by its type only.
+        root = not path
+        is_attachment = _is_attachment(
+            kind, "" if root else disposition_name, has_filename and not root
+        )
         if is_attachment:
             has_attachments = True
         if kind == "text" and subtype in {"plain", "html"} and not is_attachment:

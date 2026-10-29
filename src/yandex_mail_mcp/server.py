@@ -118,8 +118,10 @@ class BearerAuth:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             headers = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
-            expected = b"Bearer " + self.token.encode("utf-8")
-            if len(headers) != 1 or not hmac.compare_digest(headers[0], expected):
+            scheme, _, credentials = headers[0].partition(b" ") if len(headers) == 1 else (b"",) * 3
+            if scheme.lower() != b"bearer" or not hmac.compare_digest(
+                credentials.lstrip(b" "), self.token.encode("utf-8")
+            ):
                 await PlainTextResponse(
                     "Unauthorized", status_code=401, headers={"WWW-Authenticate": "Bearer"}
                 )(scope, receive, send)

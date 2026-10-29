@@ -196,8 +196,16 @@ def test_bearer_auth_rejects_missing_and_wrong_token():
         [(b"authorization", b"Bearer secret"), (b"authorization", b"Bearer secret")],
     ):
         assert asyncio.run(run(headers))[0]["status"] == 401
-    asyncio.run(run([(b"authorization", b"Bearer secret")]))
-    assert len(calls) == 1
+    for headers in (
+        [(b"authorization", b"Basic secret")],
+        [(b"authorization", b"Bearersecret")],
+        [(b"authorization", b"Bearer")],
+        [(b"authorization", b"secret")],
+    ):
+        assert asyncio.run(run(headers))[0]["status"] == 401
+    for value in (b"Bearer secret", b"bearer secret", b"BEARER secret", b"Bearer  secret"):
+        assert asyncio.run(run([(b"authorization", value)])) == []
+    assert len(calls) == 4
 
 
 @pytest.mark.parametrize(
