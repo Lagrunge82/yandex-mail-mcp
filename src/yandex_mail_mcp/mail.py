@@ -17,6 +17,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import date
 from email import policy
 from email.message import MIMEPart
 from email.parser import BytesParser
@@ -143,6 +144,52 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
         "preview": body[: min(max_body_chars, 10000)],
         "has_attachments": has_attachments,
     }
+
+
+def _search_date(name: str, value: str) -> date:
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise MailValueError(f"{name} must be a date in YYYY-MM-DD format") from exc
+
+
+def search_criteria(
+    *,
+    query: str | None = None,
+    sender: str | None = None,
+    to: str | None = None,
+    subject: str | None = None,
+    since: str | None = None,
+    before: str | None = None,
+    unread: bool | None = None,
+    flagged: bool | None = None,
+) -> list[Any]:
+    """Build IMAP SEARCH criteria; IMAPClient quotes strings and formats dates."""
+    criteria: list[Any] = []
+    for name, key, value in (
+        ("query", "TEXT", query),
+        ("sender", "FROM", sender),
+        ("to", "TO", to),
+        ("subject", "SUBJECT", subject),
+    ):
+        if value is None:
+            continue
+        if not value.strip():
+            raise MailValueError(f"{name} cannot be empty")
+        criteria += [key, value]
+    since_date = None if since is None else _search_date("since", since)
+    before_date = None if before is None else _search_date("before", before)
+    if since_date and before_date and since_date >= before_date:
+        raise MailValueError("since must be earlier than before")
+    if since_date:
+        criteria += ["SINCE", since_date]
+    if before_date:
+        criteria += ["BEFORE", before_date]
+    if unread is not None:
+        criteria.append("UNSEEN" if unread else "SEEN")
+    if flagged is not None:
+        criteria.append("FLAGGED" if flagged else "UNFLAGGED")
+    return criteria
 
 
 def valid_uid(uid: int) -> int:
@@ -438,35 +485,88 @@ class Mailbox:
             uids = imap.search(["UNSEEN"] if unread_only else ["ALL"])
             return self._fetch(imap, sorted(uids)[-limit:][::-1])
 
-    def search(self, query: str, limit: int = 20, folder: str = "INBOX") -> list[MailSummary]:
-        """Search the server, falling back to the latest 300 previews if unsupported."""
-        if not query.strip():
-            raise MailValueError("query cannot be empty")
+    def search(
+        self,
+        query: str | None = None,
+        *,
+        sender: str | None = None,
+        to: str | None = None,
+        subject: str | None = None,
+        since: str | None = None,
+        before: str | None = None,
+        unread: bool | None = None,
+        flagged: bool | None = None,
+        has_attachments: bool | None = None,
+        limit: int = 20,
+        folder: str = "INBOX",
+    ) -> list[MailSummary]:
+        """Search the server with the given criteria, newest first.
+
+        A query alone falls back to the latest 300 previews if the server rejects it.
+        """
+        criteria = search_criteria(
+            query=query,
+            sender=sender,
+            to=to,
+            subject=subject,
+            since=since,
+            before=before,
+            unread=unread,
+            flagged=flagged,
+        )
+        if not criteria and has_attachments is None:
+            raise MailValueError("Give at least one search criterion")
         limit = max(1, min(limit, 100))
-        needle = query.casefold()
         with self.connect() as imap:
             imap.select_folder(folder, readonly=True)
             try:
-                uids = sorted(imap.search(["TEXT", query], charset="UTF-8"))[::-1]
+                uids = sorted(imap.search(criteria or ["ALL"], charset="UTF-8"))[::-1]
             except imaplib.IMAP4.abort:
                 raise
             except imaplib.IMAP4.error:
-                uids = sorted(imap.search(["ALL"]))[-300:][::-1]
-            else:
+                if query is None or criteria != ["TEXT", query] or has_attachments is not None:
+                    raise
+                return self._search_previews(imap, query, limit)
+            if has_attachments is None:
                 return self._fetch(imap, uids[:limit], max_body_chars=2000)
-            found: list[MailSummary] = []
-            for start in range(0, len(uids), 30):
-                for message in self._fetch(imap, uids[start : start + 30], max_body_chars=2000):
-                    if (
-                        needle
-                        in " ".join(
-                            [message["from"], message["subject"], message["preview"]]
-                        ).casefold()
-                    ):
-                        found.append(message)
-                        if len(found) >= limit:
-                            return found
-            return found
+            return self._filter_attachments(imap, uids, has_attachments, limit)
+
+    def _search_previews(self, imap: IMAPClient, query: str, limit: int) -> list[MailSummary]:
+        needle = query.casefold()
+        uids = sorted(imap.search(["ALL"]))[-300:][::-1]
+        found: list[MailSummary] = []
+        for start in range(0, len(uids), 30):
+            for message in self._fetch(imap, uids[start : start + 30], max_body_chars=2000):
+                if (
+                    needle
+                    in " ".join(
+                        [message["from"], message["subject"], message["preview"]]
+                    ).casefold()
+                ):
+                    found.append(message)
+                    if len(found) >= limit:
+                        return found
+        return found
+
+    def _filter_attachments(
+        self, imap: IMAPClient, uids: list[int], has_attachments: bool, limit: int
+    ) -> list[MailSummary]:
+        """Keep messages whose MIME structure matches, scanning at most 500 candidates."""
+        found: list[MailSummary] = []
+        candidates = uids[:500]
+        for start in range(0, len(candidates), 50):
+            batch = candidates[start : start + 50]
+            structures = imap.fetch(batch, ["BODYSTRUCTURE"])
+            matching = [
+                uid
+                for uid in batch
+                if structures.get(uid, {}).get(b"BODYSTRUCTURE")
+                and _text_sections(structures[uid][b"BODYSTRUCTURE"])[1] == has_attachments
+            ]
+            found.extend(self._fetch(imap, matching[: limit - len(found)], max_body_chars=2000))
+            if len(found) >= limit:
+                break
+        return found
 
     def message(self, uid: int, folder: str = "INBOX") -> MailSummary:
         valid_uid(uid)
