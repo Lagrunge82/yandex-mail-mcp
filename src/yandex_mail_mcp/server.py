@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from imapclient.exceptions import LoginError
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
@@ -53,7 +54,7 @@ from .config import ConfigurationError, Settings, env_int
 from .credentials import OAuthCredentials, StaticTokenSource
 from .crypto import TokenCipher
 from .mail import Draft, Mailbox, MailError, MailSummary, ThreadMessage
-from .yandex_oauth import YandexOAuth, YandexOAuthError
+from .yandex_oauth import YandexOAuth, YandexOAuthError, can_write
 
 # One Mailbox, and so one connection pool, per account: keyed by Settings, or by
 # ("user", login) for users signed in through the HTTP authorization server.
@@ -171,8 +172,7 @@ AUDITED = {"folder": ("folder", "source_folder", "reply_folder"), "uid": ("uid",
 
 def _audit(tool: str, arguments: dict[str, Any], started: float, result: str) -> None:
     """One JSON line per tool call: who, which tool, where, and how it ended."""
-    token = get_access_token()
-    claims = (token.claims or {}) if token is not None else {}
+    token, claims = _signed_in()
     record: dict[str, Any] = {
         "time": datetime.now(UTC).isoformat(timespec="milliseconds"),
         "yandex_login": claims.get("yandex_login"),
@@ -336,15 +336,38 @@ def build_oauth_app(
     return app
 
 
-def _mailbox() -> Mailbox:
+HTTP_REAUTH_HINT = "reconnect this server in your MCP client and allow full mail access"
+
+
+def _signed_in() -> tuple[AccessToken | None, dict[str, Any]]:
+    """The request's access token and its claims; the claims of a Yandex user carry
+    yandex_access_token (see YandexAuthProvider.load_access_token)."""
     token = get_access_token()
-    claims = (token.claims or {}) if token is not None else {}
+    return token, (token.claims or {}) if token is not None else {}
+
+
+def _write_error(mailbox: Mailbox) -> str | None:
+    """Why the caller may not change mail, or None when they may."""
+    token, claims = _signed_in()
+    if token is None or "yandex_access_token" not in claims:
+        return mailbox.write_error()
+    # Per request, not from the shared per-login Mailbox: two clients of one user can
+    # hold tokens with different scopes.
+    if not mailbox.config.allow_write:
+        return "Write operations are disabled. Set YANDEX_ALLOW_WRITE=true"
+    if SCOPE_WRITE not in token.scopes or not can_write(str(claims["yandex_scope"])):
+        return f"Your access is read-only. Sign in again with write access: {HTTP_REAUTH_HINT}"
+    return None
+
+
+def _mailbox() -> Mailbox:
+    _, claims = _signed_in()
     if "yandex_access_token" in claims:
         # A user signed in through the authorization server: their own Yandex token.
         credentials = OAuthCredentials(
             str(claims["yandex_email"]),
             StaticTokenSource(str(claims["yandex_access_token"]), str(claims["yandex_scope"])),
-            reauth_hint="reconnect this server in your MCP client and allow full mail access",
+            reauth_hint=HTTP_REAUTH_HINT,
         )
         key = ("user", str(claims["yandex_login"]))
         with _mailboxes_lock:
@@ -490,8 +513,7 @@ async def logout() -> dict[str, Any]:
 
     Mail is not changed. Use it only when the user asks to sign out or disconnect.
     """
-    token = get_access_token()
-    claims = (token.claims or {}) if token is not None else {}
+    _, claims = _signed_in()
     if "yandex_access_token" not in claims or _yandex_oauth is None:
         raise ToolError(
             "logout signs out of the multi-user HTTP server; "
@@ -502,12 +524,12 @@ async def logout() -> dict[str, Any]:
         await anyio.to_thread.run_sync(lambda: oauth.revoke(yandex_token))
     except YandexOAuthError as exc:
         raise ToolError(f"Yandex did not revoke the token ({exc.error}); please retry") from exc
-    login = str(claims["yandex_login"])
+    yandex_login = str(claims["yandex_login"])
     with _mailboxes_lock:
-        mailbox = _mailboxes.pop(("user", login), None)
+        mailbox = _mailboxes.pop(("user", yandex_login), None)
     if mailbox is not None:
         await anyio.to_thread.run_sync(mailbox.close)
-    return {"signed_out": login, "revoked": True}
+    return {"signed_out": yandex_login, "revoked": True}
 
 
 class MoveConfirmation(BaseModel):
@@ -546,7 +568,7 @@ async def _confirmed_mutation(
     the email's sender and subject, if there is an email, follow as untrusted
     single lines.
     """
-    if (error := await anyio.to_thread.run_sync(mailbox.write_error)) is not None:
+    if (error := await anyio.to_thread.run_sync(lambda: _write_error(mailbox))) is not None:
         raise ToolError(error)
     message, target = await anyio.to_thread.run_sync(preview)
     if confirm:

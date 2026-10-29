@@ -39,7 +39,7 @@ from typing import Any
 from imapclient import IMAPClient
 from typing_extensions import TypedDict
 
-from .config import RESERVED_FOLDER_NAMES, Settings
+from .config import RESERVED_FOLDER_NAMES, ConfigurationError, Settings
 from .credentials import (
     Credentials,
     OAuthCredentials,
@@ -587,6 +587,12 @@ def default_credentials(config: Settings) -> Credentials:
         tokens = store.load()
         if tokens is None:
             raise MailError("The stored Yandex tokens are gone; run `yandex-mail-mcp login`")
+        if not config.oauth_client_id:
+            # Refreshing needs the application that issued the tokens.
+            raise ConfigurationError(
+                "Stored tokens require YANDEX_OAUTH_CLIENT_ID (and YANDEX_OAUTH_CLIENT_SECRET, "
+                "if set at login) in the server's environment"
+            )
         oauth = YandexOAuth(config.oauth_client_id, config.oauth_client_secret.get_secret_value())
         return OAuthCredentials(tokens.email, StoredTokenSource(store, tokens, oauth))
     if config.app_password is not None:

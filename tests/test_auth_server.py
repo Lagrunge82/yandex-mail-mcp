@@ -130,8 +130,9 @@ def query_of(url):
 class Flow:
     """Drives the OAuth flow against the ASGI app, as an MCP client and its browser would."""
 
-    def __init__(self, client):
+    def __init__(self, client, provider=None):
         self.client = client
+        self.provider = provider
 
     async def register(self):
         response = await self.client.post(
@@ -203,13 +204,24 @@ def run_flow(scenario, *, yandex=None, settings=None, db=":memory:"):
     yandex = yandex or FakeYandex()
 
     async def main():
-        app = server.build_oauth_app(
-            settings or Settings(), PUBLIC, generate_key(), db, oauth=yandex
-        )
+        providers = []
+        original = server.YandexAuthProvider
+
+        def capture(**kwargs):
+            providers.append(original(**kwargs))
+            return providers[-1]
+
+        server.YandexAuthProvider = capture
+        try:
+            app = server.build_oauth_app(
+                settings or Settings(), PUBLIC, generate_key(), db, oauth=yandex
+            )
+        finally:
+            server.YandexAuthProvider = original
         async with app.router.lifespan_context(app):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url=PUBLIC) as client:
-                return await scenario(Flow(client))
+                return await scenario(Flow(client, providers[0]))
 
     return asyncio.run(main()), yandex
 
@@ -412,6 +424,7 @@ def test_expired_access_token_is_rejected():
         oauth=FakeYandex(),
         public_url=PUBLIC,
         allow_write=False,
+        allowed_users=frozenset({"ivan"}),
         clock=clock,
     )
     grant = {
