@@ -7,6 +7,7 @@ import logging
 import imaplib
 import hmac
 import inspect
+import ssl
 from functools import lru_cache, wraps
 
 from dotenv import load_dotenv
@@ -35,6 +36,14 @@ mcp = MCPServer(
 )
 
 
+def _imap_address() -> str:
+    try:
+        settings = _settings()
+    except ConfigurationError:
+        return "the IMAP server"
+    return f"IMAP server {settings.imap_host}:{settings.imap_port}"
+
+
 def tool_errors(fn):
     def translate(exc):
         if isinstance(exc, LoginError):
@@ -45,10 +54,21 @@ def tool_errors(fn):
             return ToolError("IMAP connection was interrupted; please retry")
         if isinstance(exc, imaplib.IMAP4.error):
             return ToolError(f"IMAP request failed: {exc}")
-        if isinstance(exc, TimeoutError):
-            return ToolError("IMAP connection timed out; please retry")
+        # MailPermissionError is an OSError; keep its own message.
         if isinstance(exc, (MailError, ConfigurationError)):
             return ToolError(str(exc))
+        if isinstance(exc, TimeoutError):
+            return ToolError("IMAP connection timed out; please retry")
+        if isinstance(exc, ssl.SSLError):
+            return ToolError(
+                f"TLS handshake with {_imap_address()} failed; "
+                "check YANDEX_IMAP_HOST and the certificate chain"
+            )
+        if isinstance(exc, OSError):
+            return ToolError(
+                f"Cannot connect to {_imap_address()}; "
+                "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access"
+            )
         return None
 
     if inspect.iscoroutinefunction(fn):
