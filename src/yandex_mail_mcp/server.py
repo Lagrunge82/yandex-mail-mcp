@@ -511,7 +511,8 @@ def get_thread(uid: int, folder: str = "INBOX", limit: int = 50) -> list[ThreadM
 async def logout() -> dict[str, Any]:
     """Sign out of this server: revoke your Yandex access, ending every token it issued you.
 
-    Mail is not changed. Use it only when the user asks to sign out or disconnect.
+    Mail is not changed, but every MCP client of yours loses access to this server
+    until it signs in again. Use it only when the user asks to sign out or disconnect.
     """
     _, claims = _signed_in()
     if "yandex_access_token" not in claims or _yandex_oauth is None:
