@@ -33,8 +33,9 @@ class ConfigurationError(ValueError):
 
 
 def env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
+    # A blank value, as in "NAME=" or an unset Compose substitution, means the default.
+    value = (os.getenv(name) or "").strip().lower()
+    return default if not value else value in {"1", "true", "yes", "on"}
 
 
 def env_int(name: str, default: int) -> int:

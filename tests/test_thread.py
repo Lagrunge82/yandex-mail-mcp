@@ -198,3 +198,46 @@ def test_invalid_before_uid_is_rejected(value):
     box = Mailbox(Settings(email="test@yandex.com", app_password="x"))
     with pytest.raises(MailValueError, match="before_uid must be a positive integer"):
         box.recent(before_uid=value)
+
+
+def test_ids_that_cannot_be_sent_as_atoms_are_not_searched():
+    folders = conversation()
+    folders["INBOX"][2] = header(
+        "<c@x>", "Sat, 03 Oct 2026 09:00:00 +0000", "<b@x>", "<a@x> <b%c(d)@y> <тест@x> <b@x>"
+    )
+    imap = ThreadIMAP(folders)
+    result = mailbox(imap).thread(2)
+    assert [item["message_id"] for item in result] == ["<a@x>", "<b@x>", "<c@x>"]
+    tokens = [token for _, criteria in imap.searches for token in criteria]
+    assert "<b%c(d)@y>" not in tokens
+    assert "<тест@x>" not in tokens
+
+
+def test_lower_case_sent_flag_is_searched():
+    imap = ThreadIMAP(conversation())
+    imap.list_folders = lambda: [
+        ((b"\\HasNoChildren",), b"|", "INBOX"),
+        ((b"\\sent",), b"|", "Отправленные"),
+    ]
+    result = mailbox(imap).thread(1)
+    assert ("Отправленные", 7) in [(item["folder"], item["uid"]) for item in result]
+
+
+def test_thread_fetches_at_most_limit_messages():
+    root = header("<root@x>", "Thu, 01 Oct 2026 10:00:00 +0300")
+    replies = {
+        uid: header(f"<{uid}@x>", "Fri, 02 Oct 2026 10:00:00 +0300", "<root@x>", "<root@x>")
+        for uid in range(2, 802)
+    }
+    imap = ThreadIMAP({"INBOX": {1: root, **replies}})
+    fetched = []
+    fetch = imap.fetch
+
+    def recording_fetch(uids, fields):
+        if fields == ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"]:
+            fetched.append(len(uids))
+        return fetch(uids, fields)
+
+    imap.fetch = recording_fetch
+    assert len(mailbox(imap).thread(1, limit=5)) == 5
+    assert fetched == [4]

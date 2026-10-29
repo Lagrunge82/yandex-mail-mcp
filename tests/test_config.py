@@ -108,3 +108,13 @@ def test_archive_and_confirmation_settings_from_env(monkeypatch):
     monkeypatch.setenv("MCP_CONFIRM_REVERSIBLE", "false")
     settings = Settings.from_env()
     assert (settings.archive_folder, settings.confirm_reversible) == ("Архив", False)
+
+
+def test_blank_boolean_uses_default(monkeypatch):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.setenv("MCP_CONFIRM_REVERSIBLE", " ")
+    monkeypatch.setenv("YANDEX_ALLOW_WRITE", "")
+    settings = Settings.from_env()
+    assert settings.confirm_reversible is True
+    assert settings.allow_write is False
