@@ -2,8 +2,6 @@
 .env
 .env.*
 !.env.example
-*.sqlite
-*.sqlite3
 *.db
 data/
 __pycache__/

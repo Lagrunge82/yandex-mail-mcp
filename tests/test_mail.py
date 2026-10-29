@@ -263,12 +263,11 @@ def test_fetch_batches_sections_and_handles_incomplete_base64_and_missing_struct
                 }
             return {1: {b"BODY[1]<0>": data}, 2: {b"BODY[1]<0>": base64.b64encode(b"second")}}
 
-    result = Mailbox._fetch(IMAP(), [1, 2, 3], include_errors=True)
+    result = Mailbox._fetch(IMAP(), [1, 2, 3])
+    assert [item["uid"] for item in result] == [1, 2]
     assert result[0]["preview"].startswith("Привет")
     assert result[1]["preview"] == "second"
-    assert result[2]["uid"] == 3 and result[2]["_fetch_error"] is True
     assert calls[1] == ([1, 2], ["BODY.PEEK[1]<0.16384>"])
-    assert [item["uid"] for item in Mailbox._fetch(IMAP(), [1, 2, 3])] == [1, 2]
 
 
 def test_search_does_not_fallback_on_aborted_connection():

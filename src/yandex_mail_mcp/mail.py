@@ -17,7 +17,7 @@ from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from typing import Iterator
-from typing_extensions import NotRequired, TypedDict
+from typing_extensions import TypedDict
 
 from imapclient import IMAPClient
 
@@ -36,7 +36,6 @@ MailSummary = TypedDict(
         "date": str,
         "preview": str,
         "has_attachments": bool,
-        "_fetch_error": NotRequired[bool],
     },
 )
 
@@ -239,13 +238,7 @@ class Mailbox:
             yield imap
 
     @staticmethod
-    def _fetch(
-        imap: IMAPClient,
-        uids: list[int],
-        max_body_chars: int = 4000,
-        *,
-        include_errors: bool = False,
-    ) -> list[MailSummary]:
+    def _fetch(imap: IMAPClient, uids: list[int], max_body_chars: int = 4000) -> list[MailSummary]:
         if not uids:
             return []
         fetched = imap.fetch(uids, ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"])
@@ -254,20 +247,7 @@ class Mailbox:
 
         def failure(uid):
             LOG.warning("Incomplete IMAP response for UID %s", uid)
-            if include_errors:
-                summaries[uid] = {
-                    "uid": uid,
-                    "message_id": "",
-                    "subject": "",
-                    "from": "",
-                    "to": "",
-                    "date": "",
-                    "preview": "",
-                    "has_attachments": False,
-                    "_fetch_error": True,
-                }
-            else:
-                summaries.pop(uid, None)
+            summaries.pop(uid, None)
 
         for uid in uids:
             if uid not in fetched:
