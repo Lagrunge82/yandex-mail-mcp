@@ -179,6 +179,8 @@ def test_save_requires_write_opt_in():
 
 
 class Client:
+    session = SimpleNamespace(check_client_capability=lambda capability: True)
+
     def __init__(self, action="accept", approve=True):
         self.action, self.approve, self.messages = action, approve, []
 

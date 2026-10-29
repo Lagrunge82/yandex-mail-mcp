@@ -203,6 +203,21 @@ def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
         server.main([])
 
 
+def test_http_port_outside_the_valid_range_is_rejected(monkeypatch):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("MCP_PORT", "70000")
+    monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+    )
+    monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match="MCP_PORT must be a port number"):
+        server.main([])
+
+
 def test_specific_host_is_allowed_by_default(monkeypatch):
     monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
     monkeypatch.setenv("MCP_HOST", "192.168.1.5")
@@ -324,6 +339,8 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
             return {"uid": uid}
 
     class Client:
+        session = SimpleNamespace(check_client_capability=lambda capability: True)
+
         async def elicit(self, message, schema):
             return SimpleNamespace(action=action, data=SimpleNamespace(approve=approved))
 
@@ -351,6 +368,8 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
             return headers, "Промо"
 
     class Client:
+        session = SimpleNamespace(check_client_capability=lambda capability: True)
+
         async def elicit(self, message, schema):
             messages.append(message)
             return SimpleNamespace(action="decline", data=None)
@@ -389,6 +408,8 @@ def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
     box.move_to_promotions = lambda **kwargs: moved.append(kwargs)
 
     class Client:
+        session = SimpleNamespace(check_client_capability=lambda capability: True)
+
         async def elicit(self, message, schema):
             elicited.append(message)
 

@@ -33,7 +33,7 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, Re
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import ClientCapabilities, ElicitationCapability, ToolAnnotations
 from pydantic import BaseModel
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -50,7 +50,7 @@ from .auth_server import (
     RateLimit,
     YandexAuthProvider,
 )
-from .config import ConfigurationError, Settings, env_int
+from .config import ConfigurationError, Settings, env_int, env_port
 from .credentials import OAuthCredentials, StaticTokenSource
 from .crypto import TokenCipher
 from .mail import Draft, Mailbox, MailError, MailSummary, ThreadMessage
@@ -559,6 +559,7 @@ async def _confirmed_mutation(
     *,
     name: str,
     confirm: bool = True,
+    reversible: bool = False,
 ) -> dict[str, Any]:
     """Check the write opt-in, validate, ask the user, then act.
 
@@ -566,10 +567,26 @@ async def _confirmed_mutation(
     and a target (such as the destination folder), so an invalid request fails
     before the user is asked. question(target) is the first lines of the request;
     the email's sender and subject, if there is an email, follow as untrusted
-    single lines.
+    single lines. reversible says whether the operator may skip the confirmation
+    with MCP_CONFIRM_REVERSIBLE=false, for the error shown when the client cannot ask.
     """
     if (error := await anyio.to_thread.run_sync(lambda: _write_error(mailbox))) is not None:
         raise ToolError(error)
+    if confirm and not ctx.session.check_client_capability(
+        ClientCapabilities(elicitation=ElicitationCapability())
+    ):
+        # The SDK would send the request anyway and surface the client's generic
+        # "method not found" error; say what is missing instead.
+        raise ToolError(
+            f"{name} needs the user's confirmation, but this MCP client does not support "
+            "elicitation. Use a client that does"
+            + (
+                ", or set MCP_CONFIRM_REVERSIBLE=false to skip confirmation for this "
+                "reversible change"
+                if reversible
+                else ""
+            )
+        )
     message, target = await anyio.to_thread.run_sync(preview)
     if confirm:
         text = question(target)
@@ -655,6 +672,7 @@ async def _flag_change(
         lambda target: mailbox.set_flag(uid, flag, value, target),
         name=name,
         confirm=mailbox.config.confirm_reversible,
+        reversible=True,
     )
 
 
@@ -736,6 +754,7 @@ async def create_draft(
         mailbox.save_draft,
         name="Draft",
         confirm=mailbox.config.confirm_reversible,
+        reversible=True,
     )
 
 
@@ -805,7 +824,7 @@ def main(argv: list[str] | None = None) -> None:
         mcp.run()
     elif transport == "streamable-http":
         host = os.getenv("MCP_HOST", "127.0.0.1").strip()
-        port = env_int("MCP_PORT", 8000)
+        port = env_port("MCP_PORT", 8000)
         token = os.getenv("MCP_AUTH_TOKEN", "").strip()
         public_url = _public_url()
         if public_url and token:

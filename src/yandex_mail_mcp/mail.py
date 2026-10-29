@@ -1025,22 +1025,32 @@ class Mailbox:
 
         Moves never create folders and never target Trash, Spam, Drafts, Sent,
         virtual folders, or folders nested inside Trash, Spam, Drafts or Sent.
+        IMAP folder names are case-sensitive (except INBOX), so the folder is
+        matched exactly first, then case-insensitively when that is unambiguous.
         listing is a LIST result the caller already has, to avoid a second LIST.
         """
         folder = folder.strip()
         if not folder:
             raise MailValueError("folder cannot be empty")
         folders = {
-            str(name).casefold(): (
+            str(name): (
                 _flag_names(flags),
                 delimiter.decode() if isinstance(delimiter, bytes) else delimiter,
-                str(name),
             )
             for flags, delimiter, name in (imap.list_folders() if listing is None else listing)
         }
-        if folder.casefold() not in folders:
+        matching = [folder] if folder in folders else []
+        if not matching:
+            matching = [name for name in folders if name.casefold() == folder.casefold()]
+        if not matching:
             raise MailLookupError(f"Folder {folder!r} not found; moves do not create folders")
-        flags, delimiter, name = folders[folder.casefold()]
+        if len(matching) > 1:
+            raise MailValueError(
+                f"Folder {folder!r} is ambiguous: several folders differ only by case. "
+                "Give the name exactly as list_folders shows it"
+            )
+        name = matching[0]
+        flags, delimiter = folders[name]
         unsafe = MailValueError(
             "Messages cannot be moved to Trash, Spam, Drafts, Sent, virtual folders "
             "or folders inside them"
@@ -1050,7 +1060,7 @@ class Mailbox:
         components = name.split(delimiter) if delimiter else [name]
         for depth in range(1, len(components) + 1):
             ancestor = (delimiter or "").join(components[:depth])
-            ancestor_flags = folders.get(ancestor.casefold(), (set(),))[0]
+            ancestor_flags = folders.get(ancestor, (set(), None))[0]
             if ancestor_flags & SYSTEM_FOLDER_FLAGS or (
                 ancestor.casefold() in RESERVED_FOLDER_NAMES - {"inbox"}
             ):
