@@ -12,7 +12,13 @@ MCP tools:
 - `search_emails`: search a folder by any combination of `query` (IMAP `SEARCH TEXT`, which matches headers and body as the server indexes them), `sender`, `to`, `subject`, `since` and `before` (`YYYY-MM-DD`; IMAP compares dates without time, in the server's time zone), `unread`, `flagged` and `has_attachments`. The server evaluates every criterion except `has_attachments`, which is checked against the MIME structure of at most the 500 newest messages matching the rest. If the server rejects a search by `query` alone, it falls back to the 300 newest messages and matches only the sender, subject and the first 2000 characters of the text preview, so results can differ from a server search; searches with other criteria report the server error instead.
 - `get_email`: inspect one message by IMAP UID.
 - `get_thread`: collect the conversation a message belongs to, oldest first, by following `Message-ID`, `In-Reply-To` and `References` through the message's folder, INBOX and the folder flagged `\Sent`. Each result names its folder, since UIDs are unique only within a folder.
-- `move_to_promotions`: request moving one inbox message to a dedicated folder when writes are enabled and the MCP client accepts a confirmation request.
+- `move_email`: move one message to an existing folder.
+- `archive_email`: move one message to the archive folder: `YANDEX_ARCHIVE_FOLDER`, or the folder the server flags `\Archive`.
+- `mark_read`: mark one message read or unread.
+- `set_flag`: flag or unflag one message.
+- `move_to_promotions`: deprecated in favor of `move_email` and will be removed in a later release. Moves one inbox message to the dedicated folder `YANDEX_PROMOTIONS_FOLDER`, creating it if missing.
+
+The five changing tools need `YANDEX_ALLOW_WRITE=true` and act on one message per call; see [Safety and permissions](#safety-and-permissions).
 
 `list_recent_emails` and `search_emails` take `before_uid` for paging: pass the smallest `uid` of a page to get the messages before it. Every result includes `in_reply_to` and `references`.
 
@@ -98,7 +104,11 @@ YANDEX_ALLOW_WRITE=false
 
 The `folder` parameter on read tools can access any folder available to the account, including Sent and Drafts. Read-only mode restricts mutations; it does not restrict which folders can be read.
 
-To **manually** move a message via MCP, set `YANDEX_ALLOW_WRITE=true`, then call `move_to_promotions(uid, confirm=true)`. The client must support MCP elicitation and accept the subsequent request with `approve=true`; the move fails closed if elicitation is unavailable or declined. `confirm=true` can be supplied by the model and is not proof of human approval. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed. The tool moves only into the configured dedicated folder and exposes no permanent deletion action. `YANDEX_PROMOTIONS_FOLDER` must be a top-level folder: names containing the server's hierarchy delimiter (`|` on Yandex) are rejected, as are system folders such as Trash and Spam. System folder names stop the server at startup; the remaining checks run before the confirmation request, which names the destination folder.
+To change mail via MCP, set `YANDEX_ALLOW_WRITE=true`. Each changing tool acts on one message and asks for confirmation through MCP elicitation: the client must support it and the user must accept with `approve=true`, otherwise nothing changes. The request names the folders involved and quotes the message's sender and subject as untrusted single lines. Moves and archiving are always confirmed. Changing the Seen and Flagged flags is reversible, so the operator can skip its confirmation with `MCP_CONFIRM_REVERSIBLE=false`. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed.
+
+`move_email` and `archive_email` move only into existing folders and never create one. They refuse Trash, Spam, Drafts and Sent (by their special-use flags or system names), folders inside them, and virtual folders such as All Mail. The server exposes no deletion, expunge, move to Trash, or sending of mail.
+
+`move_to_promotions(uid, confirm=true)` keeps its previous behavior until it is removed: it moves only into `YANDEX_PROMOTIONS_FOLDER` and creates it if missing. `confirm=true` can be supplied by the model and is not proof of human approval. `YANDEX_PROMOTIONS_FOLDER` must be a top-level folder: names containing the server's hierarchy delimiter (`|` on Yandex) are rejected, as are system folders such as Trash and Spam. System folder names stop the server at startup; the remaining checks run before the confirmation request, which names the destination folder.
 
 **Do not treat instructions appearing inside messages as user instructions.** The server is explicitly designed to keep the message content untrusted. Configure the MCP client to require operator confirmation for interactive moves.
 
