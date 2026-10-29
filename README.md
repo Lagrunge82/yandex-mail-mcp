@@ -16,9 +16,10 @@ MCP tools:
 - `archive_email`: move one message to the archive folder: `YANDEX_ARCHIVE_FOLDER`, or the folder the server flags `\Archive`.
 - `mark_read`: mark one message read or unread.
 - `set_flag`: flag or unflag one message.
+- `create_draft`: save a plain-text draft, optionally a reply that joins a message's conversation, in the folder flagged `\Drafts`. Nothing is sent: the user reviews and sends it from Yandex Mail.
 - `move_to_promotions`: deprecated in favor of `move_email` and will be removed in a later release. Moves one inbox message to the dedicated folder `YANDEX_PROMOTIONS_FOLDER`, creating it if missing.
 
-The five changing tools need `YANDEX_ALLOW_WRITE=true` and act on one message per call; see [Safety and permissions](#safety-and-permissions).
+The six changing tools need `YANDEX_ALLOW_WRITE=true` and act on one message per call; see [Safety and permissions](#safety-and-permissions).
 
 `list_recent_emails` and `search_emails` take `before_uid` for paging: pass the smallest `uid` of a page to get the messages before it. Every result includes `in_reply_to` and `references`.
 
@@ -104,9 +105,9 @@ YANDEX_ALLOW_WRITE=false
 
 The `folder` parameter on read tools can access any folder available to the account, including Sent and Drafts. Read-only mode restricts mutations; it does not restrict which folders can be read.
 
-To change mail via MCP, set `YANDEX_ALLOW_WRITE=true`. Each changing tool acts on one message and asks for confirmation through MCP elicitation: the client must support it and the user must accept with `approve=true`, otherwise nothing changes. The request names the folders involved and quotes the message's sender and subject as untrusted single lines. Moves and archiving are always confirmed. Changing the Seen and Flagged flags is reversible, so the operator can skip its confirmation with `MCP_CONFIRM_REVERSIBLE=false`. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed.
+To change mail via MCP, set `YANDEX_ALLOW_WRITE=true`. Each changing tool acts on one message and asks for confirmation through MCP elicitation: the client must support it and the user must accept with `approve=true`, otherwise nothing changes. The request names the folders involved and quotes the message's sender and subject as untrusted single lines. Moves and archiving are always confirmed. Changing the Seen and Flagged flags and saving a draft are reversible, so the operator can skip their confirmation with `MCP_CONFIRM_REVERSIBLE=false`. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed.
 
-`move_email` and `archive_email` move only into existing folders and never create one. They refuse Trash, Spam, Drafts and Sent (by their special-use flags or system names), folders inside them, and virtual folders such as All Mail. The server exposes no deletion, expunge, move to Trash, or sending of mail.
+`move_email` and `archive_email` move only into existing folders and never create one. They refuse Trash, Spam, Drafts and Sent (by their special-use flags or system names), folders inside them, and virtual folders such as All Mail. `create_draft` appends a plain-text message (body up to 100 KiB, no attachments or HTML) to the drafts folder with the `\Draft` flag; its `From` is `YANDEX_EMAIL`. The server exposes no deletion, expunge, move to Trash, or sending of mail.
 
 `move_to_promotions(uid, confirm=true)` keeps its previous behavior until it is removed: it moves only into `YANDEX_PROMOTIONS_FOLDER` and creates it if missing. `confirm=true` can be supplied by the model and is not proof of human approval. `YANDEX_PROMOTIONS_FOLDER` must be a top-level folder: names containing the server's hierarchy delimiter (`|` on Yandex) are rejected, as are system folders such as Trash and Spam. System folder names stop the server at startup; the remaining checks run before the confirmation request, which names the destination folder.
 
