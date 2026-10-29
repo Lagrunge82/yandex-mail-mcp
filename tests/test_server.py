@@ -1,12 +1,14 @@
 import asyncio
 import imaplib
+import socket
+import ssl
 from types import SimpleNamespace
 import pytest
 import anyio.to_thread
 from mcp.server.mcpserver.exceptions import ToolError
 
 from yandex_mail_mcp import server
-from yandex_mail_mcp.mail import MailValueError
+from yandex_mail_mcp.mail import MailPermissionError, MailValueError
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +48,56 @@ def test_imap_error_reaches_client(monkeypatch):
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
     with pytest.raises(ToolError, match="No such mailbox"):
         asyncio.run(server.mcp.call_tool("list_folders", {}))
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (ConnectionRefusedError(111, "Connection refused"), "Cannot connect to IMAP server"),
+        (socket.gaierror(-2, "Name or service not known"), "Cannot connect to IMAP server"),
+        (ssl.SSLCertVerificationError("certificate verify failed"), "TLS handshake"),
+        (TimeoutError(), "timed out"),
+    ],
+)
+def test_connection_errors_reach_client(monkeypatch, error, message):
+    class Box:
+        def folders(self):
+            raise error
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        lambda: SimpleNamespace(imap_host="imap.example", imap_port=993, allow_write=False),
+    )
+    with pytest.raises(ToolError, match=message) as raised:
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
+    if isinstance(error, OSError) and not isinstance(error, TimeoutError):
+        assert "imap.example:993" in str(raised.value)
+
+
+def test_mail_permission_error_is_not_reported_as_connection_error(monkeypatch):
+    class Box:
+        def folders(self):
+            raise MailPermissionError("Write operations are disabled")
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match="^Write operations are disabled$"):
+        server.list_folders()
+
+
+def test_connection_error_without_settings_reaches_client(monkeypatch):
+    class Box:
+        def folders(self):
+            raise ConnectionRefusedError(111, "Connection refused")
+
+    def settings():
+        raise server.ConfigurationError("missing")
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    monkeypatch.setattr(server, "_settings", settings)
+    with pytest.raises(ToolError, match="Cannot connect to the IMAP server; check"):
+        server.list_folders()
 
 
 def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
