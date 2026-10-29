@@ -95,3 +95,16 @@ def test_invalid_pool_settings_are_rejected(monkeypatch, name, value):
     monkeypatch.setenv(name, value)
     with pytest.raises(ConfigurationError, match=name):
         Settings.from_env()
+
+
+def test_archive_and_confirmation_settings_from_env(monkeypatch):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.delenv("YANDEX_ARCHIVE_FOLDER", raising=False)
+    monkeypatch.delenv("MCP_CONFIRM_REVERSIBLE", raising=False)
+    settings = Settings.from_env()
+    assert (settings.archive_folder, settings.confirm_reversible) == ("", True)
+    monkeypatch.setenv("YANDEX_ARCHIVE_FOLDER", " Архив ")
+    monkeypatch.setenv("MCP_CONFIRM_REVERSIBLE", "false")
+    settings = Settings.from_env()
+    assert (settings.archive_folder, settings.confirm_reversible) == ("Архив", False)

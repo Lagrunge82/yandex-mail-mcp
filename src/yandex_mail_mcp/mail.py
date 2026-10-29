@@ -281,6 +281,20 @@ def valid_uid(uid: int, name: str = "uid") -> int:
     return uid
 
 
+# Folders mail is never moved into, or (for the first four) under.
+SYSTEM_FOLDER_FLAGS = frozenset({"\\trash", "\\junk", "\\drafts", "\\sent"})
+FORBIDDEN_DESTINATION_FLAGS = SYSTEM_FOLDER_FLAGS | {
+    "\\all",
+    "\\flagged",
+    "\\noselect",
+    "\\nonexistent",
+}
+
+
+def _flag_names(flags: Any) -> set[str]:
+    return {str(flag.decode() if isinstance(flag, bytes) else flag).casefold() for flag in flags}
+
+
 def _thread_ids(message: MailSummary) -> set[str]:
     ids = _MESSAGE_ID.findall(" ".join([message["message_id"], message["in_reply_to"]]))
     return set(ids) | set(message["references"])
@@ -845,6 +859,133 @@ class Mailbox:
         if not imap.has_capability("MOVE"):
             raise MailError("IMAP server does not support MOVE")
         return folder, bool(matching)
+
+    @staticmethod
+    def _destination(imap: IMAPClient, folder: str) -> str:
+        """Check that mail may be moved into an existing folder; return its server name.
+
+        Moves never create folders and never target Trash, Spam, Drafts, Sent,
+        virtual folders, or folders nested inside Trash, Spam, Drafts or Sent.
+        """
+        folder = folder.strip()
+        if not folder:
+            raise MailValueError("folder cannot be empty")
+        folders = {
+            str(name).casefold(): (
+                _flag_names(flags),
+                delimiter.decode() if isinstance(delimiter, bytes) else delimiter,
+                str(name),
+            )
+            for flags, delimiter, name in imap.list_folders()
+        }
+        if folder.casefold() not in folders:
+            raise MailLookupError(f"Folder {folder!r} not found; moves do not create folders")
+        flags, delimiter, name = folders[folder.casefold()]
+        unsafe = MailValueError(
+            "Messages cannot be moved to Trash, Spam, Drafts, Sent, virtual folders "
+            "or folders inside them"
+        )
+        if flags & FORBIDDEN_DESTINATION_FLAGS:
+            raise unsafe
+        components = name.split(delimiter) if delimiter else [name]
+        for depth in range(1, len(components) + 1):
+            ancestor = (delimiter or "").join(components[:depth])
+            ancestor_flags = folders.get(ancestor.casefold(), (set(),))[0]
+            if ancestor_flags & SYSTEM_FOLDER_FLAGS or (
+                ancestor.casefold() in RESERVED_FOLDER_NAMES - {"inbox"}
+            ):
+                raise unsafe
+        if not imap.has_capability("MOVE"):
+            raise MailError("IMAP server does not support MOVE")
+        return name
+
+    def _archive_destination(self, imap: IMAPClient) -> str:
+        if self.config.archive_folder:
+            return self._destination(imap, self.config.archive_folder)
+        for flags, _, name in imap.list_folders():
+            if "\\archive" in _flag_names(flags):
+                return self._destination(imap, str(name))
+        raise MailLookupError(
+            "No archive folder found: the server marks no folder \\Archive. "
+            "Set YANDEX_ARCHIVE_FOLDER to an existing folder"
+        )
+
+    def _require_write(self) -> None:
+        if not self.config.allow_write:
+            raise MailPermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
+
+    @staticmethod
+    def _select_message(imap: IMAPClient, uid: int, folder: str) -> None:
+        imap.select_folder(folder, readonly=False)
+        if uid not in imap.search(["UID", str(uid)]):
+            raise MailLookupError(f"Message UID {uid} not found in {folder}")
+
+    def preview_move(
+        self, uid: int, folder: str | None = None, source_folder: str = "INBOX"
+    ) -> tuple[MailSummary, str]:
+        """Validate a move and read the message headers for the confirmation request.
+
+        folder=None means the archive folder. Returns the headers and the
+        destination as the server spells it.
+        """
+        valid_uid(uid)
+        with self.connect() as imap:
+            destination = (
+                self._archive_destination(imap)
+                if folder is None
+                else self._destination(imap, folder)
+            )
+            if destination.casefold() == source_folder.strip().casefold():
+                raise MailValueError("The message is already in that folder")
+            return self._headers(imap, uid, source_folder), destination
+
+    def move(
+        self, uid: int, folder: str | None = None, source_folder: str = "INBOX"
+    ) -> dict[str, Any]:
+        """Move one message; folder=None means the archive folder."""
+        valid_uid(uid)
+        self._require_write()
+        with self.connect() as imap:
+            destination = (
+                self._archive_destination(imap)
+                if folder is None
+                else self._destination(imap, folder)
+            )
+            if destination.casefold() == source_folder.strip().casefold():
+                raise MailValueError("The message is already in that folder")
+            self._select_message(imap, uid, source_folder)
+            imap.move([uid], destination)
+        return {
+            "uid": uid,
+            "folder": destination,
+            "action": "move" if folder is not None else "archive",
+            "reversible": True,
+        }
+
+    def preview_flag(self, uid: int, folder: str = "INBOX") -> MailSummary:
+        valid_uid(uid)
+        with self.connect() as imap:
+            return self._headers(imap, uid, folder)
+
+    def set_flag(self, uid: int, flag: str, value: bool, folder: str = "INBOX") -> dict[str, Any]:
+        """Add or remove \\Seen or \\Flagged on one message."""
+        valid_uid(uid)
+        if flag not in {"\\Seen", "\\Flagged"}:
+            raise MailValueError("Only the \\Seen and \\Flagged flags can be changed")
+        self._require_write()
+        with self.connect() as imap:
+            self._select_message(imap, uid, folder)
+            if value:
+                imap.add_flags([uid], [flag])
+            else:
+                imap.remove_flags([uid], [flag])
+        names = {"\\Seen": ("mark_read", "mark_unread"), "\\Flagged": ("flag", "unflag")}
+        return {
+            "uid": uid,
+            "folder": folder,
+            "action": names[flag][0 if value else 1],
+            "reversible": True,
+        }
 
     def move_to_promotions(self, uid: int, confirm: bool = False) -> dict[str, Any]:
         valid_uid(uid)

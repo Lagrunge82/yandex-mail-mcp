@@ -55,6 +55,9 @@ class FakeIMAP:
     def move(self, uids, folder):
         self.calls.append(("move", uids, folder))
 
+    def add_flags(self, uids, flags):
+        self.calls.append(("add_flags", uids, flags))
+
 
 @pytest.fixture
 def fake_imap(monkeypatch):
@@ -114,6 +117,17 @@ def test_move_returns_connection_without_selected_folder(fake_imap):
     assert not imap.closed
     box.folders()
     assert len(fake_imap) == 1
+
+
+def test_move_email_returns_connection_without_selected_folder(fake_imap):
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+    assert box.move(3, "AI-Promotions")["folder"] == "AI-Promotions"
+    imap = fake_imap[0]
+    assert imap.calls[-2:] == [("move", [3], "AI-Promotions"), "unselect"]
+    assert imap._imap.state == "AUTH"
+    box.set_flag(3, "\\Seen", True)
+    assert len(fake_imap) == 1
+    assert imap.calls[-1] == "unselect"
 
 
 def test_selected_connection_without_unselect_is_closed(fake_imap):

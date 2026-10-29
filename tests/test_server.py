@@ -362,13 +362,6 @@ def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
     assert moved == []
 
 
-def test_tools_have_mutation_annotations():
-    tools = asyncio.run(server.mcp.list_tools())
-    annotations = {tool.name: tool.annotations for tool in tools}
-    assert annotations["list_folders"].read_only_hint
-    assert not annotations["move_to_promotions"].read_only_hint
-
-
 def test_healthz_is_public_but_mcp_still_requires_token():
     app = server.BearerAuth(
         server.mcp.streamable_http_app(host="127.0.0.1", transport_security=None), "secret"

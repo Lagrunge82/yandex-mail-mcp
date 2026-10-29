@@ -55,6 +55,8 @@ class Settings:
     promotions_folder: str = "AI-Promotions"
     imap_pool_size: int = 2
     imap_idle_timeout: int = 300
+    archive_folder: str = ""
+    confirm_reversible: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.app_password, str):
@@ -90,4 +92,6 @@ class Settings:
             promotions_folder=promotions_folder,
             imap_pool_size=pool_size,
             imap_idle_timeout=idle_timeout,
+            archive_folder=os.getenv("YANDEX_ARCHIVE_FOLDER", "").strip(),
+            confirm_reversible=env_bool("MCP_CONFIRM_REVERSIBLE", True),
         )
