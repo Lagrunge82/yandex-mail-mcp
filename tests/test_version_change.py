@@ -1,5 +1,5 @@
-import runpy
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -50,3 +50,23 @@ def test_script_compares_previous_commit_and_writes_outputs(tmp_path):
     env = dict(os.environ, PREVIOUS_SHA=previous, GITHUB_OUTPUT=str(output))
     subprocess.run([sys.executable, str(SCRIPT)], cwd=tmp_path, env=env, check=True)
     assert output.read_text() == "bumped=true\nversion=0.1.1\n"
+
+
+def test_zero_previous_sha_is_not_a_bump(tmp_path):
+    output = tmp_path / "output"
+    env = dict(os.environ, PREVIOUS_SHA="0" * 40, GITHUB_OUTPUT=str(output))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT)], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == "bumped=false\n"
+    assert "::warning::" in result.stdout
+
+
+def test_malformed_previous_sha_is_rejected(tmp_path):
+    env = dict(os.environ, PREVIOUS_SHA="main", GITHUB_OUTPUT=str(tmp_path / "output"))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT)], cwd=tmp_path, env=env, capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "Cannot determine the previous main commit" in result.stderr

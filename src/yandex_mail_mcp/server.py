@@ -3,31 +3,34 @@
 from __future__ import annotations
 
 import errno
-import os
-import logging
-import imaplib
 import hmac
+import imaplib
 import inspect
 import json
+import logging
+import os
 import re
 import socket
 import ssl
+from collections.abc import Callable
 from functools import lru_cache, wraps
+from typing import Any, TypeVar, cast
 
+import anyio.to_thread
+import uvicorn
 from dotenv import load_dotenv
+from imapclient.exceptions import LoginError
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
-from mcp.types import ToolAnnotations
 from mcp.server.mcpserver.exceptions import ToolError
-from imapclient.exceptions import LoginError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
+from pydantic import BaseModel
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
-import uvicorn
-import anyio.to_thread
-from pydantic import BaseModel
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .config import Settings, ConfigurationError, env_bool, env_int
+from .config import ConfigurationError, Settings, env_bool, env_int
 from .mail import Mailbox, MailError, MailSummary
 
 mcp = MCPServer(
@@ -66,8 +69,11 @@ def _os_reason(exc: OSError) -> str:
     return exc.strerror or " ".join(map(str, exc.args)) or type(exc).__name__
 
 
-def tool_errors(fn):
-    def translate(exc):
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def tool_errors(fn: F) -> F:
+    def translate(exc: Exception) -> ToolError | None:
         if isinstance(exc, LoginError):
             return ToolError(
                 "IMAP authentication failed; check your credentials and whether IMAP is enabled"
@@ -101,7 +107,7 @@ def tool_errors(fn):
     if inspect.iscoroutinefunction(fn):
 
         @wraps(fn)
-        async def async_wrapped(*args, **kwargs):
+        async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
             try:
                 return await fn(*args, **kwargs)
             except Exception as exc:
@@ -110,10 +116,10 @@ def tool_errors(fn):
                     raise
                 raise error from exc
 
-        return async_wrapped
+        return cast(F, async_wrapped)
 
     @wraps(fn)
-    def wrapped(*args, **kwargs):
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
@@ -122,7 +128,7 @@ def tool_errors(fn):
                 raise
             raise error from exc
 
-    return wrapped
+    return cast(F, wrapped)
 
 
 @lru_cache(maxsize=1)
@@ -139,11 +145,11 @@ class BearerAuth:
     # The health check reveals nothing, so Compose can probe it without the token.
     public_paths = frozenset({"/healthz"})
 
-    def __init__(self, app, token):
+    def __init__(self, app: ASGIApp, token: str) -> None:
         self.app = app
         self.token = token
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("path") not in self.public_paths:
             headers = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
             scheme, _, credentials = headers[0].partition(b" ") if len(headers) == 1 else (b"",) * 3
@@ -157,10 +163,14 @@ class BearerAuth:
         await self.app(scope, receive, send)
 
 
-@mcp.custom_route("/healthz", methods=["GET"])
 async def healthz(request: Request) -> Response:
     """Report that the HTTP server is serving, without logging in to IMAP."""
     return PlainTextResponse("ok")
+
+
+# Registered by a call: custom_route has no return annotation, so as a decorator it
+# would make healthz untyped under mypy --strict.
+mcp.custom_route("/healthz", methods=["GET"])(healthz)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
@@ -206,10 +216,12 @@ def _untrusted_line(value: str, limit: int) -> str:
 @mcp.tool(
     annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True
-    )
+    ),
+    # Keep the result unstructured, as it was before the return type was parametrized.
+    structured_output=False,
 )
 @tool_errors
-async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> dict:
+async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> dict[str, Any]:
     """Move a message from Inbox to a dedicated promotions folder.
 
     Disabled by default; requires server opt-in, confirm=true and client elicitation.

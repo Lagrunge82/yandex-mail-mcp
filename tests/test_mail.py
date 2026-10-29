@@ -1,8 +1,8 @@
-from email.message import EmailMessage
 import base64
 import imaplib
 import quopri
 from contextlib import contextmanager
+from email.message import EmailMessage
 
 import pytest
 

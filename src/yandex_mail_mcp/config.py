@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 
 from pydantic import SecretStr
 
-
 # Names a promotions folder must never take, compared case-insensitively.
 RESERVED_FOLDER_NAMES = frozenset(
     {
@@ -60,7 +59,7 @@ class Settings:
             object.__setattr__(self, "app_password", SecretStr(self.app_password))
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         email = os.getenv("YANDEX_EMAIL", "").strip()
         password = SecretStr(os.getenv("YANDEX_APP_PASSWORD", "").strip())
         if not email or not password.get_secret_value():
