@@ -27,10 +27,17 @@ Read operations use IMAP `BODY.PEEK` and should **not mark messages as read**. L
 
 ## Yandex setup
 
-1. Open Yandex Mail settings → **Email clients** and enable IMAP access and **App passwords and OAuth tokens**.
-2. Create a dedicated **Mail app password** in Yandex ID. Do not use your primary account password.
-3. Copy `.env.example` to `.env`. Set `YANDEX_EMAIL` and `YANDEX_APP_PASSWORD`.
-4. Never commit, paste into an issue, or upload the populated `.env` file. It is gitignored.
+The server signs in to IMAP with a Yandex OAuth token (`AUTHENTICATE XOAUTH2`). No password is stored.
+
+1. Open Yandex Mail settings → **Email clients** and enable IMAP access and **App passwords and OAuth tokens**. For a Yandex 360 account, the administrator must also allow OAuth access to mail.
+2. Register an application at [oauth.yandex.ru](https://oauth.yandex.ru/client/new) with the permissions **IMAP access to mail** in read-only (`mail:imap_ro`) and full (`mail:imap_full`) form, plus `login:info` and `login:email`. Add the redirect URI `http://127.0.0.1:8765/callback` (or your `YANDEX_OAUTH_LOOPBACK_PORT`).
+3. Copy `.env.example` to `.env` and set `YANDEX_OAUTH_CLIENT_ID` (and `YANDEX_OAUTH_CLIENT_SECRET`, if Yandex requires it for your application).
+4. Run `uv run yandex-mail-mcp login`. A browser opens the Yandex sign-in page; after you allow access, the tokens are saved in the system keyring, or in `~/.config/yandex-mail-mcp/tokens.json` (mode 0600, with a warning) where no keyring exists. The server refreshes the access token itself.
+5. `uv run yandex-mail-mcp logout` revokes the token at Yandex and deletes it.
+
+Without `YANDEX_ALLOW_WRITE=true`, `login` asks only for read-only IMAP access; with it, for full access. A read-only token makes the changing tools fail with a hint to sign in again.
+
+Credentials are taken from the first of these that is set: `YANDEX_OAUTH_TOKEN` with `YANDEX_EMAIL` (a ready access token, for CI and containers; it cannot be refreshed), the tokens saved by `login`, then the deprecated `YANDEX_EMAIL` with `YANDEX_APP_PASSWORD` (a Yandex **Mail app password**, never your account password; the server logs a warning). Never commit, paste into an issue, or upload the populated `.env` file. It is gitignored.
 
 Yandex's IMAP settings: `imap.yandex.com:993` (SSL). The server does not use SMTP or send mail.
 
@@ -43,7 +50,8 @@ Requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/getting-started
 ```bash
 uv sync --locked
 cp .env.example .env
-# Edit .env with your actual credentials
+# Set YANDEX_OAUTH_CLIENT_ID in .env, then sign in once:
+uv run yandex-mail-mcp login
 uv run yandex-mail-mcp
 ```
 

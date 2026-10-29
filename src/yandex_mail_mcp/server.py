@@ -12,6 +12,7 @@ import os
 import re
 import socket
 import ssl
+import sys
 import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -32,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from . import login
 from .config import ConfigurationError, Settings, env_bool, env_int
 from .mail import Draft, Mailbox, MailError, MailSummary, ThreadMessage
 
@@ -322,8 +324,8 @@ async def _confirmed_mutation(
     the email's sender and subject, if there is an email, follow as untrusted
     single lines.
     """
-    if not mailbox.config.allow_write:
-        raise ToolError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
+    if (error := await anyio.to_thread.run_sync(mailbox.write_error)) is not None:
+        raise ToolError(error)
     message, target = await anyio.to_thread.run_sync(preview)
     if confirm:
         text = question(target)
@@ -524,8 +526,29 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
     )
 
 
-def main() -> None:
+USAGE = """usage: yandex-mail-mcp [serve | login | logout]
+
+  serve   run the MCP server (the default)
+  login   sign in with Yandex in the browser and keep the tokens for the stdio server
+  logout  revoke and delete the stored tokens"""
+
+
+def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = sys.argv[1:] if argv is None else argv
+    command = args[0] if args else "serve"
+    if command in {"login", "logout"} and len(args) == 1:
+        load_dotenv()
+        try:
+            if command == "login":
+                login.login()
+            else:
+                login.logout()
+        except (login.LoginError, ConfigurationError, OSError) as exc:
+            raise SystemExit(f"yandex-mail-mcp {command}: {exc}") from exc
+        return
+    if command != "serve" or len(args) > 1:
+        raise SystemExit(USAGE)
     settings = _settings()
     logging.info(
         "Mail server configured: host=%s port=%s write=%s",
