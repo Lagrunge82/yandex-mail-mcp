@@ -15,8 +15,8 @@ import pytest
 from imapclient.exceptions import LoginError
 from keyring.backend import KeyringBackend
 
+from yandex_mail_mcp import config, server
 from yandex_mail_mcp import login as login_module
-from yandex_mail_mcp import server
 from yandex_mail_mcp.config import ConfigurationError, Settings
 from yandex_mail_mcp.credentials import (
     OAuthCredentials,
@@ -212,6 +212,23 @@ def test_token_requires_email_and_something_is_required(env):
     assert Settings.from_env(require_credentials=False).email == ""
 
 
+def test_server_without_own_credentials_leaves_the_keyring_alone(env, monkeypatch):
+    TokenStore().save(STORED)
+    lookups = []
+
+    class RecordingStore(TokenStore):
+        def load(self):
+            lookups.append(1)
+            return super().load()
+
+    monkeypatch.setattr(config, "TokenStore", RecordingStore)
+    settings = Settings.from_env(require_credentials=False)
+    assert (settings.email, settings.stored_tokens) == ("", False)
+    assert lookups == []
+    assert Settings.from_env().stored_tokens
+    assert lookups == [1]
+
+
 def test_default_credentials_follow_settings():
     token = default_credentials(Settings(email="a@yandex.ru", oauth_token="t"))
     assert isinstance(token, OAuthCredentials)
@@ -311,6 +328,24 @@ def test_stored_source_refreshes_near_expiry_and_saves(tmp_path):
         5000.0,
         STORED.scope,
     )
+
+
+def test_stored_source_refreshes_once_for_concurrent_rejections(tmp_path):
+    store, oauth = TokenStore(tmp_path / "t.json"), FakeOAuth()
+    source = StoredTokenSource(store, STORED, oauth, clock=lambda: 0.0)
+    assert source.access_token() == "access-1"
+    # Another connection, in its own thread, already replaced the token this
+    # connection was given.
+    other = threading.Thread(target=lambda: (source.access_token(), source.refresh()))
+    other.start()
+    other.join()
+    assert [call for call in oauth.calls if call[0] == "refresh"] == [("refresh", "refresh-1")]
+    # This connection's rejected token is stale: it gets the replacement, no second refresh.
+    assert source.refresh() == "access-2"
+    assert len(oauth.calls) == 1
+    # A rejection of the replacement itself does refresh again.
+    assert source.refresh() == "access-2"
+    assert len(oauth.calls) == 2
 
 
 def test_stored_source_refresh_failure_names_the_reason(tmp_path):

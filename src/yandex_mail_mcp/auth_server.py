@@ -124,14 +124,18 @@ class RateLimit:
         self.window = window
         self._clock = clock
         self._hits: dict[str, tuple[float, int]] = {}
+        self._pruned = clock()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http" and scope.get("path") in self.paths:
             now = self._clock()
-            if len(self._hits) > 10_000:
+            # Drop addresses whose window has passed: once per window in the normal
+            # case, and at once if a flood of addresses grows the table past 10 000.
+            if now - self._pruned >= self.window or len(self._hits) > 10_000:
                 self._hits = {
                     ip: hit for ip, hit in self._hits.items() if now - hit[0] < self.window
                 }
+                self._pruned = now
             ip = str((scope.get("client") or ("unknown",))[0])
             started, count = self._hits.get(ip, (now, 0))
             if now - started >= self.window:

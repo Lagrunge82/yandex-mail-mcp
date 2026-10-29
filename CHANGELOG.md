@@ -12,6 +12,9 @@
 ### Changed
 
 - README documents every environment variable, where `.env` is found, the result fields and preview limits, what counts as an attachment, and the checks CI runs. SECURITY.md adds the supported versions and the security model.
+- The multi-user HTTP server (`MCP_PUBLIC_URL`) no longer looks for the tokens saved by `yandex-mail-mcp login` at startup, so it does not touch the system keyring in a container.
+- When several pooled IMAP connections are rejected at the same time, the stored Yandex token is refreshed once; the other connections reuse the refreshed token.
+- The sign-in rate limit forgets idle client addresses once per minute instead of only after 10 000 addresses.
 
 ## 0.5.0
 

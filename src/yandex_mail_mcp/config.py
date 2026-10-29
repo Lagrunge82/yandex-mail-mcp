@@ -89,6 +89,12 @@ class Settings:
 
     @classmethod
     def from_env(cls, *, require_credentials: bool = True) -> Settings:
+        """Read the settings; require_credentials=False is for the multi-user HTTP server.
+
+        That server never logs in with credentials of its own, so missing ones are
+        not an error and the tokens saved by `yandex-mail-mcp login` are not looked
+        up: a keyring lookup in a container is slow and logs warnings for nothing.
+        """
         email = os.getenv("YANDEX_EMAIL", "").strip()
         token = os.getenv("YANDEX_OAUTH_TOKEN", "").strip()
         password = os.getenv("YANDEX_APP_PASSWORD", "").strip()
@@ -97,7 +103,7 @@ class Settings:
             if not email:
                 raise ConfigurationError("YANDEX_OAUTH_TOKEN requires YANDEX_EMAIL")
             credentials = {"email": email, "oauth_token": SecretStr(token)}
-        elif (stored := TokenStore().load()) is not None:
+        elif require_credentials and (stored := TokenStore().load()) is not None:
             credentials = {"email": stored.email, "stored_tokens": True}
         elif password and email:
             LOG.warning(

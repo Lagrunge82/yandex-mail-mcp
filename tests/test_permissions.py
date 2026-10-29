@@ -215,6 +215,20 @@ def test_rate_limit_answers_429_per_ip_and_window():
     assert other.get("/token").status_code == 200
 
 
+def test_rate_limit_forgets_idle_addresses_after_a_window():
+    now = [0.0]
+    app = Starlette(routes=[Route("/token", lambda request: PlainTextResponse("ok"))])
+    limited = RateLimit(app, frozenset({"/token"}), limit=5, clock=lambda: now[0])
+    TestClient(limited, client=("10.0.0.1", 1)).get("/token")
+    now[0] = 30
+    TestClient(limited, client=("10.0.0.2", 1)).get("/token")
+    assert set(limited._hits) == {"10.0.0.1", "10.0.0.2"}
+    now[0] = 61
+    TestClient(limited, client=("10.0.0.3", 1)).get("/token")
+    # The first address is idle for a whole window; the second is still inside its own.
+    assert set(limited._hits) == {"10.0.0.2", "10.0.0.3"}
+
+
 def test_oauth_app_limits_auth_endpoints(monkeypatch):
     monkeypatch.setenv("MCP_AUTH_RATE_LIMIT", "2")
 

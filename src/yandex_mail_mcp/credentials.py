@@ -233,15 +233,27 @@ class StoredTokenSource:
         self._oauth = oauth
         self._clock = clock
         self._lock = threading.Lock()
+        # The token last handed to each thread: a thread whose token was rejected asks
+        # for a refresh, and if another thread already replaced that token, it gets the
+        # replacement instead of a second refresh. Each pooled connection logs in from
+        # its own worker thread, so thread-local state follows the caller.
+        self._handed = threading.local()
 
     def access_token(self) -> str:
         with self._lock:
+            token = self._tokens.access_token
+            self._handed.token = token
             if self._tokens.expires_at - 60 > self._clock():
-                return self._tokens.access_token
+                return token
         return self.refresh()
 
     def refresh(self) -> str:
         with self._lock:
+            handed = getattr(self._handed, "token", None)
+            if handed is not None and handed != self._tokens.access_token:
+                # Already refreshed by another thread since this one read its token.
+                self._handed.token = self._tokens.access_token
+                return self._tokens.access_token
             try:
                 fresh = self._oauth.refresh(self._tokens.refresh_token, self._tokens.scope)
             except YandexOAuthError as exc:
@@ -249,6 +261,7 @@ class StoredTokenSource:
                 raise LoginError(f"Could not refresh the Yandex token ({exc.error})") from exc
             self._tokens = self._tokens.with_tokens(fresh)
             self._store.save(self._tokens)
+            self._handed.token = self._tokens.access_token
             return self._tokens.access_token
 
     def scope(self) -> str | None:
