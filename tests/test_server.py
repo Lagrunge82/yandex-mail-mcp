@@ -4,8 +4,9 @@ import socket
 import ssl
 from contextlib import contextmanager
 from types import SimpleNamespace
-import pytest
+
 import anyio.to_thread
+import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from yandex_mail_mcp import server
@@ -92,7 +93,7 @@ def test_dropped_session_is_reported_as_reset(monkeypatch, error):
             raise error
 
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
-    with pytest.raises(ToolError, match="IMAP connection was reset; please retry$") as raised:
+    with pytest.raises(ToolError, match=r"IMAP connection was reset; please retry$") as raised:
         asyncio.run(server.mcp.call_tool("list_folders", {}))
     assert "YANDEX_IMAP" not in str(raised.value)
 
@@ -123,7 +124,7 @@ def test_mail_permission_error_is_not_reported_as_connection_error(monkeypatch):
             raise MailPermissionError("Write operations are disabled")
 
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
-    with pytest.raises(ToolError, match="^Write operations are disabled$"):
+    with pytest.raises(ToolError, match=r"^Write operations are disabled$"):
         server.list_folders()
 
 
