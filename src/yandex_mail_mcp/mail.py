@@ -6,20 +6,22 @@ No delete, expunge, SMTP, or arbitrary folder mutation is exposed.
 
 from __future__ import annotations
 
-import re
 import base64
 import binascii
+import imaplib
 import logging
 import quopri
-import imaplib
+import re
+from collections.abc import Iterator
 from contextlib import contextmanager
 from email import policy
+from email.message import MIMEPart
 from email.parser import BytesParser
 from html.parser import HTMLParser
-from typing import Iterator
-from typing_extensions import TypedDict  # pydantic rejects typing.TypedDict before 3.12
+from typing import Any
 
 from imapclient import IMAPClient
+from typing_extensions import TypedDict  # pydantic rejects typing.TypedDict before 3.12
 
 from .config import RESERVED_FOLDER_NAMES, Settings
 
@@ -89,7 +91,7 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
     html_parts: list[str] = []
     has_attachments = False
 
-    def collect(part, root=False):
+    def collect(part: MIMEPart, root: bool = False) -> None:
         nonlocal has_attachments
         # A name or attachment disposition on the message itself does not make its body
         # an attachment; only a non-text root type does.
@@ -146,17 +148,17 @@ def valid_uid(uid: int) -> int:
     return uid
 
 
-def _text_sections(structure):
+def _text_sections(structure: Any) -> tuple[list[tuple[str, str, str, str]], bool]:
     """Return safe text section metadata and whether MIME attachments exist."""
-    sections = []
+    sections: list[tuple[str, str, str, str]] = []
     has_attachments = False
 
-    def string(value, default=""):
+    def string(value: Any, default: str = "") -> str:
         if isinstance(value, bytes):
             return value.decode("ascii", errors="replace")
         return value if isinstance(value, str) else default
 
-    def walk(part, path):
+    def walk(part: Any, path: str) -> None:
         nonlocal has_attachments
         if not isinstance(part, (tuple, list)) or not part:
             return
@@ -185,9 +187,10 @@ def _text_sections(structure):
             return
         kind = string(part[0]).lower()
         subtype = string(part[1]).lower()
-        params = part[2] if isinstance(part[2], (tuple, list)) else ()
+        raw_params = part[2] if isinstance(part[2], (tuple, list)) else ()
         params = {
-            string(params[i]).lower(): string(params[i + 1]) for i in range(0, len(params) - 1, 2)
+            string(raw_params[i]).lower(): string(raw_params[i + 1])
+            for i in range(0, len(raw_params) - 1, 2)
         }
         disposition_index = 9 if kind == "text" else 8
         disposition = part[disposition_index] if len(part) > disposition_index else None
@@ -251,7 +254,7 @@ class Mailbox:
         summaries: dict[int, MailSummary] = {}
         sections: dict[str, list[tuple[int, str, str, str]]] = {}
 
-        def failure(uid):
+        def failure(uid: int) -> None:
             LOG.warning("Incomplete IMAP response for UID %s", uid)
             summaries.pop(uid, None)
 
@@ -441,7 +444,7 @@ class Mailbox:
             raise MailError("IMAP server does not support MOVE")
         return folder, bool(matching)
 
-    def move_to_promotions(self, uid: int, confirm: bool = False) -> dict:
+    def move_to_promotions(self, uid: int, confirm: bool = False) -> dict[str, Any]:
         valid_uid(uid)
         if not self.config.allow_write:
             raise MailPermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
