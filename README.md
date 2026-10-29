@@ -25,47 +25,87 @@ The six changing tools need `YANDEX_ALLOW_WRITE=true` and act on one message per
 
 Read operations use IMAP `BODY.PEEK` and should **not mark messages as read**. Lists and searches fetch headers, MIME structure and at most 16 KiB of a text section per message, without fetching attachment sections. `get_email` downloads the complete message, including attachments, subject to a 20 MiB size limit. Attachment contents are not exposed; names, types and sizes are, in the `attachments` field of every result, along with the raw `List-Unsubscribe` header in `list_unsubscribe`. The server never follows unsubscribe links or sends unsubscribe mail.
 
-## Yandex setup
+## Quick start for one user (stdio)
 
-The server signs in to IMAP with a Yandex OAuth token (`AUTHENTICATE XOAUTH2`). No password is stored.
+The server signs in to IMAP with a Yandex OAuth token (`AUTHENTICATE XOAUTH2`); no password is needed. Requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
-1. Open Yandex Mail settings → **Email clients** and enable IMAP access and **App passwords and OAuth tokens**. For a Yandex 360 account, the administrator must also allow OAuth access to mail.
-2. Register an application at [oauth.yandex.ru](https://oauth.yandex.ru/client/new) with the permissions **IMAP access to mail** in read-only (`mail:imap_ro`) and full (`mail:imap_full`) form, plus `login:info` and `login:email`. Add the redirect URI `http://127.0.0.1:8765/callback` (or your `YANDEX_OAUTH_LOOPBACK_PORT`).
-3. Copy `.env.example` to `.env` and set `YANDEX_OAUTH_CLIENT_ID` (and `YANDEX_OAUTH_CLIENT_SECRET`, if Yandex requires it for your application).
-4. Run `uv run yandex-mail-mcp login`. A browser opens the Yandex sign-in page; after you allow access, the tokens are saved in the system keyring, or in `~/.config/yandex-mail-mcp/tokens.json` (mode 0600, with a warning) where no keyring exists. The server refreshes the access token itself.
-5. `uv run yandex-mail-mcp logout` revokes the token at Yandex and deletes it.
+1. In Yandex Mail settings → **Email clients**, enable IMAP access and **App passwords and OAuth tokens**. For a Yandex 360 account, the administrator must also allow OAuth access to mail.
+2. Register an application at [oauth.yandex.ru](https://oauth.yandex.ru/client/new) with the permissions **IMAP access to mail** in read-only (`mail:imap_ro`) and full (`mail:imap_full`) form, plus `login:info` and `login:email`, and the redirect URI `http://127.0.0.1:8765/callback`.
+3. Install, configure and sign in:
 
-Without `YANDEX_ALLOW_WRITE=true`, `login` asks only for read-only IMAP access; with it, for full access. A read-only token makes the changing tools fail with a hint to sign in again.
+   ```bash
+   uv sync --locked
+   cp .env.example .env
+   # Set YANDEX_OAUTH_CLIENT_ID (and YANDEX_OAUTH_CLIENT_SECRET if Yandex requires it).
+   uv run yandex-mail-mcp login
+   ```
 
-Credentials are taken from the first of these that is set: `YANDEX_OAUTH_TOKEN` with `YANDEX_EMAIL` (a ready access token, for CI and containers; it cannot be refreshed), the tokens saved by `login`, then the deprecated `YANDEX_EMAIL` with `YANDEX_APP_PASSWORD` (a Yandex **Mail app password**, never your account password; the server logs a warning). Never commit, paste into an issue, or upload the populated `.env` file. It is gitignored.
+   A browser opens the Yandex sign-in page. After you allow access, the tokens are saved in the system keyring, or in `~/.config/yandex-mail-mcp/tokens.json` (mode 0600, with a warning) where no keyring exists. The server refreshes the access token itself.
+4. Add the server to your MCP client as a stdio command, for example in Claude Desktop's `claude_desktop_config.json`:
 
-Yandex's IMAP settings: `imap.yandex.com:993` (SSL). The server does not use SMTP or send mail.
+   ```json
+   {"mcpServers": {"yandex-mail": {"command": "uv", "args": ["--directory", "/path/to/yandex-mail-mcp", "run", "yandex-mail-mcp"]}}}
+   ```
 
-The server keeps up to `YANDEX_IMAP_POOL_SIZE` (default 2) logged-in IMAP connections and reuses them across tool calls, so a series of calls logs in once. A call that finds every connection busy waits up to a minute. A connection idle longer than `YANDEX_IMAP_IDLE_TIMEOUT` seconds (default 300) or failing `NOOP` is replaced. Connections are returned with no folder selected, closed after a failed call, and logged out when the server stops.
+   or with Claude Code: `claude mcp add yandex-mail -- uv --directory /path/to/yandex-mail-mcp run yandex-mail-mcp`.
 
-## Run the MCP server locally
+`uv run yandex-mail-mcp logout` revokes the token at Yandex and deletes it. Without `YANDEX_ALLOW_WRITE=true`, `login` asks only for read-only IMAP access; with it, for full access. A read-only token makes the changing tools fail with a hint to sign in again.
 
-Requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/getting-started/installation/) for the locked development setup.
+Credentials come from the first of these that is set: `YANDEX_OAUTH_TOKEN` with `YANDEX_EMAIL` (a ready access token, for CI and containers; it cannot be refreshed), then the tokens saved by `login`, then the [deprecated app password](#deprecated-app-password-and-static-token).
 
-```bash
-uv sync --locked
-cp .env.example .env
-# Set YANDEX_OAUTH_CLIENT_ID in .env, then sign in once:
-uv run yandex-mail-mcp login
-uv run yandex-mail-mcp
-```
+The server keeps up to `YANDEX_IMAP_POOL_SIZE` (default 2) logged-in IMAP connections per user and reuses them across tool calls. A call that finds every connection busy waits up to a minute. A connection idle longer than `YANDEX_IMAP_IDLE_TIMEOUT` seconds (default 300) or failing `NOOP` is replaced. Connections are returned with no folder selected and logged out when the server stops. Yandex's IMAP server is `imap.yandex.com:993` (SSL); the server does not use SMTP or send mail.
 
-The default transport is **stdio**, suitable for local MCP clients. For a local HTTP MCP endpoint:
+## Shared server for several users (HTTP)
 
-```bash
-MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=8000 uv run yandex-mail-mcp
-```
+With `MCP_PUBLIC_URL` set, the HTTP server is an OAuth authorization server for MCP clients: each person adds the server's URL to their client, signs in with Yandex in the browser and works with their own mailbox. The server stores no user tokens or passwords (see [Security](#security)).
 
-The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a bearer token. Non-loopback binds require a token, unless `MCP_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set. DNS rebinding protection is enabled. A specific `MCP_HOST` is allowed by default, but wildcard binds such as `0.0.0.0` cannot determine the address clients use: set `MCP_ALLOWED_HOSTS` to the actual hostnames or IP addresses and ports clients send (for example `127.0.0.1:*,192.168.1.5:*`), and configure `MCP_ALLOWED_ORIGINS` for browser origins when needed. Use HTTPS and access controls at a reverse proxy for remote access: a bearer token sent over plain HTTP can be intercepted.
+1. Register a Yandex OAuth application as above, with the redirect URI `<MCP_PUBLIC_URL>/oauth/yandex/callback`, for example `https://mail.example.com/oauth/yandex/callback`. Note its client ID and client secret.
+2. Generate an encryption key:
 
-`GET /healthz` answers `200 ok` while the HTTP server is serving. It does not log in to IMAP and does not require the bearer token. The stdio transport has no health endpoint.
+   ```bash
+   python -c "import secrets, base64; print('k1:' + base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+   ```
 
-## Run with Docker
+3. In `.env`, set:
+
+   | Variable | Value |
+   |---|---|
+   | `MCP_PUBLIC_URL` | The HTTPS URL clients use, such as `https://mail.example.com`. It is the issuer, the resource (`<url>/mcp`) and the base of the Yandex redirect URI. |
+   | `MCP_TOKEN_ENCRYPTION_KEYS` | The generated key. |
+   | `MCP_ALLOWED_USERS` | Comma-separated Yandex logins or addresses allowed to sign in. Empty refuses everyone. |
+   | `YANDEX_OAUTH_CLIENT_ID`, `YANDEX_OAUTH_CLIENT_SECRET` | The application from step 1. |
+   | `YANDEX_ALLOW_WRITE` | `true` to offer the changing tools; each user still has to grant full IMAP access. |
+
+4. Start it with Docker Compose (`docker compose up -d --build`), which binds `127.0.0.1:8000` on the host and keeps the registered clients in the `auth` volume (`MCP_AUTH_DB`). Losing that volume only makes MCP clients register again; tokens already issued keep working.
+5. Put an HTTPS reverse proxy in front of it. Without HTTPS, tokens travel in clear text. With [Caddy](https://caddyserver.com/), which obtains the certificate itself, a `Caddyfile` of two lines is enough:
+
+   ```
+   mail.example.com
+   reverse_proxy 127.0.0.1:8000
+   ```
+
+6. Add the connector: in Claude Desktop, **Settings → Connectors → Add custom connector** with the URL `https://mail.example.com/mcp`; in Claude Code, `claude mcp add --transport http yandex-mail https://mail.example.com/mcp`, then `/mcp` to sign in. The client registers itself, opens the Yandex sign-in page and needs nothing else.
+
+Requests to `/authorize`, `/token`, `/register`, `/revoke` and the Yandex sign-in routes are limited to `MCP_AUTH_RATE_LIMIT` (30) per client IP and minute. Compose sets `MCP_FORWARDED_ALLOW_IPS=*` so the limit sees the client addresses the proxy forwards; this is safe only because the port is bound to localhost. Each tool call writes a JSON line to the `yandex_mail_mcp.audit` log with the time, Yandex login, client ID, tool, folder, UID, result and duration, without subjects, addresses, message text or tokens.
+
+`GET /healthz` answers `200 ok` while the HTTP server is serving, without logging in to IMAP or requiring a token; Compose uses it as the health check. DNS rebinding protection is enabled: the host of `MCP_PUBLIC_URL` is allowed automatically, and `MCP_ALLOWED_HOSTS` and `MCP_ALLOWED_ORIGINS` override the defaults.
+
+## Security
+
+- **Nothing about users is stored.** The server issues its own tokens, and each one carries the user's Yandex token inside, encrypted with AES-256-GCM under `MCP_TOKEN_ENCRYPTION_KEYS`. A Bearer token holds the Yandex access token, login, address and granted scope, the client ID and the expiry; a refresh token holds the Yandex refresh token instead. Access tokens last an hour (less if the Yandex token expires sooner), refresh tokens 30 days, authorization codes 60 seconds. The only file is the table of registered MCP clients, whose secrets are encrypted too.
+- **What the server holds** is the encryption key and the Yandex application's `client_secret`. Neither is a user credential, but the key together with an intercepted token gives access to that user's mail: keep both in secret storage and serve only over HTTPS.
+- **Revoking access**: the `logout` tool, or a client's call to `/revoke`, revokes the user's Yandex token, after which every token the server issued for it stops working. A user can also revoke the application in their Yandex ID settings. `MCP_ALLOWED_USERS` decides who can sign in at all; a refused user's Yandex token is revoked at once.
+- **Rotating the key**: put the new key first (`MCP_TOKEN_ENCRYPTION_KEYS=k2:...,k1:...`); new tokens use it and old ones still open. After 30 days, when the last refresh token sealed with the old key has expired, remove it. Removing a key immediately ends every token sealed with it, and clients registered with a secret have to register again.
+- **Write access** requires `YANDEX_ALLOW_WRITE=true` on the server and full IMAP access granted by the user; the server asks Yandex for full access only when writes are enabled. The server still never deletes, expunges or sends mail.
+
+## Deprecated: app password and static token
+
+These remain for one more release and will then be removed:
+
+- `YANDEX_APP_PASSWORD` with `YANDEX_EMAIL`: a Yandex **Mail app password** (never your account password), used only with the stdio transport and only when no OAuth token is configured. The server logs a warning; run `yandex-mail-mcp login` instead. The HTTP server refuses to start with it, since one password cannot serve several users.
+- `MCP_AUTH_TOKEN`: a single shared bearer token for the HTTP transport without OAuth. It cannot be combined with `MCP_PUBLIC_URL`, and the server logs a warning. `MCP_ALLOW_UNAUTHENTICATED_REMOTE` has been removed: a non-loopback HTTP server needs `MCP_PUBLIC_URL` or `MCP_AUTH_TOKEN`.
+
+## Docker image
 
 CI publishes `ghcr.io/lagrunge82/yandex-mail-mcp` for Linux amd64 and arm64 after
 the checks pass on `main` or a `v*` tag. When a push to `main` increases
@@ -88,20 +128,8 @@ For example, after the first publication:
 docker pull ghcr.io/lagrunge82/yandex-mail-mcp:latest
 ```
 
-The image runs `yandex-mail-mcp` with the stdio transport by default, for example
-`docker run -i --rm --env-file .env ghcr.io/lagrunge82/yandex-mail-mcp:latest`.
-
-The Compose service builds the image locally and runs a locally bound HTTP MCP endpoint:
-
-```bash
-cp .env.example .env
-# Edit the credentials and set MCP_AUTH_TOKEN.
-docker compose up -d --build
-docker compose logs -f mcp
-```
-
-The HTTP port binds only to `127.0.0.1:8000` on the Docker host. Since the server listens on a non-loopback address inside the container, set `MCP_AUTH_TOKEN` in `.env` (or explicitly opt into unauthenticated access).
-Compose checks `/healthz` every 30 seconds; `docker compose ps` shows the service as `healthy` once it answers. The check confirms the HTTP server is up, not that IMAP credentials work.
+The image runs `yandex-mail-mcp` with the stdio transport by default. A container has no browser for `login`, so pass a token instead, for example
+`docker run -i --rm -e YANDEX_EMAIL -e YANDEX_OAUTH_TOKEN ghcr.io/lagrunge82/yandex-mail-mcp:latest`, or use the HTTP server above.
 
 ## Safety and permissions
 
@@ -115,7 +143,7 @@ The `folder` parameter on read tools can access any folder available to the acco
 
 To change mail via MCP, set `YANDEX_ALLOW_WRITE=true`. Each changing tool acts on one message and asks for confirmation through MCP elicitation: the client must support it and the user must accept with `approve=true`, otherwise nothing changes. The request names the folders involved and quotes the message's sender and subject as untrusted single lines. Moves and archiving are always confirmed. Changing the Seen and Flagged flags and saving a draft are reversible, so the operator can skip their confirmation with `MCP_CONFIRM_REVERSIBLE=false`. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed.
 
-`move_email` and `archive_email` move only into existing folders and never create one. They refuse Trash, Spam, Drafts and Sent (by their special-use flags or system names), folders inside them, and virtual folders such as All Mail. `create_draft` appends a plain-text message (body up to 100 KiB, no attachments or HTML) to the drafts folder with the `\Draft` flag; its `From` is `YANDEX_EMAIL`. The server exposes no deletion, expunge, move to Trash, or sending of mail.
+`move_email` and `archive_email` move only into existing folders and never create one. They refuse Trash, Spam, Drafts and Sent (by their special-use flags or system names), folders inside them, and virtual folders such as All Mail. `create_draft` appends a plain-text message (body up to 100 KiB, no attachments or HTML) to the drafts folder with the `\Draft` flag; its `From` is the signed-in address. The server exposes no deletion, expunge, move to Trash, or sending of mail.
 
 `move_to_promotions(uid, confirm=true)` keeps its previous behavior until it is removed: it moves only into `YANDEX_PROMOTIONS_FOLDER` and creates it if missing. `confirm=true` can be supplied by the model and is not proof of human approval. `YANDEX_PROMOTIONS_FOLDER` must be a top-level folder: names containing the server's hierarchy delimiter (`|` on Yandex) are rejected, as are system folders such as Trash and Spam. System folder names stop the server at startup; the remaining checks run before the confirmation request, which names the destination folder.
 

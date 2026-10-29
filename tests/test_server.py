@@ -145,19 +145,44 @@ def test_connection_error_without_settings_reaches_client(monkeypatch):
         server.list_folders()
 
 
-def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
+def http_settings(monkeypatch, **values):
+    settings = {"imap_host": "imap", "imap_port": 993, "allow_write": False, "app_password": None}
     monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    monkeypatch.setattr(server, "_settings", lambda: SimpleNamespace(**settings | values))
+
+
+@pytest.mark.parametrize("override", [None, "true"])
+def test_non_loopback_requires_oauth_or_token(monkeypatch, caplog, override):
+    http_settings(monkeypatch)
     monkeypatch.setenv("MCP_HOST", "0.0.0.0")
     monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
-    monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
-    monkeypatch.setattr(server, "load_dotenv", lambda: None)
-    monkeypatch.setattr(
-        server,
-        "_settings",
-        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
-    )
-    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
+    monkeypatch.delenv("MCP_PUBLIC_URL", raising=False)
+    if override is None:
+        monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
+    else:
+        # Removed in 0.5.0: setting it no longer opens the server.
+        monkeypatch.setenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", override)
+    with pytest.raises(ValueError, match="MCP_PUBLIC_URL"):
         server.main([])
+    assert ("was removed" in caplog.text) == (override is not None)
+
+
+def test_app_password_is_refused_over_http(monkeypatch):
+    http_settings(monkeypatch, app_password="pw")
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    with pytest.raises(ValueError, match="only with the stdio transport"):
+        server.main([])
+
+
+def test_static_token_mode_warns_that_it_is_deprecated(monkeypatch, caplog):
+    http_settings(monkeypatch)
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "secret")
+    monkeypatch.delenv("MCP_PUBLIC_URL", raising=False)
+    monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
+    server.main([])
+    assert "MCP_AUTH_TOKEN is deprecated" in caplog.text
 
 
 def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
@@ -168,7 +193,9 @@ def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
     monkeypatch.setattr(
         server,
         "_settings",
-        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+        lambda: SimpleNamespace(
+            imap_host="imap", imap_port=993, allow_write=False, app_password=None
+        ),
     )
     with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
         server.main([])
@@ -183,7 +210,9 @@ def test_specific_host_is_allowed_by_default(monkeypatch):
     monkeypatch.setattr(
         server,
         "_settings",
-        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+        lambda: SimpleNamespace(
+            imap_host="imap", imap_port=993, allow_write=False, app_password=None
+        ),
     )
     captured = {}
 

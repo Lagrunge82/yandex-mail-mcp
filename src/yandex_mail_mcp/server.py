@@ -49,7 +49,7 @@ from .auth_server import (
     RateLimit,
     YandexAuthProvider,
 )
-from .config import ConfigurationError, Settings, env_bool, env_int
+from .config import ConfigurationError, Settings, env_int
 from .credentials import OAuthCredentials, StaticTokenSource
 from .crypto import TokenCipher
 from .mail import Draft, Mailbox, MailError, MailSummary, ThreadMessage
@@ -790,13 +790,22 @@ def main(argv: list[str] | None = None) -> None:
             raise ConfigurationError(
                 "Set either MCP_PUBLIC_URL (OAuth) or MCP_AUTH_TOKEN, not both"
             )
+        if settings.app_password is not None:
+            # One password shared by every HTTP user contradicts per-user sign-in.
+            raise ConfigurationError(
+                "YANDEX_APP_PASSWORD works only with the stdio transport; over HTTP use "
+                "MCP_PUBLIC_URL (each user signs in with Yandex) or YANDEX_OAUTH_TOKEN"
+            )
+        if os.getenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE") is not None:
+            logging.warning("MCP_ALLOW_UNAUTHENTICATED_REMOTE was removed in 0.5.0 and is ignored")
         if host not in {"127.0.0.1", "localhost", "::1"} and not token and not public_url:
-            if not env_bool("MCP_ALLOW_UNAUTHENTICATED_REMOTE"):
-                raise ConfigurationError(
-                    "Non-loopback MCP_HOST requires MCP_AUTH_TOKEN or MCP_ALLOW_UNAUTHENTICATED_REMOTE=true"
-                )
+            raise ConfigurationError(
+                "A non-loopback MCP_HOST requires MCP_PUBLIC_URL (OAuth) or MCP_AUTH_TOKEN"
+            )
+        if token:
             logging.warning(
-                "HTTP MCP is accessible without authentication on a non-loopback address"
+                "MCP_AUTH_TOKEN is deprecated and will be removed in the next minor release; "
+                "set MCP_PUBLIC_URL to let users sign in with Yandex"
             )
         default_hosts = "localhost:*,127.0.0.1:*,[::1]:*"
         if host not in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}:

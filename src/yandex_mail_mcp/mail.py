@@ -1122,7 +1122,7 @@ class Mailbox:
                 original = parse_message(raw, in_reply_to_uid, max_body_chars=0)
                 reply = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
         message = EmailMessage(policy=policy.SMTP)
-        message["From"] = self.config.email
+        message["From"] = self.credentials.email
         if reply is not None and original is not None:
             if not recipients:
                 answer_to = str(reply.get("Reply-To") or reply.get("From") or "")
@@ -1144,7 +1144,7 @@ class Mailbox:
             message["Cc"] = ", ".join(copies)
         message["Subject"] = subject
         message["Date"] = formatdate(localtime=True)
-        message["Message-ID"] = make_msgid(domain=self.config.email.rpartition("@")[2] or None)
+        message["Message-ID"] = make_msgid(domain=self.credentials.email.rpartition("@")[2] or None)
         message.set_content(body, charset="utf-8", cte="quoted-printable")
         return original, Draft(folder=folder, message=message)
 
