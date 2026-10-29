@@ -7,6 +7,7 @@ A small, self-hosted **MCP server for Yandex Mail**. Built with Python and IMAP.
 - [What it does](#what-it-does)
 - [Quick start for one user (stdio)](#quick-start-for-one-user-stdio)
 - [Shared server for several users (HTTP)](#shared-server-for-several-users-http)
+- [Write access and confirmations](#write-access-and-confirmations)
 - [Configuration](#configuration)
 - [Security](#security)
 - [Docker image](#docker-image)
@@ -31,6 +32,8 @@ Changing tools, which need `YANDEX_ALLOW_WRITE=true`, act on one message per cal
 - `set_flag`: flag or unflag one message.
 - `create_draft`: save a plain-text draft, optionally a reply that joins a message's conversation, in the folder flagged `\Drafts`. Nothing is sent: the user reviews and sends it from Yandex Mail.
 - `move_to_promotions`: deprecated in favor of `move_email` and will be removed in a later release. Moves one inbox message to the dedicated folder `YANDEX_PROMOTIONS_FOLDER`, creating it if missing.
+
+`get_connection_capabilities` reports what the current connection may do: whether the server allows changes, which MCP scopes the connection holds, whether the Yandex authorization behind it has full IMAP access, whether the client can confirm changes itself or through a link, and what to do when changes are unavailable. It reveals no tokens or secrets.
 
 On the [shared HTTP server](#shared-server-for-several-users-http), `logout` signs the caller out: it revokes their Yandex access, which ends every token the server issued for it. Mail is not changed. The local server has the `logout` command instead.
 
@@ -105,11 +108,42 @@ With `MCP_PUBLIC_URL` set, the HTTP server is an OAuth authorization server for 
    reverse_proxy 127.0.0.1:8000
    ```
 
-6. Add the connector: in Claude Desktop, **Settings → Connectors → Add custom connector** with the URL `https://mail.example.com/mcp`; in Claude Code, `claude mcp add --transport http yandex-mail https://mail.example.com/mcp`, then `/mcp` to sign in. The client registers itself, opens the Yandex sign-in page and needs nothing else.
+6. Add the connector: in Claude Desktop, **Settings → Connectors → Add custom connector** with the URL `https://mail.example.com/mcp`; in Claude Code, `claude mcp add --transport http yandex-mail https://mail.example.com/mcp`, then `/mcp` to sign in. The client registers itself and opens the sign-in flow. When the server allows writes, a page on this server first asks whether the app may **read only** or **read and change mail**; Yandex then shows its own permission page. See [Write access and confirmations](#write-access-and-confirmations).
 
 Requests to `/authorize`, `/token`, `/register`, `/revoke` and the Yandex sign-in routes are limited to `MCP_AUTH_RATE_LIMIT` (30) per client IP and minute. Compose sets `MCP_FORWARDED_ALLOW_IPS=*` so the limit sees the client addresses the proxy forwards; this is safe only because the port is bound to localhost. Each tool call writes a JSON line to the `yandex_mail_mcp.audit` log with the time, Yandex login, client ID, tool, folder, UID, result and duration, without subjects, addresses, message text or tokens.
 
 `GET /healthz` answers `200 ok` while the HTTP server is serving, without logging in to IMAP or requiring a token; Compose uses it as the health check. DNS rebinding protection is enabled: the host of `MCP_PUBLIC_URL` and a specific `MCP_HOST` are allowed automatically, and `MCP_ALLOWED_HOSTS` and `MCP_ALLOWED_ORIGINS` override the defaults. A wildcard bind such as `0.0.0.0` without `MCP_PUBLIC_URL` needs `MCP_ALLOWED_HOSTS` set to the host names or addresses and ports clients send.
+
+## Write access and confirmations
+
+Changing mail takes three separate permissions, and all three are checked on every call:
+
+1. **The operator** enables changes with `YANDEX_ALLOW_WRITE=true`. Without it the server never asks Yandex for more than read access and never offers the `mail.write` scope.
+2. **The user** grants them when connecting. On the shared HTTP server a consent page asks whether the app may *read only* or *read and change mail*; only the second choice makes the server request full IMAP access (`mail:imap_full`) from Yandex, and Yandex shows its own permission page after it. The MCP token gets the `mail.write` scope only when the user chose it and Yandex granted full access. A client that asks for `mail.read` alone goes straight to read-only access and sees no page. On the local server, `yandex-mail-mcp login` asks for full access when `YANDEX_ALLOW_WRITE=true` is set.
+3. **The user confirms each change.** Every changing tool acts on one message and shows what it is about to do, with the message's sender and subject marked as untrusted text, before doing it. Clients with MCP elicitation (Claude Desktop, Claude Code) ask inside the conversation. On the shared HTTP server, a client without elicitation gets a link instead: the tool returns `confirmation_required` with a `confirm_url` on this server, where the user, signed in as the same Yandex account, sees the change and approves or rejects it. Nothing happens until they approve; the link is single-use and expires in 10 minutes. Changing the Seen and Flagged flags and saving a draft are reversible, so the operator can skip their confirmation with `MCP_CONFIRM_REVERSIBLE=false`; moves and archiving are always confirmed.
+
+The confirmation page relies on a cookie set in the browser that completed the Yandex sign-in, so it is normally available right away. In another browser, or after 30 days, the page first sends the user through a Yandex sign-in that asks only for their login, then shows the change. The assistant cannot approve on the user's behalf: the page needs that browser session, and approving is a form submission from it.
+
+### ChatGPT
+
+ChatGPT connects to the shared HTTP server as any other MCP client, with the same consent page. Its OAuth client asks for the scopes this server publishes in its protected-resource metadata, which include `mail.write` when writes are enabled, so the consent page appears and the user chooses. Whether a given ChatGPT connection can confirm changes through elicitation is best checked with `get_connection_capabilities`: `confirmation` is `elicitation` when it can, and `browser_link` when changes will be confirmed through the link described above. Both work; the link is the fallback for clients that cannot ask.
+
+### Upgrading a read-only connection
+
+A connection authorized before writes were enabled, or with *read only* chosen on the consent page, keeps read-only tokens for as long as it refreshes them: refreshing never widens a token. To get write access, authorize again:
+
+1. The operator sets `YANDEX_ALLOW_WRITE=true` and restarts the server.
+2. In the client, disconnect and reconnect the server (ChatGPT: remove the connector and add it again, or use its reauthorize option when offered; Claude Desktop: remove and re-add the custom connector; Claude Code: `claude mcp remove yandex-mail`, add it again and run `/mcp`).
+3. On the consent page choose **Read and change mail**, then allow full access on Yandex's page.
+
+Clients registered while writes were off can do this without re-registering: what a client may ask for follows the server's current configuration. Tokens issued earlier stay read-only until they expire or are refreshed into nothing wider than they were.
+
+### Troubleshooting
+
+- **"Your access is read-only. Sign in again with write access: reconnect this server in your MCP client and allow full mail access"** means this connection's token lacks `mail.write`: either the connection was authorized before `YANDEX_ALLOW_WRITE=true`, or *read only* was chosen, or Yandex granted only `mail:imap_ro`. Reconnecting alone does not help if the client reuses its refresh token; follow [Upgrading a read-only connection](#upgrading-a-read-only-connection). `get_connection_capabilities` shows `mcp_scopes` and `yandex_full_mail_access` for the connection.
+- **"Write operations are disabled. Set YANDEX_ALLOW_WRITE=true"**: the server itself refuses changes; this is the operator's setting.
+- **"… needs the user's confirmation, but this MCP client does not support elicitation"** appears only on the local server or with the deprecated static token: there is no browser identity to confirm with. Use a client with elicitation, or the shared HTTP server.
+- **"Folder 'github/ci/cd' not found"**: nested folders are written with the server's delimiter, `|` on Yandex (`github|ci/cd`); the error names the folder it thinks you meant. `list_folders` shows the exact names.
 
 ## Configuration
 
@@ -152,7 +186,7 @@ The server keeps up to `YANDEX_IMAP_POOL_SIZE` logged-in IMAP connections per us
 - **What the server holds** is the encryption key and the Yandex application's `client_secret`. Neither is a user credential, but the key together with an intercepted token gives access to that user's mail: keep both in secret storage and serve only over HTTPS.
 - **Revoking access**: the `logout` tool, or a client's call to `/revoke`, revokes the user's Yandex token, after which every token the server issued for it stops working. A user can also revoke the application in their Yandex ID settings. `MCP_ALLOWED_USERS` decides who can sign in at all and is checked on every token, so removing a user ends their access at once; a refused user's Yandex token is revoked immediately.
 - **Rotating the key**: put the new key first (`MCP_TOKEN_ENCRYPTION_KEYS=k2:...,k1:...`); new tokens use it and old ones still open. After 30 days, when the last refresh token sealed with the old key has expired, remove it. Removing a key immediately ends every token sealed with it, and clients registered with a secret have to register again.
-- **Write access** requires `YANDEX_ALLOW_WRITE=true` on the server and full IMAP access granted by the user; the server asks Yandex for full access only when writes are enabled. The server still never deletes, expunges or sends mail.
+- **Write access** requires `YANDEX_ALLOW_WRITE=true` on the server, the user's choice of *read and change mail* on the consent page, and full IMAP access granted by the user at Yandex; the server asks Yandex for full access only after that choice, and refreshing a token never widens it. Each change is then confirmed by the user, in the client or on this server's confirmation page, which only the browser that signed in can use. The server still never deletes, expunges or sends mail.
 - **The local server** keeps the tokens from `login` in the system keyring, or in a 0600 file where no keyring exists. Credentials are never logged or returned in errors, and the IMAP connection always uses TLS with certificate verification.
 
 See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
@@ -200,7 +234,7 @@ YANDEX_ALLOW_WRITE=false
 
 The `folder` parameter on read tools can access any folder available to the account, including Sent and Drafts. Read-only mode restricts mutations; it does not restrict which folders can be read.
 
-To change mail via MCP, set `YANDEX_ALLOW_WRITE=true`. Each changing tool acts on one message and asks for confirmation through MCP elicitation: the client must support it and the user must accept with `approve=true`, otherwise nothing changes. With a client that does not support elicitation, a confirmed change fails with an error that says so. The request names the folders involved and quotes the message's sender and subject as untrusted single lines. Moves and archiving are always confirmed. Changing the Seen and Flagged flags and saving a draft are reversible, so the operator can skip their confirmation with `MCP_CONFIRM_REVERSIBLE=false`. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed.
+To change mail via MCP, set `YANDEX_ALLOW_WRITE=true` and authorize the connection with write access (see [Write access and confirmations](#write-access-and-confirmations)). Each changing tool acts on one message and asks for confirmation through MCP elicitation: the user must accept with `approve=true`, otherwise nothing changes. On the shared HTTP server, a client without elicitation gets a single-use link to a confirmation page on this server instead; on the local server such a client gets an error that says so. The request names the folders involved and quotes the message's sender and subject as untrusted single lines. Moves and archiving are always confirmed. Changing the Seen and Flagged flags and saving a draft are reversible, so the operator can skip their confirmation with `MCP_CONFIRM_REVERSIBLE=false`. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed.
 
 Every change is validated before the user is asked and again after the approval: an invalid request fails before the confirmation, and a folder that disappears in between fails the change.
 

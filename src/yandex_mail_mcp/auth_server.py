@@ -35,8 +35,16 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from .confirmations import ConfirmationFailed, PendingAction, PendingActions
 from .crypto import TokenCipher
-from .yandex_oauth import YandexOAuth, YandexOAuthError, YandexUser, can_write, requested_scope
+from .yandex_oauth import (
+    SCOPE_LOGIN,
+    YandexOAuth,
+    YandexOAuthError,
+    YandexUser,
+    can_write,
+    requested_scope,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -44,7 +52,11 @@ SCOPE_READ = "mail.read"
 SCOPE_WRITE = "mail.write"
 START_PATH = "/oauth/yandex/start"
 CALLBACK_PATH = "/oauth/yandex/callback"
+CONFIRM_PATH = "/confirm/{action_id}"
 NONCE_COOKIE = "mcp_auth_nonce"
+# Who signed in through this browser, so confirmation pages know whom they talk to.
+BROWSER_COOKIE = "mcp_auth_user"
+BROWSER_TTL = 30 * 24 * 3600
 # Yandex limits its state parameter; the sealed state carries the client's own state.
 YANDEX_MAX_STATE = 1024
 MAX_CLIENT_STATE = 256
@@ -162,12 +174,25 @@ class YandexRefreshToken(RefreshToken):
     grant: dict[str, Any]
 
 
-def _page(message: str, status: int = 400) -> HTMLResponse:
-    body = (
-        "<!doctype html><meta charset=utf-8><title>Yandex Mail MCP</title>"
-        f"<p>{html.escape(message)}</p>"
+_STYLE = (
+    "<style>body{font:16px/1.5 system-ui,sans-serif;max-width:40em;margin:3em auto;padding:0 1em}"
+    "pre{white-space:pre-wrap;background:#f4f4f4;padding:1em;border-radius:.5em}"
+    "button{font:inherit;padding:.6em 1.2em;margin:.3em .6em .3em 0;border-radius:.4em;"
+    "border:1px solid #888;background:#fff;cursor:pointer}"
+    "button.primary{background:#1a73e8;color:#fff;border-color:#1a73e8}</style>"
+)
+
+
+def _document(title: str, body: str, status: int = 200) -> HTMLResponse:
+    page = (
+        f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+        f"<title>{html.escape(title)}</title>{_STYLE}<h1>{html.escape(title)}</h1>{body}"
     )
-    return HTMLResponse(body, status_code=status, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(page, status_code=status, headers={"Cache-Control": "no-store"})
+
+
+def _page(message: str, status: int = 400) -> HTMLResponse:
+    return _document("Yandex Mail MCP", f"<p>{html.escape(message)}</p>", status)
 
 
 class YandexAuthProvider(
@@ -185,6 +210,7 @@ class YandexAuthProvider(
         allow_write: bool,
         allowed_users: frozenset[str] = frozenset(),
         clock: Callable[[], float] = time.time,
+        pending: PendingActions | None = None,
     ) -> None:
         self.cipher = cipher
         self.clients = clients
@@ -192,6 +218,8 @@ class YandexAuthProvider(
         self.public_url = public_url.rstrip("/")
         self.resource = f"{self.public_url}/mcp"
         self.allow_write = allow_write
+        # Changes waiting for approval in the browser (clients without elicitation).
+        self.pending = pending
         # Casefolded Yandex logins or addresses; empty lets nobody in.
         self.allowed_users = frozenset(user.casefold() for user in allowed_users)
         self._clock = clock
@@ -202,10 +230,26 @@ class YandexAuthProvider(
     def callback_url(self) -> str:
         return f"{self.public_url}{CALLBACK_PATH}"
 
+    @property
+    def offered_scopes(self) -> list[str]:
+        """The MCP scopes this server offers under its current configuration."""
+        return [SCOPE_READ, SCOPE_WRITE] if self.allow_write else [SCOPE_READ]
+
+    def confirm_url(self, action_id: str) -> str:
+        return f"{self.public_url}{CONFIRM_PATH.format(action_id=action_id)}"
+
     # Clients
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return await anyio.to_thread.run_sync(lambda: self.clients.get(client_id))
+        client = await anyio.to_thread.run_sync(lambda: self.clients.get(client_id))
+        if client is not None:
+            # What a client may ask for follows the server's configuration now, not at
+            # the moment it registered: the SDK rejects a request for a scope outside
+            # client.scope, so a registration made while writes were off would cap every
+            # later authorization at mail.read. Asking is not getting: the user still
+            # chooses on the consent page, and Yandex still has to grant full access.
+            client.scope = " ".join(self.offered_scopes)
+        return client
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         await anyio.to_thread.run_sync(lambda: self.clients.add(client_info))
@@ -227,8 +271,9 @@ class YandexAuthProvider(
                 "redirect_uri_explicit": params.redirect_uri_provided_explicitly,
                 "code_challenge": params.code_challenge,
                 "state": params.state,
-                # No scope requested means the scopes the client registered with.
-                "scopes": params.scopes or (client.scope or SCOPE_READ).split(),
+                # No scope requested means every scope the server offers; the consent
+                # page lets the user keep it to reading.
+                "scopes": params.scopes or self.offered_scopes,
                 "nonce": secrets.token_urlsafe(16),
             },
             STATE_TTL,
@@ -240,26 +285,89 @@ class YandexAuthProvider(
         return f"{self.public_url}{START_PATH}?{urlencode({'state': state})}"
 
     async def start(self, request: Request) -> Response:
-        state = request.query_params.get("state", "")
+        """Ask the user how much access to grant, then send them to Yandex.
+
+        GET shows the choice when writes are on the table (the server allows them and
+        the client asked for mail.write); POST carries the choice. Read-only requests go
+        straight to Yandex. The choice is sealed into the state, so the callback issues
+        mail.write only when the user picked it here and Yandex granted full access.
+        """
+        if request.method == "POST":
+            form = await request.form()
+            state = str(form.get("state", ""))
+            access = str(form.get("access", ""))
+        else:
+            state = request.query_params.get("state", "")
+            access = ""
         payload = self.cipher.open(state, "state")
-        if payload is None:
+        if payload is None or "scopes" not in payload:
             return _page("This sign-in link has expired or is invalid. Start again from your app.")
-        scope = requested_scope(self.allow_write and SCOPE_WRITE in payload["scopes"])
+        write_offered = self.allow_write and SCOPE_WRITE in payload["scopes"]
+        if write_offered and access not in {"read", "write"}:
+            return self._consent_page(state)
+        return self._to_yandex(payload, write=write_offered and access == "write")
+
+    def _consent_page(self, state: str) -> Response:
+        body = (
+            "<p>An app wants to connect to your Yandex Mail through this server. "
+            "Choose what it may do. You can change your mind later by connecting again.</p>"
+            f"<form method=post action='{START_PATH}'>"
+            f"<input type=hidden name=state value='{html.escape(state, quote=True)}'>"
+            "<p><button name=access value=read>Read only</button> "
+            "search and read mail, nothing changes.</p>"
+            "<p><button name=access value=write class=primary>Read and change mail</button> "
+            "also move and archive messages, mark them read or flagged, and save drafts. "
+            "Each change still asks you to confirm. The server never deletes mail, "
+            "never empties folders and never sends anything.</p>"
+            "</form>"
+            "<p>Yandex will show its own permission page next.</p>"
+        )
+        return _document("Connect Yandex Mail", body)
+
+    def _to_yandex(self, payload: dict[str, Any], *, write: bool) -> Response:
+        state = self.cipher.seal("state", {**payload, "write": write}, STATE_TTL)
+        if len(state) > YANDEX_MAX_STATE:
+            return _page("The sign-in request is too long. Start again from your app.")
         response = RedirectResponse(
-            self.oauth.authorize_url(self.callback_url, state, scope),
+            self.oauth.authorize_url(self.callback_url, state, requested_scope(write)),
             status_code=302,
             headers={"Cache-Control": "no-store"},
         )
+        self._set_nonce_cookie(response, str(payload["nonce"]))
+        return response
+
+    def _set_nonce_cookie(self, response: Response, nonce: str) -> None:
         response.set_cookie(
             NONCE_COOKIE,
-            payload["nonce"],
+            nonce,
             max_age=STATE_TTL,
             path=CALLBACK_PATH,
             secure=self.public_url.startswith("https://"),
             httponly=True,
             samesite="lax",
         )
-        return response
+
+    def _set_browser_cookie(self, response: Response, user: YandexUser) -> None:
+        """Remember who signed in through this browser, for confirmation pages."""
+        response.set_cookie(
+            BROWSER_COOKIE,
+            self.cipher.seal("browser", {"login": user.login, "email": user.email}, BROWSER_TTL),
+            max_age=BROWSER_TTL,
+            path="/",
+            secure=self.public_url.startswith("https://"),
+            httponly=True,
+            samesite="lax",
+        )
+
+    def browser_user(self, request: Request) -> YandexUser | None:
+        """The allowed Yandex user who signed in through this browser, if any."""
+        payload = self.cipher.open(request.cookies.get(BROWSER_COOKIE, ""), "browser")
+        if payload is None:
+            return None
+        user = YandexUser(login=str(payload["login"]), email=str(payload["email"]))
+        if not (self.allowed(user.login) or self.allowed(user.email)):
+            return None
+        return user
 
     def _client_redirect(self, payload: dict[str, Any], **params: str | None) -> Response:
         url = construct_redirect_uri(payload["redirect_uri"], state=payload["state"], **params)
@@ -299,6 +407,8 @@ class YandexAuthProvider(
         cookie = request.cookies.get(NONCE_COOKIE, "")
         if not secrets.compare_digest(cookie.encode(), str(payload["nonce"]).encode()):
             return _page("This sign-in was started in another browser. Start again from your app.")
+        if "confirm" in payload:
+            return await self._confirm_callback(request, payload)
         code = request.query_params.get("code")
         if not code:
             error = request.query_params.get("error") or "access_denied"
@@ -307,9 +417,13 @@ class YandexAuthProvider(
                 error="access_denied" if error == "access_denied" else "server_error",
                 error_description=f"Yandex sign-in failed: {error}",
             )
+        # Writes only when the user chose them on the consent page; the choice is sealed
+        # in the state, and the code's scopes follow it even if Yandex granted more.
+        write = bool(payload.get("write"))
+        scopes = [scope for scope in payload["scopes"] if write or scope != SCOPE_WRITE]
         try:
             # Yandex may not echo the granted scope; fall back to what start() requested.
-            scope = requested_scope(self.allow_write and SCOPE_WRITE in payload["scopes"])
+            scope = requested_scope(write)
             tokens = await anyio.to_thread.run_sync(
                 lambda: self.oauth.exchange_code(code, redirect_uri=self.callback_url, scope=scope)
             )
@@ -337,12 +451,125 @@ class YandexAuthProvider(
                 "redirect_uri": payload["redirect_uri"],
                 "redirect_uri_explicit": payload["redirect_uri_explicit"],
                 "code_challenge": payload["code_challenge"],
-                "scopes": payload["scopes"],
+                "scopes": scopes,
                 "grant": grant,
             },
             CODE_TTL,
         )
-        return self._client_redirect(payload, code=code_blob)
+        response = self._client_redirect(payload, code=code_blob)
+        self._set_browser_cookie(response, user)
+        return response
+
+    # Confirmation of changes in the browser
+
+    def _confirm_signin(self, pending: PendingAction) -> Response:
+        """Have the user prove who they are to Yandex before showing a confirmation."""
+        nonce = secrets.token_urlsafe(16)
+        state = self.cipher.seal("state", {"confirm": pending.id, "nonce": nonce}, STATE_TTL)
+        response = RedirectResponse(
+            self.oauth.authorize_url(self.callback_url, state, " ".join(SCOPE_LOGIN)),
+            status_code=302,
+            headers={"Cache-Control": "no-store"},
+        )
+        self._set_nonce_cookie(response, nonce)
+        return response
+
+    async def _confirm_callback(self, request: Request, payload: dict[str, Any]) -> Response:
+        code = request.query_params.get("code")
+        if not code:
+            return _page("Yandex sign-in was cancelled. Nothing was changed.")
+        try:
+            tokens = await anyio.to_thread.run_sync(
+                lambda: self.oauth.exchange_code(code, redirect_uri=self.callback_url)
+            )
+            user = await anyio.to_thread.run_sync(lambda: self.oauth.user(tokens.access_token))
+        except YandexOAuthError as exc:
+            LOG.warning("Yandex sign-in for a confirmation failed: %s", exc.error)
+            return _page("Yandex rejected the sign-in. Nothing was changed.")
+        if (denied := await self.check_user(user, tokens.access_token)) is not None:
+            return _page(denied, 403)
+        # The identity token is not kept: it expires on its own, and revoking it could
+        # end the grant behind the user's MCP tokens.
+        response = RedirectResponse(
+            self.confirm_url(str(payload["confirm"])),
+            status_code=302,
+            headers={"Cache-Control": "no-store"},
+        )
+        response.delete_cookie(NONCE_COOKIE, path=CALLBACK_PATH)
+        self._set_browser_cookie(response, user)
+        return response
+
+    async def confirm(self, request: Request) -> Response:
+        """Show a pending change to its owner and carry out their decision."""
+        if self.pending is None:
+            return _page("This server does not confirm changes in the browser.", 404)
+        pending = self.pending.get(request.path_params["action_id"])
+        if pending is None:
+            return _page(
+                "This confirmation has expired or does not exist. Nothing was changed; "
+                "ask the assistant again if you still want it.",
+                404,
+            )
+        user = self.browser_user(request)
+        if user is None or user.login.casefold() != pending.login.casefold():
+            return self._confirm_signin(pending)
+        if pending.decided:
+            return self._decision_page(pending)
+        if request.method != "POST":
+            return self._confirm_page(pending)
+        form = await request.form()
+        decision = str(form.get("decision", ""))
+        if decision not in {"approve", "reject"}:
+            return _page("Choose Approve or Reject.")
+        claimed = self.pending.claim(pending.id, user.login, decision)
+        if claimed is None:
+            return self._decision_page(pending)
+        if decision == "reject":
+            self.pending.finish(pending, result=None, error=None)
+            LOG.info("Confirmation %s rejected by %s", pending.name, pending.login)
+            return self._decision_page(pending)
+        try:
+            result = await anyio.to_thread.run_sync(pending.action)
+        except ConfirmationFailed as exc:
+            self.pending.finish(pending, result=None, error=str(exc))
+        except Exception:
+            LOG.exception("Approved %s failed", pending.name)
+            self.pending.finish(
+                pending, result=None, error="The change failed; the server log has details."
+            )
+        else:
+            self.pending.finish(pending, result=result, error=None)
+        return self._decision_page(pending)
+
+    def _confirm_page(self, pending: PendingAction) -> Response:
+        assert self.pending is not None
+        minutes = max(1, self.pending.seconds_left(pending) // 60)
+        body = (
+            f"<p>Signed in as <b>{html.escape(pending.email)}</b>. The assistant asks for this "
+            f"change; it happens only if you approve it here within {minutes} min.</p>"
+            f"<pre>{html.escape(pending.question)}</pre>"
+            "<form method=post>"
+            "<button name=decision value=approve class=primary>Approve</button>"
+            "<button name=decision value=reject>Reject</button>"
+            "</form>"
+        )
+        return _document(f"{pending.name}: approve?", body)
+
+    @staticmethod
+    def _decision_page(pending: PendingAction) -> Response:
+        if pending.decision == "reject":
+            body = "<p>Rejected. Nothing was changed.</p>"
+        elif pending.error is not None:
+            body = f"<p>Approved, but the change failed: {html.escape(pending.error)}</p>"
+        elif pending.result is not None:
+            details = "".join(
+                f"<li>{html.escape(str(key))}: {html.escape(str(value))}</li>"
+                for key, value in pending.result.items()
+            )
+            body = f"<p>Done.</p><ul>{details}</ul>"
+        else:
+            body = "<p>This change was already decided.</p>"
+        return _document(f"{pending.name}: {pending.decision or 'decided'}", body)
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
