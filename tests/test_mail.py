@@ -83,7 +83,9 @@ def test_inline_image_without_filename_counts_as_attachment_in_both_paths():
         ],
         b"RELATED",
     )
-    assert _text_sections(structure)[1] is True
+    assert _text_sections(structure)[1] == [
+        {"filename": "", "content_type": "image/png", "size": 4, "section": "2"}
+    ]
 
 
 def test_root_message_with_name_or_attachment_disposition_is_body_in_both_paths():
@@ -112,7 +114,7 @@ def test_root_message_with_name_or_attachment_disposition_is_body_in_both_paths(
         (b"ATTACHMENT", (b"FILENAME", b"body.txt")),
         None,
     )
-    assert _text_sections(structure) == ([("1", "text/plain", "utf-8", "7BIT")], False)
+    assert _text_sections(structure) == ([("1", "text/plain", "utf-8", "7BIT")], [])
 
 
 def test_root_message_of_non_text_type_is_still_an_attachment():
@@ -121,7 +123,10 @@ def test_root_message_of_non_text_type_is_still_an_attachment():
     raw = b"Subject: Scan\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.7\r\n"
     assert parse_message(raw, 1)["has_attachments"] is True
     structure = (b"APPLICATION", b"PDF", None, None, None, b"BASE64", 10, None, None, None)
-    assert _text_sections(structure) == ([], True)
+    assert _text_sections(structure) == (
+        [],
+        [{"filename": "", "content_type": "application/pdf", "size": 10, "section": "1"}],
+    )
 
 
 def test_html_blocks_and_entities_are_separated():

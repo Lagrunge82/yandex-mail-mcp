@@ -16,7 +16,7 @@ MCP tools:
 
 `list_recent_emails` and `search_emails` take `before_uid` for paging: pass the smallest `uid` of a page to get the messages before it. Every result includes `in_reply_to` and `references`.
 
-Read operations use IMAP `BODY.PEEK` and should **not mark messages as read**. Lists and searches fetch headers, MIME structure and at most 16 KiB of a text section per message, without fetching attachment sections. `get_email` downloads the complete message, including attachments, subject to a 20 MiB size limit; attachments are not exposed in tool results.
+Read operations use IMAP `BODY.PEEK` and should **not mark messages as read**. Lists and searches fetch headers, MIME structure and at most 16 KiB of a text section per message, without fetching attachment sections. `get_email` downloads the complete message, including attachments, subject to a 20 MiB size limit. Attachment contents are not exposed; names, types and sizes are, in the `attachments` field of every result, along with the raw `List-Unsubscribe` header in `list_unsubscribe`. The server never follows unsubscribe links or sends unsubscribe mail.
 
 ## Yandex setup
 
