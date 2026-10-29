@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- README and the `search_emails` description say that Yandex's text search index lags behind delivery: a message that arrived minutes ago is found by date and flags but may not match `query`, `sender`, `to` or `subject` yet.
+
 ## 0.6.0
 
 ### Deprecated
