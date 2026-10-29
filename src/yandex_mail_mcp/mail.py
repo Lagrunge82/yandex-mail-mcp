@@ -17,7 +17,7 @@ from email import policy
 from email.parser import BytesParser
 from html.parser import HTMLParser
 from typing import Iterator
-from typing_extensions import TypedDict
+from typing_extensions import TypedDict  # pydantic rejects typing.TypedDict before 3.12
 
 from imapclient import IMAPClient
 
