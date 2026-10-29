@@ -26,7 +26,13 @@ def increased_version(previous: str, current: str) -> str | None:
 
 def main() -> None:
     previous_sha = os.environ["PREVIOUS_SHA"]
-    if not re.fullmatch(r"[0-9a-f]{40}", previous_sha) or previous_sha == "0" * 40:
+    if previous_sha == "0" * 40:
+        # GitHub sends an all-zero SHA for the first push of a branch and for some
+        # force pushes; there is no previous version to compare against.
+        print("::warning::No previous main commit; skipping the version tag")
+        write_outputs(None)
+        return
+    if not re.fullmatch(r"[0-9a-f]{40}", previous_sha):
         raise ValueError("Cannot determine the previous main commit")
     old_content = subprocess.run(
         ["git", "show", f"{previous_sha}:pyproject.toml"],
@@ -36,7 +42,10 @@ def main() -> None:
     ).stdout
     old = tomllib.loads(old_content)["project"]["version"]
     new = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    version = increased_version(old, new)
+    write_outputs(increased_version(old, new))
+
+
+def write_outputs(version: str | None) -> None:
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
         output.write(f"bumped={'true' if version else 'false'}\n")
         if version:

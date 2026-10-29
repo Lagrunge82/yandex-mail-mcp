@@ -54,7 +54,9 @@ example `v0.1.1`) and publishes the image with that tag. A conflicting existing
 Git tag fails the workflow instead of being moved. The GitHub Actions token does
 not trigger another workflow for the new tag, so the same run publishes the
 versioned image. Versions must be valid Docker tags (PEP 440 local versions with
-`+` are unsupported). The `main` image also has the `latest` and commit-SHA tags;
+`+` are unsupported). A push without a previous commit to compare with (the
+branch's first push, or some force pushes) creates no version tag. The `main`
+image also has the `latest` and commit-SHA tags;
 manually pushed `v*` tags produce matching image tags. Each publication
 also gets a unique `build-<run_id>-<run_attempt>` tag. Registry tags can still be
 overwritten; for a strictly immutable deployment, use the `image@sha256:...` digest

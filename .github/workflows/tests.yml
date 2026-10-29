@@ -7,6 +7,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its previous run. Pushes to main and tags each
+# get their own group, so tests and the version tag always run for every commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   tests:
     runs-on: ubuntu-latest
@@ -98,6 +104,13 @@ jobs:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [version]
     runs-on: ubuntu-latest
+    # Publishes for one ref run one at a time, so the newest commit writes `latest` last.
+    # GitHub keeps only the newest waiting run: a publish superseded while waiting is
+    # skipped, and a versioned image it would have pushed can be published by pushing
+    # the v* tag manually.
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
