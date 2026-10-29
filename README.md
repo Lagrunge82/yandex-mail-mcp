@@ -24,6 +24,8 @@ Read operations use IMAP `BODY.PEEK` and should **not mark messages as read**. L
 
 Yandex's IMAP settings: `imap.yandex.com:993` (SSL). The server does not use SMTP or send mail.
 
+The server keeps up to `YANDEX_IMAP_POOL_SIZE` (default 2) logged-in IMAP connections and reuses them across tool calls, so a series of calls logs in once. A call that finds every connection busy waits up to a minute. A connection idle longer than `YANDEX_IMAP_IDLE_TIMEOUT` seconds (default 300) or failing `NOOP` is replaced. Connections are returned with no folder selected, closed after a failed call, and logged out when the server stops.
+
 ## Run the MCP server locally
 
 Requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/getting-started/installation/) for the locked development setup.

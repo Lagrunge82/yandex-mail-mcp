@@ -53,6 +53,8 @@ class Settings:
     imap_port: int = 993
     allow_write: bool = False
     promotions_folder: str = "AI-Promotions"
+    imap_pool_size: int = 2
+    imap_idle_timeout: int = 300
 
     def __post_init__(self) -> None:
         if isinstance(self.app_password, str):
@@ -73,6 +75,12 @@ class Settings:
             raise ConfigurationError(
                 "YANDEX_PROMOTIONS_FOLDER must name a dedicated folder, not a system folder"
             )
+        pool_size = env_int("YANDEX_IMAP_POOL_SIZE", 2)
+        if pool_size < 1:
+            raise ConfigurationError("YANDEX_IMAP_POOL_SIZE must be at least 1")
+        idle_timeout = env_int("YANDEX_IMAP_IDLE_TIMEOUT", 300)
+        if idle_timeout < 0:
+            raise ConfigurationError("YANDEX_IMAP_IDLE_TIMEOUT cannot be negative")
         return cls(
             email=email,
             app_password=password,
@@ -80,4 +88,6 @@ class Settings:
             imap_port=env_int("YANDEX_IMAP_PORT", 993),
             allow_write=env_bool("YANDEX_ALLOW_WRITE"),
             promotions_folder=promotions_folder,
+            imap_pool_size=pool_size,
+            imap_idle_timeout=idle_timeout,
         )
