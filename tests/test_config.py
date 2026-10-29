@@ -1,7 +1,7 @@
 from dataclasses import asdict
 
-from pydantic import SecretStr
 import pytest
+from pydantic import SecretStr
 
 from yandex_mail_mcp.config import ConfigurationError, Settings
 
