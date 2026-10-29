@@ -21,7 +21,7 @@ from typing_extensions import TypedDict
 
 from imapclient import IMAPClient
 
-from .config import Settings
+from .config import RESERVED_FOLDER_NAMES, Settings
 
 LOG = logging.getLogger(__name__)
 
@@ -368,14 +368,78 @@ class Mailbox:
     def headers(self, uid: int, folder: str = "INBOX") -> MailSummary:
         valid_uid(uid)
         with self.connect() as imap:
-            imap.select_folder(folder, readonly=True)
-            item = imap.fetch([uid], ["BODY.PEEK[HEADER]"]).get(uid, {})
-            raw = item.get(b"BODY[HEADER]")
-            if not isinstance(raw, bytes):
-                raise MailLookupError(
-                    f"Message UID {uid} not found or header unavailable in {folder}"
-                )
-            return parse_message(raw, uid, max_body_chars=0)
+            return self._headers(imap, uid, folder)
+
+    @staticmethod
+    def _headers(imap: IMAPClient, uid: int, folder: str) -> MailSummary:
+        imap.select_folder(folder, readonly=True)
+        item = imap.fetch([uid], ["BODY.PEEK[HEADER]"]).get(uid, {})
+        raw = item.get(b"BODY[HEADER]")
+        if not isinstance(raw, bytes):
+            raise MailLookupError(f"Message UID {uid} not found or header unavailable in {folder}")
+        return parse_message(raw, uid, max_body_chars=0)
+
+    def preview_promotions_move(self, uid: int) -> tuple[MailSummary, str]:
+        """Validate the promotions folder and read the INBOX message headers.
+
+        Returns the headers and the folder name as the server spells it, so the
+        caller can show both to a human before calling move_to_promotions.
+        """
+        valid_uid(uid)
+        self._promotions_folder_name()
+        with self.connect() as imap:
+            folder, _ = self.validate_promotions_folder(imap)
+            return self._headers(imap, uid, "INBOX"), folder
+
+    def _promotions_folder_name(self) -> str:
+        # Checks that need no connection; Settings.from_env runs the same ones.
+        folder = self.config.promotions_folder.strip()
+        if not folder or folder.casefold() in RESERVED_FOLDER_NAMES:
+            raise MailValueError("Choose a safe dedicated promotions folder")
+        return folder
+
+    def validate_promotions_folder(self, imap: IMAPClient) -> tuple[str, bool]:
+        """Check that the configured promotions folder is safe to move mail into.
+
+        Returns the canonical folder name and whether the folder already exists.
+        """
+        folder = self._promotions_folder_name()
+        folders = imap.list_folders()
+        delimiters = {
+            delimiter.decode() if isinstance(delimiter, bytes) else delimiter
+            for _, delimiter, _ in folders
+            if delimiter
+        }
+        if any(delimiter in folder for delimiter in delimiters):
+            raise MailValueError(
+                "Choose a safe dedicated top-level promotions folder; nested folders are not allowed"
+            )
+        matching = [
+            (flags, delimiter, name)
+            for flags, delimiter, name in folders
+            if name.casefold() == folder.casefold()
+        ]
+        if len(matching) > 1:
+            raise MailValueError("Promotions folder name is ambiguous")
+        if matching:
+            flags, _, folder = matching[0]
+            special = {
+                str(flag.decode() if isinstance(flag, bytes) else flag).casefold() for flag in flags
+            }
+            if special & {
+                "\\trash",
+                "\\junk",
+                "\\drafts",
+                "\\sent",
+                "\\all",
+                "\\flagged",
+                "\\inbox",
+                "\\noselect",
+            }:
+                raise MailValueError("Choose a safe dedicated promotions folder")
+        if not imap.has_capability("MOVE"):
+            raise MailError("IMAP server does not support MOVE")
+        return folder, bool(matching)
 
     def move_to_promotions(self, uid: int, confirm: bool = False) -> dict:
         valid_uid(uid)
@@ -383,63 +447,10 @@ class Mailbox:
             raise MailPermissionError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
         if confirm is not True:
             raise MailPermissionError("Explicit confirm=true is required to move a message")
-        folder = self.config.promotions_folder.strip()
-        forbidden_names = {
-            "inbox",
-            "trash",
-            "spam",
-            "deleted",
-            "junk",
-            "drafts",
-            "sent",
-            "outbox",
-            "спам",
-            "удалённые",
-            "удаленные",
-            "черновики",
-            "отправленные",
-            "исходящие",
-        }
-        if not folder or folder.casefold() in forbidden_names:
-            raise MailValueError("Choose a safe dedicated promotions folder")
+        self._promotions_folder_name()
         with self.connect() as imap:
-            folders = imap.list_folders()
-            delimiters = {
-                delimiter.decode() if isinstance(delimiter, bytes) else delimiter
-                for _, delimiter, _ in folders
-                if delimiter
-            }
-            if any(delimiter in folder for delimiter in delimiters):
-                raise MailValueError(
-                    "Choose a safe dedicated top-level promotions folder; nested folders are not allowed"
-                )
-            matching = [
-                (flags, delimiter, name)
-                for flags, delimiter, name in folders
-                if name.casefold() == folder.casefold()
-            ]
-            if len(matching) > 1:
-                raise MailValueError("Promotions folder name is ambiguous")
-            if matching:
-                flags, _, folder = matching[0]
-                special = {
-                    str(flag.decode() if isinstance(flag, bytes) else flag).casefold()
-                    for flag in flags
-                }
-                if special & {
-                    "\\trash",
-                    "\\junk",
-                    "\\drafts",
-                    "\\sent",
-                    "\\all",
-                    "\\flagged",
-                    "\\inbox",
-                    "\\noselect",
-                }:
-                    raise MailValueError("Choose a safe dedicated promotions folder")
-            if not imap.has_capability("MOVE"):
-                raise MailError("IMAP server does not support MOVE")
-            if not matching:
+            folder, exists = self.validate_promotions_folder(imap)
+            if not exists:
                 imap.create_folder(folder)
             imap.select_folder("INBOX", readonly=False)
             if uid not in imap.search(["UID", str(uid)]):

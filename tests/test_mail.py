@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import pytest
 
 from yandex_mail_mcp.config import Settings
-from yandex_mail_mcp.mail import Mailbox, MailValueError, parse_message, valid_uid
+from yandex_mail_mcp.mail import Mailbox, MailError, MailValueError, parse_message, valid_uid
 
 
 def test_parse_message_decodes_unicode_and_does_not_include_attachment():
@@ -407,3 +407,58 @@ def test_headers_does_not_fetch_full_message():
 
     box.connect = connect
     assert box.headers(1)["subject"] == "Large"
+
+
+def test_preview_validates_folder_and_reads_headers_in_one_connection():
+    box = Mailbox(
+        Settings(
+            email="test@yandex.com",
+            app_password="x",
+            allow_write=True,
+            promotions_folder="ai-promotions",
+        )
+    )
+    connections = []
+
+    class IMAP:
+        def list_folders(self):
+            return [((b"\\HasNoChildren",), b"|", "AI-Promotions")]
+
+        def has_capability(self, name):
+            return True
+
+        def select_folder(self, name, readonly):
+            assert (name, readonly) == ("INBOX", True)
+
+        def fetch(self, uids, fields):
+            return {3: {b"BODY[HEADER]": b"Subject: Sale\r\nFrom: shop@example.com\r\n\r\n"}}
+
+    @contextmanager
+    def connect():
+        connections.append(1)
+        yield IMAP()
+
+    box.connect = connect
+    headers, folder = box.preview_promotions_move(3)
+    assert headers["subject"] == "Sale"
+    assert folder == "AI-Promotions"
+    assert connections == [1]
+
+
+def test_preview_rejects_server_without_move():
+    box = Mailbox(Settings(email="test@yandex.com", app_password="x", allow_write=True))
+
+    class IMAP:
+        def list_folders(self):
+            return []
+
+        def has_capability(self, name):
+            return False
+
+    @contextmanager
+    def connect():
+        yield IMAP()
+
+    box.connect = connect
+    with pytest.raises(MailError, match="MOVE"):
+        box.preview_promotions_move(3)

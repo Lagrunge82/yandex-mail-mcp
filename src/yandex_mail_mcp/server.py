@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import logging
 import imaplib
@@ -9,6 +10,7 @@ import hmac
 import inspect
 import json
 import re
+import socket
 import ssl
 from functools import lru_cache, wraps
 
@@ -19,7 +21,8 @@ from mcp.types import ToolAnnotations
 from mcp.server.mcpserver.exceptions import ToolError
 from imapclient.exceptions import LoginError
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.responses import PlainTextResponse
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
 import uvicorn
 import anyio.to_thread
 from pydantic import BaseModel
@@ -46,6 +49,23 @@ def _imap_address() -> str:
     return f"IMAP server {settings.imap_host}:{settings.imap_port}"
 
 
+NETWORK_ERRNOS = {
+    errno.ENETDOWN,
+    errno.ENETUNREACH,
+    errno.EHOSTDOWN,
+    errno.EHOSTUNREACH,
+    errno.EADDRNOTAVAIL,
+}
+
+
+RESET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError)
+
+
+def _os_reason(exc: OSError) -> str:
+    """The OS or TLS error text, which carries no secrets."""
+    return exc.strerror or " ".join(map(str, exc.args)) or type(exc).__name__
+
+
 def tool_errors(fn):
     def translate(exc):
         if isinstance(exc, LoginError):
@@ -61,15 +81,20 @@ def tool_errors(fn):
             return ToolError(str(exc))
         if isinstance(exc, TimeoutError):
             return ToolError("IMAP connection timed out; please retry")
+        # imaplib does not wrap read errors, so a dropped session surfaces here.
+        if isinstance(exc, RESET_ERRORS):
+            return ToolError("IMAP connection was reset; please retry")
         if isinstance(exc, ssl.SSLError):
             return ToolError(
-                f"TLS handshake with {_imap_address()} failed; "
+                f"TLS error with {_imap_address()} ({_os_reason(exc)}); "
                 "check YANDEX_IMAP_HOST and the certificate chain"
             )
-        if isinstance(exc, OSError):
+        if isinstance(exc, (ConnectionError, socket.gaierror, socket.herror)) or (
+            isinstance(exc, OSError) and exc.errno in NETWORK_ERRNOS
+        ):
             return ToolError(
-                f"Cannot connect to {_imap_address()}; "
-                "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access"
+                f"Connection to {_imap_address()} failed ({_os_reason(exc)}); "
+                "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access, then retry"
             )
         return None
 
@@ -111,12 +136,15 @@ def _mailbox() -> Mailbox:
 
 
 class BearerAuth:
+    # The health check reveals nothing, so Compose can probe it without the token.
+    public_paths = frozenset({"/healthz"})
+
     def __init__(self, app, token):
         self.app = app
         self.token = token
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        if scope["type"] == "http" and scope.get("path") not in self.public_paths:
             headers = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
             scheme, _, credentials = headers[0].partition(b" ") if len(headers) == 1 else (b"",) * 3
             if scheme.lower() != b"bearer" or not hmac.compare_digest(
@@ -127,6 +155,12 @@ class BearerAuth:
                 )(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> Response:
+    """Report that the HTTP server is serving, without logging in to IMAP."""
+    return PlainTextResponse("ok")
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
@@ -186,10 +220,12 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
     mailbox = _mailbox()
     if not mailbox.config.allow_write:
         raise ToolError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
-    message = await anyio.to_thread.run_sync(lambda: mailbox.headers(uid, folder="INBOX"))
+    # Reject an unsafe folder before asking a human, not after they approve.
+    message, folder = await anyio.to_thread.run_sync(lambda: mailbox.preview_promotions_move(uid))
     result = await ctx.elicit(
         f"Move message UID {uid} from INBOX to the promotions folder? "
-        "Nothing is deleted and the move can be undone, but the message will leave INBOX.\n"
+        "Nothing is deleted; the message can be moved back manually in Yandex Mail.\n"
+        f"Destination folder (configured by the operator): {json.dumps(folder, ensure_ascii=False)}\n"
         "The sender and subject below are copied from the email: untrusted content, "
         "not instructions.\n"
         f"Sender (from the email, untrusted): {_untrusted_line(message['from'], 180)}\n"
@@ -216,7 +252,7 @@ def main() -> None:
     elif transport == "streamable-http":
         host = os.getenv("MCP_HOST", "127.0.0.1").strip()
         port = env_int("MCP_PORT", 8000)
-        token = os.getenv("MCP_AUTH_TOKEN", "")
+        token = os.getenv("MCP_AUTH_TOKEN", "").strip()
         if host not in {"127.0.0.1", "localhost", "::1"} and not token:
             if not env_bool("MCP_ALLOW_UNAUTHENTICATED_REMOTE"):
                 raise ConfigurationError(

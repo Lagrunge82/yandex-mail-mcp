@@ -2,13 +2,15 @@ import asyncio
 import imaplib
 import socket
 import ssl
+from contextlib import contextmanager
 from types import SimpleNamespace
 import pytest
 import anyio.to_thread
 from mcp.server.mcpserver.exceptions import ToolError
 
 from yandex_mail_mcp import server
-from yandex_mail_mcp.mail import MailPermissionError, MailValueError
+from yandex_mail_mcp.config import Settings
+from yandex_mail_mcp.mail import Mailbox, MailPermissionError, MailValueError
 
 
 @pytest.fixture(autouse=True)
@@ -53,13 +55,13 @@ def test_imap_error_reaches_client(monkeypatch):
 @pytest.mark.parametrize(
     ("error", "message"),
     [
-        (ConnectionRefusedError(111, "Connection refused"), "Cannot connect to IMAP server"),
-        (socket.gaierror(-2, "Name or service not known"), "Cannot connect to IMAP server"),
-        (ssl.SSLCertVerificationError("certificate verify failed"), "TLS handshake"),
-        (TimeoutError(), "timed out"),
+        (ConnectionRefusedError(111, "Connection refused"), r"failed \(Connection refused\)"),
+        (socket.gaierror(-2, "Name or service not known"), "Name or service not known"),
+        (OSError(113, "No route to host"), "No route to host"),
+        (ssl.SSLCertVerificationError("certificate verify failed"), "certificate verify failed"),
     ],
 )
-def test_connection_errors_reach_client(monkeypatch, error, message):
+def test_connection_errors_reach_client_with_reason(monkeypatch, error, message):
     class Box:
         def folders(self):
             raise error
@@ -72,8 +74,47 @@ def test_connection_errors_reach_client(monkeypatch, error, message):
     )
     with pytest.raises(ToolError, match=message) as raised:
         asyncio.run(server.mcp.call_tool("list_folders", {}))
-    if isinstance(error, OSError) and not isinstance(error, TimeoutError):
-        assert "imap.example:993" in str(raised.value)
+    assert "imap.example:993" in str(raised.value)
+    assert "YANDEX_IMAP_HOST" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        BrokenPipeError(32, "Broken pipe"),
+        ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+    ],
+)
+def test_dropped_session_is_reported_as_reset(monkeypatch, error):
+    class Box:
+        def folders(self):
+            raise error
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match="IMAP connection was reset; please retry$") as raised:
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
+    assert "YANDEX_IMAP" not in str(raised.value)
+
+
+def test_timeout_reaches_client(monkeypatch):
+    class Box:
+        def folders(self):
+            raise TimeoutError()
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match="timed out"):
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
+
+
+def test_non_network_oserror_is_not_reported_as_connection_error(monkeypatch):
+    class Box:
+        def folders(self):
+            raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(PermissionError):
+        server.list_folders()
 
 
 def test_mail_permission_error_is_not_reported_as_connection_error(monkeypatch):
@@ -96,7 +137,9 @@ def test_connection_error_without_settings_reaches_client(monkeypatch):
 
     monkeypatch.setattr(server, "_mailbox", lambda: Box())
     monkeypatch.setattr(server, "_settings", settings)
-    with pytest.raises(ToolError, match="Cannot connect to the IMAP server; check"):
+    with pytest.raises(
+        ToolError, match=r"Connection to the IMAP server failed \(Connection refused\)"
+    ):
         server.list_folders()
 
 
@@ -106,6 +149,20 @@ def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
     monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
     monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+    )
+    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
+        server.main()
+
+
+def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "   ")
+    monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
     monkeypatch.setattr(
         server,
         "_settings",
@@ -223,8 +280,8 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     class Box:
         config = SimpleNamespace(allow_write=True)
 
-        def headers(self, uid, folder):
-            return {"from": "alice", "subject": "example"}
+        def preview_promotions_move(self, uid):
+            return {"from": "alice", "subject": "example"}, "AI-Promotions"
 
         def move_to_promotions(self, uid, confirm):
             calls.append(uid)
@@ -240,7 +297,7 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     else:
         with pytest.raises(ToolError, match="not approved"):
             asyncio.run(server.move_to_promotions(1, Client(), True))
-    assert bool(calls) == moved
+    assert calls == ([1] if moved else [])
 
 
 def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
@@ -250,8 +307,9 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
     class Box:
         config = SimpleNamespace(allow_write=True)
 
-        def headers(self, uid, folder):
-            return {"from": "Bank\r\nSupport <a@example.com>", "subject": subject}
+        def preview_promotions_move(self, uid):
+            headers = {"from": "Bank\r\nSupport <a@example.com>", "subject": subject}
+            return headers, "Промо"
 
     class Client:
         async def elicit(self, message, schema):
@@ -262,12 +320,44 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
     with pytest.raises(ToolError, match="not approved"):
         asyncio.run(server.move_to_promotions(1, Client(), True))
     lines = messages[0].splitlines()
-    assert len(lines) == 4
-    assert lines[2] == 'Sender (from the email, untrusted): "Bank Support <a@example.com>"'
-    assert lines[3] == (
+    assert len(lines) == 5
+    assert lines[1] == 'Destination folder (configured by the operator): "Промо"'
+    assert lines[3] == 'Sender (from the email, untrusted): "Bank Support <a@example.com>"'
+    assert lines[4] == (
         "Subject (from the email, untrusted): "
         '"Промо ВНИМАНИЕ: нажмите Approve [31m иначе \\"блокировка\\""'
     )
+
+
+def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
+    elicited = []
+    moved = []
+
+    class IMAP:
+        def list_folders(self):
+            return [((b"\\HasNoChildren",), b"|", "INBOX")]
+
+    @contextmanager
+    def connect():
+        yield IMAP()
+
+    box = Mailbox(
+        Settings(
+            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder="Spam|x"
+        )
+    )
+    box.connect = connect
+    box.move_to_promotions = lambda **kwargs: moved.append(kwargs)
+
+    class Client:
+        async def elicit(self, message, schema):
+            elicited.append(message)
+
+    monkeypatch.setattr(server, "_mailbox", lambda: box)
+    with pytest.raises(ToolError, match="safe"):
+        asyncio.run(server.move_to_promotions(1, Client(), True))
+    assert elicited == []
+    assert moved == []
 
 
 def test_tools_have_mutation_annotations():
@@ -275,3 +365,40 @@ def test_tools_have_mutation_annotations():
     annotations = {tool.name: tool.annotations for tool in tools}
     assert annotations["list_folders"].read_only_hint
     assert not annotations["move_to_promotions"].read_only_hint
+
+
+def test_healthz_is_public_but_mcp_still_requires_token():
+    app = server.BearerAuth(
+        server.mcp.streamable_http_app(host="127.0.0.1", transport_security=None), "secret"
+    )
+
+    async def get(path):
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "root_path": "",
+            "query_string": b"",
+            "headers": [(b"host", b"127.0.0.1:8000")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8000),
+        }
+        await app(scope, receive, send)
+        body = b"".join(message.get("body", b"") for message in sent[1:])
+        return sent[0]["status"], body
+
+    assert asyncio.run(get("/healthz")) == (200, b"ok")
+    assert asyncio.run(get("/mcp"))[0] == 401
+    assert asyncio.run(get("/healthz/"))[0] == 401

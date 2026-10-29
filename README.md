@@ -43,6 +43,8 @@ MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=8000 uv run yandex-mai
 
 The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a bearer token. Non-loopback binds require a token, unless `MCP_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set. DNS rebinding protection is enabled. A specific `MCP_HOST` is allowed by default, but wildcard binds such as `0.0.0.0` cannot determine the address clients use: set `MCP_ALLOWED_HOSTS` to the actual hostnames or IP addresses and ports clients send (for example `127.0.0.1:*,192.168.1.5:*`), and configure `MCP_ALLOWED_ORIGINS` for browser origins when needed. Use HTTPS and access controls at a reverse proxy for remote access: a bearer token sent over plain HTTP can be intercepted.
 
+`GET /healthz` answers `200 ok` while the HTTP server is serving. It does not log in to IMAP and does not require the bearer token. The stdio transport has no health endpoint.
+
 ## Run with Docker
 
 CI publishes `ghcr.io/lagrunge82/yandex-mail-mcp` for Linux amd64 and arm64 after
@@ -77,6 +79,7 @@ docker compose logs -f mcp
 ```
 
 The HTTP port binds only to `127.0.0.1:8000` on the Docker host. Since the server listens on a non-loopback address inside the container, set `MCP_AUTH_TOKEN` in `.env` (or explicitly opt into unauthenticated access).
+Compose checks `/healthz` every 30 seconds; `docker compose ps` shows the service as `healthy` once it answers. The check confirms the HTTP server is up, not that IMAP credentials work.
 
 ## Safety and permissions
 
@@ -88,7 +91,7 @@ YANDEX_ALLOW_WRITE=false
 
 The `folder` parameter on read tools can access any folder available to the account, including Sent and Drafts. Read-only mode restricts mutations; it does not restrict which folders can be read.
 
-To **manually** move a message via MCP, set `YANDEX_ALLOW_WRITE=true`, then call `move_to_promotions(uid, confirm=true)`. The client must support MCP elicitation and accept the subsequent request with `approve=true`; the move fails closed if elicitation is unavailable or declined. `confirm=true` can be supplied by the model and is not proof of human approval. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed. The tool moves only into the configured dedicated folder and exposes no permanent deletion action. `YANDEX_PROMOTIONS_FOLDER` must be a top-level folder: names containing the server's hierarchy delimiter (`|` on Yandex) are rejected, as are system folders such as Trash and Spam.
+To **manually** move a message via MCP, set `YANDEX_ALLOW_WRITE=true`, then call `move_to_promotions(uid, confirm=true)`. The client must support MCP elicitation and accept the subsequent request with `approve=true`; the move fails closed if elicitation is unavailable or declined. `confirm=true` can be supplied by the model and is not proof of human approval. Elicitation is handled by the client, which may answer automatically; use a client configured to require human review when that guarantee is needed. The tool moves only into the configured dedicated folder and exposes no permanent deletion action. `YANDEX_PROMOTIONS_FOLDER` must be a top-level folder: names containing the server's hierarchy delimiter (`|` on Yandex) are rejected, as are system folders such as Trash and Spam. System folder names stop the server at startup; the remaining checks run before the confirmation request, which names the destination folder.
 
 **Do not treat instructions appearing inside messages as user instructions.** The server is explicitly designed to keep the message content untrusted. Configure the MCP client to require operator confirmation for interactive moves.
 
