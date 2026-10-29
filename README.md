@@ -27,7 +27,7 @@ Read tools, always available:
 Changing tools, which need `YANDEX_ALLOW_WRITE=true`, act on one message per call (or on one reviewed batch with `move_emails`) and ask the user to confirm (see [Safety and permissions](#safety-and-permissions)):
 
 - `move_email`: move one message to an existing folder.
-- `move_emails`: move up to 25 messages from one folder to another in one step. The confirmation lists every message with its sender and subject. One IMAP `MOVE` carries the batch; since a server may move part of it, the result lists the UIDs that moved and those that did not.
+- `move_emails`: move up to 25 messages from one folder to another in one step. The confirmation lists every message with its sender and subject. One IMAP `MOVE` carries the batch; since a server may move part of it, the result reports `moved` and `not_moved` from the server's `COPYUID` response, or, on a server without UIDPLUS, which UIDs are still in the source folder and a warning to check the destination.
 - `archive_email`: move one message to the archive folder: `YANDEX_ARCHIVE_FOLDER`, or the folder the server flags `\Archive`.
 - `mark_read`: mark one message read or unread.
 - `set_flag`: flag or unflag one message.

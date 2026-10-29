@@ -44,12 +44,17 @@ def header(subject, sender):
 class BatchIMAP:
     """A folder of distinct messages; records fetches, selections and moves."""
 
-    def __init__(self, copyuid=True, moves=None, refuse=False):
-        # copyuid: answer MOVE with a UIDPLUS COPYUID line; moves: UIDs the server
-        # actually moves (None: all); refuse: answer NO after moving those.
+    def __init__(self, copyuid=True, moves=None, refuse=False, vanish=()):
+        # Mirrors imaplib: move() returns the (absent) untagged FETCH data, and the
+        # COPYUID response code of the tagged OK or NO lands in untagged_responses.
+        # copyuid: the server has UIDPLUS; moves: UIDs it actually moves (None: all);
+        # refuse: answer NO after moving those; vanish: UIDs another client removes
+        # while the MOVE runs.
         self.copyuid = copyuid
         self.moves = moves
         self.refuse = refuse
+        self.vanish = set(vanish)
+        self._imap = SimpleNamespace(untagged_responses={})
         self.inbox = {
             3: header("Run failed: CI (0bac95a)", "Lagrunge <notifications@github.com>"),
             4: header("Run failed: Build image", "Lagrunge <notifications@github.com>"),
@@ -85,16 +90,22 @@ class BatchIMAP:
         return [uid for uid in self.inbox if uid in wanted]
 
     def move(self, uids, folder):
-        moved = [uid for uid in uids if self.moves is None or uid in self.moves]
+        for uid in self.vanish:
+            self.inbox.pop(uid, None)
+        moved = [
+            uid for uid in uids if uid in self.inbox and (self.moves is None or uid in self.moves)
+        ]
         self.changes.append(("move", list(uids), folder))
         for uid in moved:
             del self.inbox[uid]
+        if self.copyuid and moved:
+            sources = ",".join(str(uid) for uid in moved)
+            self._imap.untagged_responses["COPYUID"] = [
+                f"1587 {sources} 100:{99 + len(moved)}".encode()
+            ]
         if self.refuse:
             raise imaplib.IMAP4.error("MOVE failed: [SERVERBUG] Partial move")
-        if not self.copyuid:
-            return [b"Move completed."]
-        sources = ",".join(str(uid) for uid in moved)
-        return [f"[COPYUID 1587 {sources} 100:{99 + len(moved)}] Move completed.".encode()]
+        return [None]
 
 
 def box_with(imap, **settings):
@@ -148,11 +159,15 @@ def test_batch_validation_stops_at_the_first_excess_uid():
 
 
 def test_copyuid_sources_are_parsed_or_absent():
-    assert copyuid_sources([b"[COPYUID 1587 3,5:7 100:103] Done"]) == {3, 5, 6, 7}
-    assert copyuid_sources(b"[COPYUID 2 4 9] ok") == {4}
+    # As imaplib stores the response code: the data after the code name.
+    assert copyuid_sources([b"1587 3,5:7 100:103"]) == {3, 5, 6, 7}
+    assert copyuid_sources(b"2 4 9") == {4}
+    assert copyuid_sources(b"COPYUID 2 4 9") == {4}
+    # RFC 4315: a range may name its high end first.
+    assert copyuid_sources(b"1 5:3 10:12") == {3, 4, 5}
     assert copyuid_sources([b"Move completed."]) is None
     assert copyuid_sources(None) is None
-    assert copyuid_sources([b"[COPYUID 1 1:99999999 1:99999999] ok"]) is None
+    assert copyuid_sources([b"1 1:99999999 1:99999999"]) is None
 
 
 def test_preview_reads_every_header_at_once_and_names_missing_messages():
@@ -189,8 +204,17 @@ def test_move_many_issues_one_move_for_the_whole_batch():
     assert imap.selected[-1] == ("INBOX", False)
 
 
+def test_copyuid_is_read_from_imaplibs_response_codes_and_cleared_first():
+    imap = BatchIMAP()
+    imap._imap.untagged_responses["COPYUID"] = [b"1 999 1"]  # left by an earlier command
+    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
+    assert (result["moved"], result["not_moved"]) == ([3, 4], [])
+    assert "warning" not in result
+    assert "COPYUID" not in imap._imap.untagged_responses
+
+
 def test_partial_move_is_reported_from_copyuid_even_when_the_server_says_no():
-    imap = BatchIMAP(moves=[3], refuse=False)
+    imap = BatchIMAP(moves=[3])
     result = box_with(imap, allow_write=True).move_many([3, 4, 5], "github|ci/cd")
     assert (result["moved"], result["not_moved"]) == ([3], [4, 5])
     assert "moved only part of the batch; 2 messages are still in INBOX" in result["warning"]
@@ -203,11 +227,25 @@ def test_partial_move_is_reported_from_copyuid_even_when_the_server_says_no():
         box_with(BatchIMAP(moves=[], refuse=True), allow_write=True).move_many([3], "github")
 
 
-def test_without_copyuid_the_source_folder_is_read_again():
-    imap = BatchIMAP(copyuid=False, moves=[4])
+def test_message_removed_by_another_client_is_not_counted_as_moved():
+    imap = BatchIMAP(vanish=[4])
     result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
-    assert (result["moved"], result["not_moved"]) == ([4], [3])
-    assert imap.selected[-1] == ("INBOX", False)
+    assert (result["moved"], result["not_moved"]) == ([3], [4])
+    assert "1 messages are still in INBOX" in result["warning"]
+
+
+def test_without_copyuid_the_outcome_is_undetermined_but_the_source_is_reported():
+    imap = BatchIMAP(copyuid=False, moves=[3], vanish=[4])
+    result = box_with(imap, allow_write=True).move_many([3, 4, 5], "github|ci/cd")
+    assert result["moved"] is None
+    assert result["left_source"] == [3, 4]  # moved, or removed by another client
+    assert result["not_moved"] == [5]
+    assert "no COPYUID" in result["warning"] and "check the destination" in result["warning"]
+    # A NO without COPYUID and nothing gone from the source is a plain error.
+    with pytest.raises(imaplib.IMAP4.error):
+        box_with(BatchIMAP(copyuid=False, moves=[], refuse=True), allow_write=True).move_many(
+            [3], "github"
+        )
 
     class Unreadable(BatchIMAP):
         def search(self, criteria):
@@ -217,7 +255,7 @@ def test_without_copyuid_the_source_folder_is_read_again():
 
     imap = Unreadable(copyuid=False)
     result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
-    assert result["moved"] is None and result["not_moved"] is None
+    assert (result["moved"], result["not_moved"], result["left_source"]) == (None, None, None)
     assert "check both folders" in result["warning"]
 
 
