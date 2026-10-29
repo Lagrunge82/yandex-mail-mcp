@@ -11,7 +11,7 @@ MCP tools:
 - `list_recent_emails`: inspect recent messages (optionally unread only), newest first.
 - `search_emails`: search a folder by any combination of `query` (IMAP `SEARCH TEXT`, which matches headers and body as the server indexes them), `sender`, `to`, `subject`, `since` and `before` (`YYYY-MM-DD`; IMAP compares dates without time, in the server's time zone), `unread`, `flagged` and `has_attachments`. The server evaluates every criterion except `has_attachments`, which is checked against the MIME structure of at most the 500 newest messages matching the rest. If the server rejects a search by `query` alone, it falls back to the 300 newest messages and matches only the sender, subject and the first 2000 characters of the text preview, so results can differ from a server search; searches with other criteria report the server error instead.
 - `get_email`: inspect one message by IMAP UID.
-- `get_thread`: collect the conversation a message belongs to, oldest first, by following `Message-ID`, `In-Reply-To` and `References` through the message's folder, INBOX and the folder flagged `\Sent`. Each result names its folder, since UIDs are unique only within a folder.
+- `get_thread`: collect the conversation a message belongs to, oldest first, by following `Message-ID`, `In-Reply-To` and `References` through the message's folder, INBOX and the folder flagged `\Sent`. Each result names its folder, since UIDs are unique only within a folder. Yandex can fail a search by `Message-ID` with `[UNAVAILABLE] UID SEARCH Backend error`; the earlier messages of the thread are then found by subject among at most 200 messages per folder, and compared by `Message-ID`.
 - `move_email`: move one message to an existing folder.
 - `archive_email`: move one message to the archive folder: `YANDEX_ARCHIVE_FOLDER`, or the folder the server flags `\Archive`.
 - `mark_read`: mark one message read or unread.
@@ -30,7 +30,7 @@ Read operations use IMAP `BODY.PEEK` and should **not mark messages as read**. L
 The server signs in to IMAP with a Yandex OAuth token (`AUTHENTICATE XOAUTH2`); no password is needed. Requires Python 3.11 or newer and [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 1. In Yandex Mail settings → **Email clients**, enable IMAP access and **App passwords and OAuth tokens**. For a Yandex 360 account, the administrator must also allow OAuth access to mail.
-2. Register an application at [oauth.yandex.ru](https://oauth.yandex.ru/client/new) with the permissions **IMAP access to mail** in read-only (`mail:imap_ro`) and full (`mail:imap_full`) form, plus `login:info` and `login:email`, and the redirect URI `http://127.0.0.1:8765/callback`.
+2. Register an application at [oauth.yandex.ru](https://oauth.yandex.ru/) of the type **for user authorization** («Для авторизации пользователей»; [Yandex instructions](https://yandex.ru/dev/id/doc/ru/register-auth)). The type for API access or debugging cannot use a loopback redirect. Choose the **Web services** platform with the redirect URI `http://127.0.0.1:8765/callback`, and the permissions `login:email`, `login:info`, `mail:imap_ro` (reading mail) and `mail:imap_full` (shown by Yandex as reading and deleting mail; the server never deletes). Signing in works with PKCE alone, without the client secret; still set `YANDEX_OAUTH_CLIENT_SECRET`, since token refresh has only been checked with it.
 3. Install, configure and sign in:
 
    ```bash
