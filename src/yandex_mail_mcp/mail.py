@@ -10,9 +10,12 @@ import base64
 import binascii
 import imaplib
 import logging
+import queue
 import quopri
 import re
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from email import policy
 from email.message import MIMEPart
@@ -231,20 +234,134 @@ def _text_sections(structure: Any) -> tuple[list[tuple[str, str, str, str]], boo
     return sections, has_attachments
 
 
+def _close(imap: IMAPClient) -> None:
+    # The same cleanup as IMAPClient.__exit__: errors here mean the session is gone.
+    try:
+        imap.logout()
+    except Exception:
+        try:
+            imap.shutdown()
+        except Exception as exc:
+            LOG.info("Could not close the IMAP connection cleanly: %s", exc)
+
+
+def _selected(imap: IMAPClient) -> bool:
+    # IMAPClient keeps no public record of the selected folder; imaplib's state does.
+    return getattr(getattr(imap, "_imap", None), "state", None) == "SELECTED"
+
+
+class ConnectionPool:
+    """Reuse logged-in IMAP connections across tool calls.
+
+    At most ``size`` connections are open at once, since Yandex limits concurrent
+    IMAP sessions per account. A connection that has been idle longer than
+    ``idle_timeout`` seconds or fails NOOP is replaced. A connection is returned
+    with no folder selected, and is closed instead if the caller raised.
+    """
+
+    def __init__(
+        self,
+        factory: Callable[[], IMAPClient],
+        size: int = 2,
+        idle_timeout: float = 300,
+        *,
+        wait_timeout: float = 60,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._factory = factory
+        self._idle: queue.LifoQueue[tuple[IMAPClient, float]] = queue.LifoQueue()
+        self._slots = threading.BoundedSemaphore(size)
+        self._idle_timeout = idle_timeout
+        self._wait_timeout = wait_timeout
+        self._clock = clock
+        self._closed = False
+
+    @contextmanager
+    def connection(self) -> Iterator[IMAPClient]:
+        if not self._slots.acquire(timeout=self._wait_timeout):
+            raise MailError("All IMAP connections are busy; please retry")
+        try:
+            imap = self._checkout()
+            try:
+                yield imap
+            except BaseException:
+                _close(imap)
+                raise
+            self._checkin(imap)
+        finally:
+            self._slots.release()
+
+    def _checkout(self) -> IMAPClient:
+        while True:
+            try:
+                imap, last_used = self._idle.get_nowait()
+            except queue.Empty:
+                return self._factory()
+            if self._clock() - last_used > self._idle_timeout:
+                _close(imap)
+                continue
+            try:
+                imap.noop()
+            except (imaplib.IMAP4.error, OSError):
+                # IMAP4.abort is an IMAP4.error.
+                _close(imap)
+                continue
+            return imap
+
+    def _checkin(self, imap: IMAPClient) -> None:
+        if self._closed:
+            _close(imap)
+            return
+        if _selected(imap):
+            # CLOSE would expunge messages marked deleted, so only UNSELECT is safe.
+            if not imap.has_capability("UNSELECT"):
+                _close(imap)
+                return
+            try:
+                imap.unselect_folder()
+            except (imaplib.IMAP4.error, OSError):
+                _close(imap)
+                return
+        self._idle.put((imap, self._clock()))
+
+    def close(self) -> None:
+        self._closed = True
+        while True:
+            try:
+                imap, _ = self._idle.get_nowait()
+            except queue.Empty:
+                return
+            _close(imap)
+
+
 class Mailbox:
     def __init__(self, config: Settings):
         self.config = config
+        self.pool = ConnectionPool(
+            self._open, size=config.imap_pool_size, idle_timeout=config.imap_idle_timeout
+        )
 
-    @contextmanager
-    def connect(self) -> Iterator[IMAPClient]:
-        with IMAPClient(
+    def _open(self) -> IMAPClient:
+        imap = IMAPClient(
             self.config.imap_host,
             port=self.config.imap_port,
             ssl=True,
             timeout=30,
-        ) as imap:
+        )
+        try:
             imap.login(self.config.email, self.config.app_password.get_secret_value())
+        except BaseException:
+            _close(imap)
+            raise
+        return imap
+
+    @contextmanager
+    def connect(self) -> Iterator[IMAPClient]:
+        with self.pool.connection() as imap:
             yield imap
+
+    def close(self) -> None:
+        self.pool.close()
 
     @staticmethod
     def _fetch(imap: IMAPClient, uids: list[int], max_body_chars: int = 4000) -> list[MailSummary]:

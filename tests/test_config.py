@@ -71,3 +71,27 @@ def test_system_promotions_folder_is_rejected_at_startup(monkeypatch, value):
     monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", value)
     with pytest.raises(ConfigurationError, match="YANDEX_PROMOTIONS_FOLDER"):
         Settings.from_env()
+
+
+def test_pool_settings_from_env(monkeypatch):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.delenv("YANDEX_IMAP_POOL_SIZE", raising=False)
+    monkeypatch.delenv("YANDEX_IMAP_IDLE_TIMEOUT", raising=False)
+    settings = Settings.from_env()
+    assert (settings.imap_pool_size, settings.imap_idle_timeout) == (2, 300)
+    monkeypatch.setenv("YANDEX_IMAP_POOL_SIZE", "4")
+    monkeypatch.setenv("YANDEX_IMAP_IDLE_TIMEOUT", "60")
+    settings = Settings.from_env()
+    assert (settings.imap_pool_size, settings.imap_idle_timeout) == (4, 60)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"), [("YANDEX_IMAP_POOL_SIZE", "0"), ("YANDEX_IMAP_IDLE_TIMEOUT", "-1")]
+)
+def test_invalid_pool_settings_are_rejected(monkeypatch, name, value):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "SUPERSECRET")
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigurationError, match=name):
+        Settings.from_env()
