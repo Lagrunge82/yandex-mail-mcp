@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Write access on the shared HTTP server. The protected-resource metadata advertised only `mail.read`, so every client asked for read access, and a client registered while `YANDEX_ALLOW_WRITE` was off kept a read-only registration for good; the server then asked Yandex for `mail:imap_ro` and issued read-only tokens, and reconnecting changed nothing. The metadata now lists `mail.write` when writes are enabled, and what a client may ask for follows the server's current configuration.
+
+### Added
+
+- A consent page before the Yandex sign-in: when the server allows writes and the client asks for them, the user chooses *read only* or *read and change mail*. Only the second choice requests full IMAP access from Yandex, and the issued token carries `mail.write` only after that choice and Yandex's grant. Refreshing a token never widens it.
+- Browser confirmation for clients without elicitation on the shared HTTP server: a changing tool returns a single-use `confirm_url` where the signed-in owner approves or rejects the change within 10 minutes. The page requires the browser session that completed the Yandex sign-in, or a fresh Yandex sign-in for identity only.
+- `get_connection_capabilities`: a read-only tool that reports whether writes are enabled, the connection's MCP scopes, whether the Yandex authorization has full IMAP access, how changes are confirmed, and what to do when they are unavailable, without revealing secrets.
+- A hint when a nested folder is written with `/`: Yandex separates levels with `|`, and the error names the folder that matches.
+
 ## 0.5.1
 
 ### Fixed

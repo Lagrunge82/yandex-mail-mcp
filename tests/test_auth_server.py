@@ -133,6 +133,7 @@ class Flow:
     def __init__(self, client, provider=None):
         self.client = client
         self.provider = provider
+        self.consent_shown = False
 
     async def register(self):
         response = await self.client.post(
@@ -141,27 +142,39 @@ class Flow:
         assert response.status_code == 201, response.text
         return response.json()["client_id"]
 
-    async def to_callback(self, client_id, code="yc"):
-        response = await self.client.get(
-            "/authorize",
-            params={
-                "response_type": "code",
-                "client_id": client_id,
-                "redirect_uri": REDIRECT,
-                "code_challenge": CHALLENGE,
-                "code_challenge_method": "S256",
-                "state": "client-state",
-                "resource": f"{PUBLIC}/mcp",
-            },
-        )
+    async def to_callback(self, client_id, code="yc", *, access="write", scope=None):
+        """Walk from /authorize to the Yandex redirect; return the sealed state and callback params.
+
+        access is what the user picks on the consent page when writes are offered;
+        scope is the client's own scope request, None for no scope parameter.
+        """
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": REDIRECT,
+            "code_challenge": CHALLENGE,
+            "code_challenge_method": "S256",
+            "state": "client-state",
+            "resource": f"{PUBLIC}/mcp",
+        }
+        if scope is not None:
+            params["scope"] = scope
+        response = await self.client.get("/authorize", params=params)
         assert response.status_code == 302, response.text
         start = await self.client.get(response.headers["location"])
-        assert start.status_code == 302
+        self.consent_shown = start.status_code == 200
+        if self.consent_shown:
+            assert "Read and change mail" in start.text
+            sealed = query_of(response.headers["location"])["state"]
+            start = await self.client.post(
+                "/oauth/yandex/start", data={"state": sealed, "access": access}
+            )
+        assert start.status_code == 302, start.text
         state = query_of(start.headers["location"])["state"]
         return state, {"state": state, "code": code}
 
-    async def authorize(self, client_id, code="yc"):
-        _, params = await self.to_callback(client_id, code)
+    async def authorize(self, client_id, code="yc", *, access="write", scope=None):
+        _, params = await self.to_callback(client_id, code, access=access, scope=scope)
         callback = await self.client.get("/oauth/yandex/callback", params=params)
         assert callback.status_code == 302, callback.text
         assert callback.headers["location"].startswith(REDIRECT)
@@ -181,9 +194,10 @@ class Flow:
             },
         )
 
-    async def sign_in(self, code="yc"):
+    async def sign_in(self, code="yc", *, access="write", scope=None):
         client_id = await self.register()
-        response = await self.token(client_id, await self.authorize(client_id, code))
+        code = await self.authorize(client_id, code, access=access, scope=scope)
+        response = await self.token(client_id, code)
         assert response.status_code == 200, response.text
         return client_id, response.json()
 

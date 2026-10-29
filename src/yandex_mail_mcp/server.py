@@ -29,6 +29,7 @@ from imapclient.exceptions import LoginError
 from mcp.server import MCPServer
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.routes import create_protected_resource_routes
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
@@ -43,6 +44,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import login
 from .auth_server import (
     CALLBACK_PATH,
+    CONFIRM_PATH,
     SCOPE_READ,
     SCOPE_WRITE,
     START_PATH,
@@ -51,6 +53,7 @@ from .auth_server import (
     YandexAuthProvider,
 )
 from .config import ConfigurationError, Settings, env_int, env_port
+from .confirmations import ConfirmationFailed, PendingActions
 from .credentials import OAuthCredentials, ReauthenticationRequired, StaticTokenSource
 from .crypto import TokenCipher
 from .mail import Draft, Mailbox, MailError, MailSummary, ThreadMessage
@@ -62,6 +65,10 @@ _mailboxes: dict[object, Mailbox] = {}
 _mailboxes_lock = threading.Lock()
 # The Yandex OAuth client of the HTTP authorization server, for the logout tool.
 _yandex_oauth: YandexOAuth | None = None
+# The HTTP authorization server and the changes waiting for approval in the browser,
+# for MCP clients that cannot ask the user through elicitation.
+_auth_provider: YandexAuthProvider | None = None
+_confirmations: PendingActions | None = None
 
 
 @asynccontextmanager
@@ -113,8 +120,9 @@ def _new_server(
     # would make the handler untyped under mypy --strict.
     server.custom_route("/healthz", methods=["GET"])(healthz)
     if provider is not None:
-        server.custom_route(START_PATH, methods=["GET"])(provider.start)
+        server.custom_route(START_PATH, methods=["GET", "POST"])(provider.start)
         server.custom_route(CALLBACK_PATH, methods=["GET"])(provider.callback)
+        server.custom_route(CONFIRM_PATH, methods=["GET", "POST"])(provider.confirm)
     return server
 
 
@@ -189,6 +197,41 @@ def _audit(tool: str, arguments: dict[str, Any], started: float, result: str) ->
     AUDIT.info(json.dumps(record, ensure_ascii=False))
 
 
+def _translate(exc: Exception) -> ToolError | None:
+    if isinstance(exc, ReauthenticationRequired):
+        # Written for the user: the reason and how to sign in again.
+        return ToolError(str(exc))
+    if isinstance(exc, LoginError):
+        return ToolError(
+            "IMAP authentication failed; check your credentials and whether IMAP is enabled"
+        )
+    if isinstance(exc, imaplib.IMAP4.abort):
+        return ToolError("IMAP connection was interrupted; please retry")
+    if isinstance(exc, imaplib.IMAP4.error):
+        return ToolError(f"IMAP request failed: {exc}")
+    # MailPermissionError is an OSError; keep its own message.
+    if isinstance(exc, (MailError, ConfigurationError)):
+        return ToolError(str(exc))
+    if isinstance(exc, TimeoutError):
+        return ToolError("IMAP connection timed out; please retry")
+    # imaplib does not wrap read errors, so a dropped session surfaces here.
+    if isinstance(exc, RESET_ERRORS):
+        return ToolError("IMAP connection was reset; please retry")
+    if isinstance(exc, ssl.SSLError):
+        return ToolError(
+            f"TLS error with {_imap_address()} ({_os_reason(exc)}); "
+            "check YANDEX_IMAP_HOST and the certificate chain"
+        )
+    if isinstance(exc, (ConnectionError, socket.gaierror, socket.herror)) or (
+        isinstance(exc, OSError) and exc.errno in NETWORK_ERRNOS
+    ):
+        return ToolError(
+            f"Connection to {_imap_address()} failed ({_os_reason(exc)}); "
+            "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access, then retry"
+        )
+    return None
+
+
 def tool_errors(fn: F) -> F:
     """Report expected errors to the caller as ToolError, and write the audit log."""
     signature = inspect.signature(fn)
@@ -199,50 +242,19 @@ def tool_errors(fn: F) -> F:
         except TypeError:
             return {}
 
-    def translate(exc: Exception) -> ToolError | None:
-        if isinstance(exc, ReauthenticationRequired):
-            # Written for the user: the reason and how to sign in again.
-            return ToolError(str(exc))
-        if isinstance(exc, LoginError):
-            return ToolError(
-                "IMAP authentication failed; check your credentials and whether IMAP is enabled"
-            )
-        if isinstance(exc, imaplib.IMAP4.abort):
-            return ToolError("IMAP connection was interrupted; please retry")
-        if isinstance(exc, imaplib.IMAP4.error):
-            return ToolError(f"IMAP request failed: {exc}")
-        # MailPermissionError is an OSError; keep its own message.
-        if isinstance(exc, (MailError, ConfigurationError)):
-            return ToolError(str(exc))
-        if isinstance(exc, TimeoutError):
-            return ToolError("IMAP connection timed out; please retry")
-        # imaplib does not wrap read errors, so a dropped session surfaces here.
-        if isinstance(exc, RESET_ERRORS):
-            return ToolError("IMAP connection was reset; please retry")
-        if isinstance(exc, ssl.SSLError):
-            return ToolError(
-                f"TLS error with {_imap_address()} ({_os_reason(exc)}); "
-                "check YANDEX_IMAP_HOST and the certificate chain"
-            )
-        if isinstance(exc, (ConnectionError, socket.gaierror, socket.herror)) or (
-            isinstance(exc, OSError) and exc.errno in NETWORK_ERRNOS
-        ):
-            return ToolError(
-                f"Connection to {_imap_address()} failed ({_os_reason(exc)}); "
-                "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access, then retry"
-            )
-        return None
-
     if inspect.iscoroutinefunction(fn):
 
         @wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
             started, result = time.monotonic(), "ok"
             try:
-                return await fn(*args, **kwargs)
+                value = await fn(*args, **kwargs)
+                if isinstance(value, dict) and value.get("status") == "confirmation_required":
+                    result = "confirmation_required"
+                return value
             except Exception as exc:
                 result = type(exc).__name__
-                error = translate(exc)
+                error = _translate(exc)
                 if error is None:
                     raise
                 raise error from exc
@@ -258,7 +270,7 @@ def tool_errors(fn: F) -> F:
             return fn(*args, **kwargs)
         except Exception as exc:
             result = type(exc).__name__
-            error = translate(exc)
+            error = _translate(exc)
             if error is None:
                 raise
             raise error from exc
@@ -306,15 +318,18 @@ def build_oauth_app(
     )
     if not allowed:
         logging.warning("MCP_ALLOWED_USERS is empty: every sign-in will be refused")
-    provider = YandexAuthProvider(
+    global _auth_provider, _confirmations
+    _confirmations = PendingActions()
+    provider = _auth_provider = YandexAuthProvider(
         cipher=cipher,
         clients=ClientStore(db_path, cipher),
         oauth=_yandex_oauth,
         public_url=public_url,
         allow_write=settings.allow_write,
         allowed_users=allowed,
+        pending=_confirmations,
     )
-    scopes = [SCOPE_READ, SCOPE_WRITE] if settings.allow_write else [SCOPE_READ]
+    scopes = provider.offered_scopes
     # Validated from strings, which keeps a path-less issuer without a trailing slash.
     auth = AuthSettings.model_validate(
         {
@@ -329,6 +344,18 @@ def build_oauth_app(
         }
     )
     app = create_server(auth, provider).streamable_http_app(host=host, transport_security=security)
+    # The SDK publishes required_scopes as the resource's scopes_supported, and clients
+    # request exactly that list: every connection would ask for mail.read only. Publish
+    # what the server offers, so a client asks for writes and the user gets to decide.
+    (resource_metadata,) = create_protected_resource_routes(
+        resource_url=auth.resource_server_url or auth.issuer_url,
+        authorization_servers=[auth.issuer_url],
+        scopes_supported=scopes,
+    )
+    app.router.routes[:] = [
+        resource_metadata if getattr(route, "path", None) == resource_metadata.path else route
+        for route in app.router.routes
+    ]
     app.add_middleware(
         RateLimit,
         paths=frozenset(
@@ -507,6 +534,65 @@ def get_thread(uid: int, folder: str = "INBOX", limit: int = 50) -> list[ThreadM
 
 
 @_tool(
+    annotations=ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False),
+    structured_output=False,
+)
+@tool_errors
+async def get_connection_capabilities(ctx: Context) -> dict[str, Any]:
+    """Explain what this connection may do with the mailbox, without touching it.
+
+    Reports whether the server allows changes, which MCP scopes this connection holds,
+    whether the Yandex authorization behind it includes full IMAP access, whether this
+    client can confirm changes itself (elicitation) or through a link, and what to do
+    when changes are unavailable. Reveals no tokens or secrets.
+    """
+    settings = _settings()
+    token, claims = _signed_in()
+    mailbox = _mailbox()
+    elicitation = _client_can_elicit(ctx)
+    info: dict[str, Any] = {"server_allows_write": settings.allow_write}
+    if token is not None and "yandex_access_token" in claims:
+        info["connection"] = "http_oauth"
+        info["yandex_login"] = claims["yandex_login"]
+        info["mcp_scopes"] = list(token.scopes)
+        info["yandex_full_mail_access"] = can_write(str(claims["yandex_scope"]))
+    else:
+        info["connection"] = "local"
+        info["mcp_scopes"] = None
+        credentials = await anyio.to_thread.run_sync(lambda: mailbox.credentials)
+        scope = credentials.source.scope() if isinstance(credentials, OAuthCredentials) else None
+        # None: unknown, as with an app password or a token whose scope was not reported.
+        info["yandex_full_mail_access"] = None if scope is None else can_write(scope)
+    write_error = await anyio.to_thread.run_sync(lambda: _write_error(mailbox))
+    info["write_available"] = write_error is None
+    info["client_supports_elicitation"] = elicitation
+    if elicitation:
+        confirmation = "elicitation"
+    elif _browser_confirmation_available():
+        confirmation = "browser_link"
+    else:
+        confirmation = "unavailable"
+    info["confirmation"] = confirmation
+    info["reversible_changes_skip_confirmation"] = not settings.confirm_reversible
+    if write_error is not None:
+        info["action_needed"] = write_error
+    elif confirmation == "unavailable":
+        info["action_needed"] = (
+            "Changes cannot be confirmed from this client: it has no elicitation, and only "
+            "users of the HTTP server with MCP_PUBLIC_URL can confirm in the browser. Use "
+            "a client with elicitation"
+            + (
+                "; MCP_CONFIRM_REVERSIBLE=false would skip confirmation for flags and drafts"
+                if settings.confirm_reversible
+                else ""
+            )
+        )
+    else:
+        info["action_needed"] = None
+    return info
+
+
+@_tool(
     annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True
     ),
@@ -578,9 +664,8 @@ async def _confirmed_mutation(
     """
     if (error := await anyio.to_thread.run_sync(lambda: _write_error(mailbox))) is not None:
         raise ToolError(error)
-    if confirm and not ctx.session.check_client_capability(
-        ClientCapabilities(elicitation=ElicitationCapability())
-    ):
+    elicitation = _client_can_elicit(ctx)
+    if confirm and not elicitation and not _browser_confirmation_available():
         # The SDK would send the request anyway and surface the client's generic
         # "method not found" error; say what is missing instead.
         raise ToolError(
@@ -603,10 +688,78 @@ async def _confirmed_mutation(
                 f"Sender (from the email, untrusted): {_untrusted_line(message['from'], 180)}\n"
                 f"Subject (from the email, untrusted): {_untrusted_line(message['subject'], 200)}"
             )
+        if not elicitation:
+            return _park_for_browser(name, text, lambda: action(target))
         result = await ctx.elicit(text, schema=MoveConfirmation)
         if result.action != "accept" or not result.data.approve:
             raise ToolError(f"{name} was not approved")
     return await anyio.to_thread.run_sync(lambda: action(target))
+
+
+def _client_can_elicit(ctx: Context) -> bool:
+    return bool(
+        ctx.session.check_client_capability(ClientCapabilities(elicitation=ElicitationCapability()))
+    )
+
+
+def _browser_confirmation_available() -> bool:
+    """Whether a change can be confirmed on this server's web page instead of in the client.
+
+    Only users of the HTTP authorization server have a browser identity the page can
+    check; the local server and the deprecated static token have none.
+    """
+    return (
+        _confirmations is not None
+        and _auth_provider is not None
+        and "yandex_access_token" in _signed_in()[1]
+    )
+
+
+def _park_for_browser(name: str, text: str, run: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Hand a change to the browser confirmation page and tell the model what to do."""
+    assert _confirmations is not None and _auth_provider is not None
+    _, claims = _signed_in()
+    login, email = str(claims["yandex_login"]), str(claims["yandex_email"])
+
+    def approved() -> dict[str, Any]:
+        started = time.monotonic()
+        record: dict[str, Any] = {
+            "time": datetime.now(UTC).isoformat(timespec="milliseconds"),
+            "yandex_login": login,
+            "tool": name.lower(),
+            "confirmation": "approved_in_browser",
+        }
+        try:
+            result = run()
+        except Exception as exc:
+            record |= {"result": type(exc).__name__, "duration_ms": _elapsed_ms(started)}
+            AUDIT.info(json.dumps(record, ensure_ascii=False))
+            error = _translate(exc)
+            if error is None:
+                raise
+            raise ConfirmationFailed(str(error)) from exc
+        record |= {"result": "ok", "duration_ms": _elapsed_ms(started)}
+        AUDIT.info(json.dumps(record, ensure_ascii=False))
+        return result
+
+    pending = _confirmations.create(
+        login=login, email=email, name=name, question=text, action=approved
+    )
+    return {
+        "status": "confirmation_required",
+        "confirm_url": _auth_provider.confirm_url(pending.id),
+        "expires_in_seconds": _confirmations.seconds_left(pending),
+        "message": (
+            f"{name} needs the user's approval, and this MCP client cannot ask for it. "
+            f"Show the user the link: it opens a page on this server where, signed in as "
+            f"{email}, they see the change and approve or reject it. Nothing changes until "
+            "they approve, and the link expires in 10 minutes."
+        ),
+    }
+
+
+def _elapsed_ms(started: float) -> int:
+    return round((time.monotonic() - started) * 1000)
 
 
 def _folder_line(label: str, folder: str) -> str:
@@ -620,8 +773,12 @@ async def move_email(
 ) -> dict[str, Any]:
     """Move one message to an existing folder, after the user confirms.
 
-    Requires YANDEX_ALLOW_WRITE=true and client elicitation. Never creates folders
-    and never moves into Trash, Spam, Drafts, Sent or folders inside them.
+    Give the folder exactly as list_folders shows it; nested folders use the server's
+    separator, "|" on Yandex (for example "github|ci/cd"). Requires
+    YANDEX_ALLOW_WRITE=true and write access for this connection. The user confirms
+    in the client, or, when the client cannot ask, through the returned confirm_url.
+    Never creates folders and never moves into Trash, Spam, Drafts, Sent or folders
+    inside them.
     """
     mailbox = _mailbox()
     return await _confirmed_mutation(

@@ -574,6 +574,20 @@ class Draft:
     message: EmailMessage
 
 
+def _delimiter_hint(folder: str, folders: dict[str, tuple[set[str], str | None]]) -> str:
+    """Explain a folder written with "/" when the server separates levels otherwise."""
+    delimiters = sorted({delimiter for _, delimiter in folders.values() if delimiter})
+    if "/" not in folder or not delimiters or "/" in delimiters:
+        return ""
+    delimiter = delimiters[0]
+    example = next(
+        (name for name in folders if name == folder.replace("/", delimiter, 1)),
+        None,
+    )
+    hint = f". Nested folders are written with {delimiter!r} between the levels, as list_folders shows them"
+    return hint + (f"; did you mean {example!r}?" if example else "")
+
+
 def _address(field: str, value: str) -> str:
     """Validate one address such as "Name <user@example.com>" and return it formatted."""
     if "\r" in value or "\n" in value:
@@ -1045,7 +1059,10 @@ class Mailbox:
         if not matching:
             matching = [name for name in folders if name.casefold() == folder.casefold()]
         if not matching:
-            raise MailLookupError(f"Folder {folder!r} not found; moves do not create folders")
+            raise MailLookupError(
+                f"Folder {folder!r} not found; moves do not create folders"
+                + _delimiter_hint(folder, folders)
+            )
         if len(matching) > 1:
             raise MailValueError(
                 f"Folder {folder!r} is ambiguous: several folders differ only by case. "
