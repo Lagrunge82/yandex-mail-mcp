@@ -16,3 +16,14 @@ services:
       MCP_ALLOW_UNAUTHENTICATED_REMOTE: "${MCP_ALLOW_UNAUTHENTICATED_REMOTE:-false}"
     ports:
       - "127.0.0.1:8000:8000"
+    # /healthz does not touch IMAP and needs no token; python:slim has no curl.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

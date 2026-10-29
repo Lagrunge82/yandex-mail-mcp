@@ -43,6 +43,8 @@ MCP_TRANSPORT=streamable-http MCP_HOST=127.0.0.1 MCP_PORT=8000 uv run yandex-mai
 
 The endpoint is `http://127.0.0.1:8000/mcp`. Set `MCP_AUTH_TOKEN` to require a bearer token. Non-loopback binds require a token, unless `MCP_ALLOW_UNAUTHENTICATED_REMOTE=true` is explicitly set. DNS rebinding protection is enabled. A specific `MCP_HOST` is allowed by default, but wildcard binds such as `0.0.0.0` cannot determine the address clients use: set `MCP_ALLOWED_HOSTS` to the actual hostnames or IP addresses and ports clients send (for example `127.0.0.1:*,192.168.1.5:*`), and configure `MCP_ALLOWED_ORIGINS` for browser origins when needed. Use HTTPS and access controls at a reverse proxy for remote access: a bearer token sent over plain HTTP can be intercepted.
 
+`GET /healthz` answers `200 ok` while the HTTP server is serving. It does not log in to IMAP and does not require the bearer token. The stdio transport has no health endpoint.
+
 ## Run with Docker
 
 CI publishes `ghcr.io/lagrunge82/yandex-mail-mcp` for Linux amd64 and arm64 after
@@ -77,6 +79,7 @@ docker compose logs -f mcp
 ```
 
 The HTTP port binds only to `127.0.0.1:8000` on the Docker host. Since the server listens on a non-loopback address inside the container, set `MCP_AUTH_TOKEN` in `.env` (or explicitly opt into unauthenticated access).
+Compose checks `/healthz` every 30 seconds; `docker compose ps` shows the service as `healthy` once it answers. The check confirms the HTTP server is up, not that IMAP credentials work.
 
 ## Safety and permissions
 

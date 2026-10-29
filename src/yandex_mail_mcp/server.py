@@ -21,7 +21,8 @@ from mcp.types import ToolAnnotations
 from mcp.server.mcpserver.exceptions import ToolError
 from imapclient.exceptions import LoginError
 from mcp.server.transport_security import TransportSecuritySettings
-from starlette.responses import PlainTextResponse
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
 import uvicorn
 import anyio.to_thread
 from pydantic import BaseModel
@@ -135,12 +136,15 @@ def _mailbox() -> Mailbox:
 
 
 class BearerAuth:
+    # The health check reveals nothing, so Compose can probe it without the token.
+    public_paths = frozenset({"/healthz"})
+
     def __init__(self, app, token):
         self.app = app
         self.token = token
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http":
+        if scope["type"] == "http" and scope.get("path") not in self.public_paths:
             headers = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
             scheme, _, credentials = headers[0].partition(b" ") if len(headers) == 1 else (b"",) * 3
             if scheme.lower() != b"bearer" or not hmac.compare_digest(
@@ -151,6 +155,12 @@ class BearerAuth:
                 )(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> Response:
+    """Report that the HTTP server is serving, without logging in to IMAP."""
+    return PlainTextResponse("ok")
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))

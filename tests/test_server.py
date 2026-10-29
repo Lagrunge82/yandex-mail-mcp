@@ -365,3 +365,40 @@ def test_tools_have_mutation_annotations():
     annotations = {tool.name: tool.annotations for tool in tools}
     assert annotations["list_folders"].read_only_hint
     assert not annotations["move_to_promotions"].read_only_hint
+
+
+def test_healthz_is_public_but_mcp_still_requires_token():
+    app = server.BearerAuth(
+        server.mcp.streamable_http_app(host="127.0.0.1", transport_security=None), "secret"
+    )
+
+    async def get(path):
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "root_path": "",
+            "query_string": b"",
+            "headers": [(b"host", b"127.0.0.1:8000")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8000),
+        }
+        await app(scope, receive, send)
+        body = b"".join(message.get("body", b"") for message in sent[1:])
+        return sent[0]["status"], body
+
+    assert asyncio.run(get("/healthz")) == (200, b"ok")
+    assert asyncio.run(get("/mcp"))[0] == 401
+    assert asyncio.run(get("/healthz/"))[0] == 401
