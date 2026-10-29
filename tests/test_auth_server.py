@@ -17,6 +17,14 @@ from yandex_mail_mcp.crypto import TokenCipher, generate_key
 from yandex_mail_mcp.yandex_oauth import YandexOAuth, YandexOAuthError, YandexTokens, YandexUser
 
 PUBLIC = "http://127.0.0.1:8000"
+
+
+@pytest.fixture(autouse=True)
+def allowed_users(monkeypatch):
+    monkeypatch.setenv("MCP_ALLOWED_USERS", "ivan")
+    monkeypatch.delenv("MCP_AUTH_RATE_LIMIT", raising=False)
+
+
 REDIRECT = "http://localhost:9999/cb"
 VERIFIER = "v" * 50
 CHALLENGE = (

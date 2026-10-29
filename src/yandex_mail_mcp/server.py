@@ -14,8 +14,10 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from functools import lru_cache, wraps
 from typing import Any, TypeVar, cast
 from urllib.parse import urlsplit
@@ -44,18 +46,21 @@ from .auth_server import (
     SCOPE_WRITE,
     START_PATH,
     ClientStore,
+    RateLimit,
     YandexAuthProvider,
 )
 from .config import ConfigurationError, Settings, env_bool, env_int
 from .credentials import OAuthCredentials, StaticTokenSource
 from .crypto import TokenCipher
 from .mail import Draft, Mailbox, MailError, MailSummary, ThreadMessage
-from .yandex_oauth import YandexOAuth
+from .yandex_oauth import YandexOAuth, YandexOAuthError
 
 # One Mailbox, and so one connection pool, per account: keyed by Settings, or by
 # ("user", login) for users signed in through the HTTP authorization server.
 _mailboxes: dict[object, Mailbox] = {}
 _mailboxes_lock = threading.Lock()
+# The Yandex OAuth client of the HTTP authorization server, for the logout tool.
+_yandex_oauth: YandexOAuth | None = None
 
 
 @asynccontextmanager
@@ -159,7 +164,41 @@ def _os_reason(exc: OSError) -> str:
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+AUDIT = logging.getLogger("yandex_mail_mcp.audit")
+# Arguments worth recording: where a tool acted, never what a message says.
+AUDITED = {"folder": ("folder", "source_folder", "reply_folder"), "uid": ("uid", "in_reply_to_uid")}
+
+
+def _audit(tool: str, arguments: dict[str, Any], started: float, result: str) -> None:
+    """One JSON line per tool call: who, which tool, where, and how it ended."""
+    token = get_access_token()
+    claims = (token.claims or {}) if token is not None else {}
+    record: dict[str, Any] = {
+        "time": datetime.now(UTC).isoformat(timespec="milliseconds"),
+        "yandex_login": claims.get("yandex_login"),
+        "client_id": token.client_id if token is not None else None,
+        "tool": tool,
+    }
+    for field, names in AUDITED.items():
+        value = next((arguments[name] for name in names if arguments.get(name) is not None), None)
+        record[field] = value if isinstance(value, (int, str)) else None
+    if isinstance(record["folder"], str):
+        record["folder"] = record["folder"][:200]
+    record["result"] = result
+    record["duration_ms"] = round((time.monotonic() - started) * 1000)
+    AUDIT.info(json.dumps(record, ensure_ascii=False))
+
+
 def tool_errors(fn: F) -> F:
+    """Report expected errors to the caller as ToolError, and write the audit log."""
+    signature = inspect.signature(fn)
+
+    def arguments(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return dict(signature.bind_partial(*args, **kwargs).arguments)
+        except TypeError:
+            return {}
+
     def translate(exc: Exception) -> ToolError | None:
         if isinstance(exc, LoginError):
             return ToolError(
@@ -195,25 +234,33 @@ def tool_errors(fn: F) -> F:
 
         @wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
+            started, result = time.monotonic(), "ok"
             try:
                 return await fn(*args, **kwargs)
             except Exception as exc:
+                result = type(exc).__name__
                 error = translate(exc)
                 if error is None:
                     raise
                 raise error from exc
+            finally:
+                _audit(fn.__name__, arguments(args, kwargs), started, result)
 
         return cast(F, async_wrapped)
 
     @wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        started, result = time.monotonic(), "ok"
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
+            result = type(exc).__name__
             error = translate(exc)
             if error is None:
                 raise
             raise error from exc
+        finally:
+            _audit(fn.__name__, arguments(args, kwargs), started, result)
 
     return cast(F, wrapped)
 
@@ -246,14 +293,23 @@ def build_oauth_app(
     """The multi-user HTTP app: MCP behind the authorization server federated to Yandex."""
     if not settings.oauth_client_id and oauth is None:
         raise ConfigurationError("MCP_PUBLIC_URL requires YANDEX_OAUTH_CLIENT_ID")
+    global _yandex_oauth
     cipher = TokenCipher.from_env(keys)
+    _yandex_oauth = oauth or YandexOAuth(
+        settings.oauth_client_id, settings.oauth_client_secret.get_secret_value()
+    )
+    allowed = frozenset(
+        user.strip() for user in os.getenv("MCP_ALLOWED_USERS", "").split(",") if user.strip()
+    )
+    if not allowed:
+        logging.warning("MCP_ALLOWED_USERS is empty: every sign-in will be refused")
     provider = YandexAuthProvider(
         cipher=cipher,
         clients=ClientStore(db_path, cipher),
-        oauth=oauth
-        or YandexOAuth(settings.oauth_client_id, settings.oauth_client_secret.get_secret_value()),
+        oauth=_yandex_oauth,
         public_url=public_url,
         allow_write=settings.allow_write,
+        allowed_users=allowed,
     )
     scopes = [SCOPE_READ, SCOPE_WRITE] if settings.allow_write else [SCOPE_READ]
     # Validated from strings, which keeps a path-less issuer without a trailing slash.
@@ -269,7 +325,15 @@ def build_oauth_app(
             "revocation_options": RevocationOptions(enabled=True),
         }
     )
-    return create_server(auth, provider).streamable_http_app(host=host, transport_security=security)
+    app = create_server(auth, provider).streamable_http_app(host=host, transport_security=security)
+    app.add_middleware(
+        RateLimit,
+        paths=frozenset(
+            {"/authorize", "/token", "/register", "/revoke", START_PATH, CALLBACK_PATH}
+        ),
+        limit=env_int("MCP_AUTH_RATE_LIMIT", 30),
+    )
+    return app
 
 
 def _mailbox() -> Mailbox:
@@ -280,6 +344,7 @@ def _mailbox() -> Mailbox:
         credentials = OAuthCredentials(
             str(claims["yandex_email"]),
             StaticTokenSource(str(claims["yandex_access_token"]), str(claims["yandex_scope"])),
+            reauth_hint="reconnect this server in your MCP client and allow full mail access",
         )
         key = ("user", str(claims["yandex_login"]))
         with _mailboxes_lock:
@@ -411,6 +476,38 @@ def get_thread(uid: int, folder: str = "INBOX", limit: int = 50) -> list[ThreadM
     Maximum 100.
     """
     return _mailbox().thread(uid=uid, folder=folder, limit=limit)
+
+
+@_tool(
+    annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True
+    ),
+    structured_output=False,
+)
+@tool_errors
+async def logout() -> dict[str, Any]:
+    """Sign out of this server: revoke your Yandex access, ending every token it issued you.
+
+    Mail is not changed. Use it only when the user asks to sign out or disconnect.
+    """
+    token = get_access_token()
+    claims = (token.claims or {}) if token is not None else {}
+    if "yandex_access_token" not in claims or _yandex_oauth is None:
+        raise ToolError(
+            "logout signs out of the multi-user HTTP server; "
+            "for the local server run `yandex-mail-mcp logout`"
+        )
+    oauth, yandex_token = _yandex_oauth, str(claims["yandex_access_token"])
+    try:
+        await anyio.to_thread.run_sync(lambda: oauth.revoke(yandex_token))
+    except YandexOAuthError as exc:
+        raise ToolError(f"Yandex did not revoke the token ({exc.error}); please retry") from exc
+    login = str(claims["yandex_login"])
+    with _mailboxes_lock:
+        mailbox = _mailboxes.pop(("user", login), None)
+    if mailbox is not None:
+        await anyio.to_thread.run_sync(mailbox.close)
+    return {"signed_out": login, "revoked": True}
 
 
 class MoveConfirmation(BaseModel):
@@ -740,6 +837,8 @@ def main(argv: list[str] | None = None) -> None:
             app,
             host=host,
             port=port,
+            # Trust X-Forwarded-For from the reverse proxy, so rate limits see client IPs.
+            forwarded_allow_ips=os.getenv("MCP_FORWARDED_ALLOW_IPS", "").strip() or None,
         )
     else:
         raise ValueError("MCP_TRANSPORT must be 'stdio' or 'streamable-http'")

@@ -631,12 +631,7 @@ class Mailbox:
         """Why this mailbox may not change mail, or None when it may."""
         if not self.config.allow_write:
             return "Write operations are disabled. Set YANDEX_ALLOW_WRITE=true"
-        if self.credentials.write_scope_missing():
-            return (
-                "Your Yandex access is read-only. Sign in again with write access: "
-                "run `yandex-mail-mcp login` with YANDEX_ALLOW_WRITE=true"
-            )
-        return None
+        return self.credentials.read_only_reason()
 
     @contextmanager
     def connect(self) -> Iterator[IMAPClient]:

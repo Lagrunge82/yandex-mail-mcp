@@ -34,8 +34,8 @@ class Credentials(Protocol):
 
     def login(self, imap: IMAPClient) -> None: ...
 
-    def write_scope_missing(self) -> bool:
-        """True when the credentials are known to allow reading only."""
+    def read_only_reason(self) -> str | None:
+        """Why these credentials cannot change mail, when they are known to be read-only."""
         ...
 
 
@@ -47,8 +47,8 @@ class PasswordCredentials:
     def login(self, imap: IMAPClient) -> None:
         imap.login(self.email, self.password.get_secret_value())
 
-    def write_scope_missing(self) -> bool:
-        return False
+    def read_only_reason(self) -> str | None:
+        return None
 
 
 class TokenSource(Protocol):
@@ -80,10 +80,16 @@ class StaticTokenSource:
         return self._scope
 
 
+LOCAL_REAUTH_HINT = "run `yandex-mail-mcp login` with YANDEX_ALLOW_WRITE=true"
+
+
 class OAuthCredentials:
-    def __init__(self, email: str, source: TokenSource) -> None:
+    def __init__(
+        self, email: str, source: TokenSource, reauth_hint: str = LOCAL_REAUTH_HINT
+    ) -> None:
         self.email = email
         self.source = source
+        self.reauth_hint = reauth_hint
 
     def login(self, imap: IMAPClient) -> None:
         try:
@@ -92,9 +98,13 @@ class OAuthCredentials:
             # An expired or revoked token: refresh once and retry; a second failure is final.
             imap.oauth2_login(self.email, self.source.refresh())
 
-    def write_scope_missing(self) -> bool:
+    def read_only_reason(self) -> str | None:
         scope = self.source.scope()
-        return scope is not None and not can_write(scope)
+        if scope is None or can_write(scope):
+            return None
+        return (
+            f"Your Yandex access is read-only. Sign in again with write access: {self.reauth_hint}"
+        )
 
 
 @dataclass(frozen=True)

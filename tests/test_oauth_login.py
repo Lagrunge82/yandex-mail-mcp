@@ -117,11 +117,11 @@ def test_static_token_cannot_refresh():
         OAuthCredentials("a@yandex.ru", StaticTokenSource("t")).login(FakeIMAP(failures=1))
 
 
-def test_write_scope_missing_only_when_scope_is_known_read_only():
-    assert OAuthCredentials("a", CountingSource("mail:imap_ro")).write_scope_missing()
-    assert not OAuthCredentials("a", CountingSource("mail:imap_full")).write_scope_missing()
-    assert not OAuthCredentials("a", CountingSource(None)).write_scope_missing()
-    assert not PasswordCredentials("a", "x").write_scope_missing()
+def test_read_only_only_when_scope_is_known_read_only():
+    assert "read-only" in OAuthCredentials("a", CountingSource("mail:imap_ro")).read_only_reason()
+    assert OAuthCredentials("a", CountingSource("mail:imap_full")).read_only_reason() is None
+    assert OAuthCredentials("a", CountingSource(None)).read_only_reason() is None
+    assert PasswordCredentials("a", "x").read_only_reason() is None
 
 
 def test_read_only_token_blocks_writes_with_a_hint():
