@@ -53,6 +53,8 @@ def signed_in(scope, login="ivan", token="ya-secret-token-123", scopes=("mail.re
 
 
 class Client:
+    session = SimpleNamespace(check_client_capability=lambda capability: True)
+
     def __init__(self):
         self.messages = []
 
@@ -92,6 +94,14 @@ def test_full_access_user_passes(user_mailboxes):
     assert result["action"] == "mark_read"
     assert len(client.messages) == 1
     assert user_mailboxes.changes == [("add_flags", [3], ["\\Seen"])]
+
+
+def test_http_user_is_told_to_reconnect_the_client(user_mailboxes):
+    with signed_in("mail:imap_full"):
+        credentials = server._mailbox().credentials
+    assert credentials.relogin_hint == server.HTTP_RELOGIN_HINT
+    assert "MCP client" in credentials.relogin_hint
+    assert "yandex-mail-mcp login" not in credentials.relogin_hint
 
 
 def test_server_flag_is_the_upper_bound(user_mailboxes, monkeypatch):

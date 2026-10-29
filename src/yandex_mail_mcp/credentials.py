@@ -63,6 +63,14 @@ class TokenSource(Protocol):
         ...
 
 
+class ReauthenticationRequired(LoginError):  # type: ignore[misc]
+    """The OAuth credentials no longer work; the message says how to sign in again.
+
+    Unlike a bare LoginError from the IMAP server, this message is meant for the
+    user and is reported to the tool caller as it is.
+    """
+
+
 class StaticTokenSource:
     """A token given from outside (YANDEX_OAUTH_TOKEN or an HTTP request); it cannot refresh."""
 
@@ -81,22 +89,51 @@ class StaticTokenSource:
 
 
 LOCAL_REAUTH_HINT = "run `yandex-mail-mcp login` with YANDEX_ALLOW_WRITE=true"
+LOCAL_RELOGIN_HINT = "run `yandex-mail-mcp login` again"
 
 
 class OAuthCredentials:
+    """XOAUTH2 login with a token source.
+
+    reauth_hint says how to obtain write access when the token is read-only;
+    relogin_hint says how to sign in again when the token no longer works at all.
+    """
+
     def __init__(
-        self, email: str, source: TokenSource, reauth_hint: str = LOCAL_REAUTH_HINT
+        self,
+        email: str,
+        source: TokenSource,
+        reauth_hint: str = LOCAL_REAUTH_HINT,
+        relogin_hint: str = LOCAL_RELOGIN_HINT,
     ) -> None:
         self.email = email
         self.source = source
         self.reauth_hint = reauth_hint
+        self.relogin_hint = relogin_hint
 
     def login(self, imap: IMAPClient) -> None:
         try:
-            imap.oauth2_login(self.email, self.source.access_token())
+            token = self.source.access_token()
+        except LoginError as exc:
+            # Refreshing an expiring token failed before IMAP was even tried.
+            raise ReauthenticationRequired(f"{exc}; {self.relogin_hint}") from exc
+        try:
+            imap.oauth2_login(self.email, token)
+            return
         except LoginError:
             # An expired or revoked token: refresh once and retry; a second failure is final.
-            imap.oauth2_login(self.email, self.source.refresh())
+            pass
+        try:
+            token = self.source.refresh()
+        except LoginError as exc:
+            raise ReauthenticationRequired(f"{exc}; {self.relogin_hint}") from exc
+        try:
+            imap.oauth2_login(self.email, token)
+        except LoginError as exc:
+            raise ReauthenticationRequired(
+                f"Yandex rejected the refreshed OAuth token for IMAP ({exc}); check that IMAP "
+                f"access is enabled in Yandex Mail settings, then {self.relogin_hint}"
+            ) from exc
 
     def read_only_reason(self) -> str | None:
         scope = self.source.scope()
@@ -220,10 +257,8 @@ class StoredTokenSource:
             try:
                 fresh = self._oauth.refresh(self._tokens.refresh_token, self._tokens.scope)
             except YandexOAuthError as exc:
-                raise LoginError(
-                    f"Could not refresh the Yandex token ({exc.error}); "
-                    "run `yandex-mail-mcp login` again"
-                ) from exc
+                # OAuthCredentials adds how to sign in again.
+                raise LoginError(f"Could not refresh the Yandex token ({exc.error})") from exc
             self._tokens = self._tokens.with_tokens(fresh)
             self._store.save(self._tokens)
             self._handed.token = self._tokens.access_token

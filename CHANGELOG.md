@@ -2,8 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- `move_email` and `archive_email` matched the destination folder without regard to case, so with folders that differ only by case the message could go to the wrong one. The name is now matched exactly first, then case-insensitively when unambiguous; an ambiguous name is rejected.
+- A client without elicitation support got a generic "method not found" error from a changing tool. The server now checks the capability first and explains what is missing and, for reversible changes, how to skip the confirmation.
+- `YANDEX_IMAP_PORT` and `MCP_PORT` outside 1–65535 are rejected at startup instead of failing later with a misleading DNS error.
+- When a Yandex OAuth token stops working, tools report why and how to sign in again (`yandex-mail-mcp login`, a fresh `YANDEX_OAUTH_TOKEN`, or reconnecting the server in the MCP client) instead of the generic "IMAP authentication failed" message meant for passwords.
+
 ### Changed
 
+- README documents every environment variable, where `.env` is found, the result fields and preview limits, what counts as an attachment, and the checks CI runs. SECURITY.md adds the supported versions and the security model.
 - The multi-user HTTP server (`MCP_PUBLIC_URL`) no longer looks for the tokens saved by `yandex-mail-mcp login` at startup, so it does not touch the system keyring in a container.
 - When several pooled IMAP connections are rejected at the same time, the stored Yandex token is refreshed once; the other connections reuse the refreshed token.
 - The sign-in rate limit forgets idle client addresses once per minute instead of only after 10 000 addresses.

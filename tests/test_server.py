@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import imaplib
+import re
 import socket
 import ssl
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from yandex_mail_mcp import server
 from yandex_mail_mcp.config import Settings
+from yandex_mail_mcp.credentials import ReauthenticationRequired
 from yandex_mail_mcp.mail import Mailbox, MailPermissionError, MailValueError
 
 
@@ -203,6 +205,21 @@ def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
         server.main([])
 
 
+def test_http_port_outside_the_valid_range_is_rejected(monkeypatch):
+    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    monkeypatch.setenv("MCP_PORT", "70000")
+    monkeypatch.setattr(server, "load_dotenv", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_settings",
+        lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
+    )
+    monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match="MCP_PORT must be a port number"):
+        server.main([])
+
+
 def test_specific_host_is_allowed_by_default(monkeypatch):
     monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
     monkeypatch.setenv("MCP_HOST", "192.168.1.5")
@@ -324,6 +341,8 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
             return {"uid": uid}
 
     class Client:
+        session = SimpleNamespace(check_client_capability=lambda capability: True)
+
         async def elicit(self, message, schema):
             return SimpleNamespace(action=action, data=SimpleNamespace(approve=approved))
 
@@ -351,6 +370,8 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
             return headers, "Промо"
 
     class Client:
+        session = SimpleNamespace(check_client_capability=lambda capability: True)
+
         async def elicit(self, message, schema):
             messages.append(message)
             return SimpleNamespace(action="decline", data=None)
@@ -389,6 +410,8 @@ def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
     box.move_to_promotions = lambda **kwargs: moved.append(kwargs)
 
     class Client:
+        session = SimpleNamespace(check_client_capability=lambda capability: True)
+
         async def elicit(self, message, schema):
             elicited.append(message)
 
@@ -462,6 +485,20 @@ def test_bearer_auth_passes_lifespan_without_token():
 
     asyncio.run(server.BearerAuth(app, "secret")({"type": "lifespan"}, receive, send))
     assert calls == ["lifespan"]
+
+
+def test_reauthentication_message_reaches_the_tool_caller(monkeypatch):
+    message = (
+        "Could not refresh the Yandex token (invalid_grant); run `yandex-mail-mcp login` again"
+    )
+
+    class Box:
+        def folders(self):
+            raise ReauthenticationRequired(message)
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match=re.escape(message)):
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
 
 
 def test_search_tool_passes_structured_criteria(monkeypatch):
