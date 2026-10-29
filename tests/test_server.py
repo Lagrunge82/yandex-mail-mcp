@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import imaplib
+import re
 import socket
 import ssl
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from yandex_mail_mcp import server
 from yandex_mail_mcp.config import Settings
+from yandex_mail_mcp.credentials import ReauthenticationRequired
 from yandex_mail_mcp.mail import Mailbox, MailPermissionError, MailValueError
 
 
@@ -483,6 +485,20 @@ def test_bearer_auth_passes_lifespan_without_token():
 
     asyncio.run(server.BearerAuth(app, "secret")({"type": "lifespan"}, receive, send))
     assert calls == ["lifespan"]
+
+
+def test_reauthentication_message_reaches_the_tool_caller(monkeypatch):
+    message = (
+        "Could not refresh the Yandex token (invalid_grant); run `yandex-mail-mcp login` again"
+    )
+
+    class Box:
+        def folders(self):
+            raise ReauthenticationRequired(message)
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match=re.escape(message)):
+        asyncio.run(server.mcp.call_tool("list_folders", {}))
 
 
 def test_search_tool_passes_structured_criteria(monkeypatch):

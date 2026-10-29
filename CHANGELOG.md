@@ -7,6 +7,7 @@
 - `move_email` and `archive_email` matched the destination folder without regard to case, so with folders that differ only by case the message could go to the wrong one. The name is now matched exactly first, then case-insensitively when unambiguous; an ambiguous name is rejected.
 - A client without elicitation support got a generic "method not found" error from a changing tool. The server now checks the capability first and explains what is missing and, for reversible changes, how to skip the confirmation.
 - `YANDEX_IMAP_PORT` and `MCP_PORT` outside 1–65535 are rejected at startup instead of failing later with a misleading DNS error.
+- When a Yandex OAuth token stops working, tools report why and how to sign in again (`yandex-mail-mcp login`, a fresh `YANDEX_OAUTH_TOKEN`, or reconnecting the server in the MCP client) instead of the generic "IMAP authentication failed" message meant for passwords.
 
 ### Changed
 

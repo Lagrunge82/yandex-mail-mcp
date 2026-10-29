@@ -588,7 +588,9 @@ def default_credentials(config: Settings) -> Credentials:
     """The IMAP credentials Settings.from_env chose."""
     if config.oauth_token is not None:
         return OAuthCredentials(
-            config.email, StaticTokenSource(config.oauth_token.get_secret_value())
+            config.email,
+            StaticTokenSource(config.oauth_token.get_secret_value()),
+            relogin_hint="set a fresh YANDEX_OAUTH_TOKEN",
         )
     if config.stored_tokens:
         store = TokenStore()

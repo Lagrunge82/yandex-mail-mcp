@@ -21,6 +21,7 @@ from yandex_mail_mcp.config import ConfigurationError, Settings
 from yandex_mail_mcp.credentials import (
     OAuthCredentials,
     PasswordCredentials,
+    ReauthenticationRequired,
     StaticTokenSource,
     StoredTokens,
     StoredTokenSource,
@@ -106,15 +107,45 @@ def test_oauth_credentials_refresh_once_after_login_error():
 
 def test_oauth_credentials_raise_after_second_failure():
     imap, source = FakeIMAP(failures=2), CountingSource()
-    with pytest.raises(LoginError):
+    with pytest.raises(ReauthenticationRequired) as raised:
         OAuthCredentials("ivan@yandex.ru", source).login(imap)
     assert len(imap.logins) == 2
     assert source.refreshes == 1
+    message = str(raised.value)
+    assert "[AUTHENTICATIONFAILED] Invalid credentials" in message
+    assert "IMAP access is enabled in Yandex Mail settings" in message
+    assert message.endswith("run `yandex-mail-mcp login` again")
 
 
 def test_static_token_cannot_refresh():
-    with pytest.raises(LoginError, match="cannot be refreshed"):
+    with pytest.raises(ReauthenticationRequired, match="cannot be refreshed") as raised:
         OAuthCredentials("a@yandex.ru", StaticTokenSource("t")).login(FakeIMAP(failures=1))
+    assert str(raised.value).endswith("; run `yandex-mail-mcp login` again")
+    hint = "set a fresh YANDEX_OAUTH_TOKEN"
+    with pytest.raises(ReauthenticationRequired, match=hint):
+        OAuthCredentials("a@yandex.ru", StaticTokenSource("t"), relogin_hint=hint).login(
+            FakeIMAP(failures=1)
+        )
+
+
+def test_refresh_failure_before_imap_is_reported_with_the_hint():
+    class ExpiredSource(CountingSource):
+        def access_token(self):
+            raise LoginError("Could not refresh the Yandex token (invalid_grant)")
+
+    imap = FakeIMAP()
+    with pytest.raises(ReauthenticationRequired) as raised:
+        OAuthCredentials("ivan@yandex.ru", ExpiredSource()).login(imap)
+    assert str(raised.value) == (
+        "Could not refresh the Yandex token (invalid_grant); run `yandex-mail-mcp login` again"
+    )
+    assert imap.logins == []
+
+
+def test_env_token_credentials_point_to_a_fresh_token():
+    credentials = default_credentials(Settings(email="a@yandex.ru", oauth_token="t"))
+    assert isinstance(credentials, OAuthCredentials)
+    assert credentials.relogin_hint == "set a fresh YANDEX_OAUTH_TOKEN"
 
 
 def test_read_only_only_when_scope_is_known_read_only():
@@ -282,11 +313,14 @@ def test_stored_source_refreshes_near_expiry_and_saves(tmp_path):
     )
 
 
-def test_stored_source_refresh_failure_asks_to_log_in(tmp_path):
+def test_stored_source_refresh_failure_names_the_reason(tmp_path):
     oauth = FakeOAuth(YandexOAuthError("invalid_grant", "expired"))
     source = StoredTokenSource(TokenStore(tmp_path / "t.json"), STORED, oauth)
-    with pytest.raises(LoginError, match="yandex-mail-mcp login"):
+    with pytest.raises(LoginError, match=r"Could not refresh the Yandex token \(invalid_grant\)"):
         source.refresh()
+    # The credentials add how to sign in again, so the tool caller sees both.
+    with pytest.raises(ReauthenticationRequired, match=r"invalid_grant.*yandex-mail-mcp login"):
+        OAuthCredentials("ivan@yandex.ru", source).login(FakeIMAP(failures=1))
 
 
 class Recorder:

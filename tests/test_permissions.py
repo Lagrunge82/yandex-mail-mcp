@@ -96,6 +96,14 @@ def test_full_access_user_passes(user_mailboxes):
     assert user_mailboxes.changes == [("add_flags", [3], ["\\Seen"])]
 
 
+def test_http_user_is_told_to_reconnect_the_client(user_mailboxes):
+    with signed_in("mail:imap_full"):
+        credentials = server._mailbox().credentials
+    assert credentials.relogin_hint == server.HTTP_RELOGIN_HINT
+    assert "MCP client" in credentials.relogin_hint
+    assert "yandex-mail-mcp login" not in credentials.relogin_hint
+
+
 def test_server_flag_is_the_upper_bound(user_mailboxes, monkeypatch):
     monkeypatch.setattr(server, "_settings", lambda: Settings(allow_write=False))
     with signed_in("mail:imap_full"), pytest.raises(ToolError, match="YANDEX_ALLOW_WRITE"):
