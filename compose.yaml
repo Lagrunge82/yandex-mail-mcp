@@ -1,5 +1,6 @@
 services:
-  # Local HTTP MCP endpoint. The host port is NOT exposed publicly.
+  # Shared HTTP MCP server: each user signs in with Yandex (see README).
+  # The host port is NOT exposed publicly; put an HTTPS reverse proxy in front of it.
   mcp:
     build: .
     restart: unless-stopped
@@ -12,8 +13,20 @@ services:
       MCP_TRANSPORT: streamable-http
       MCP_HOST: 0.0.0.0
       MCP_PORT: "8000"
-      # The published port is restricted to localhost on the host machine.
-      MCP_ALLOW_UNAUTHENTICATED_REMOTE: "${MCP_ALLOW_UNAUTHENTICATED_REMOTE:-false}"
+      # Required; Compose refuses to start without them.
+      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:?set MCP_PUBLIC_URL to the HTTPS URL clients use}"
+      MCP_TOKEN_ENCRYPTION_KEYS: "${MCP_TOKEN_ENCRYPTION_KEYS:?generate a key, see README}"
+      MCP_ALLOWED_USERS: "${MCP_ALLOWED_USERS:?list the Yandex logins allowed to sign in}"
+      YANDEX_OAUTH_CLIENT_ID: "${YANDEX_OAUTH_CLIENT_ID:?set the Yandex OAuth application ID}"
+      YANDEX_OAUTH_CLIENT_SECRET: "${YANDEX_OAUTH_CLIENT_SECRET:?set the Yandex OAuth application secret}"
+      # Only the registered MCP clients live here. Losing the volume makes clients
+      # register again; it does not affect tokens already issued.
+      MCP_AUTH_DB: /data/auth.db
+      # The port below is bound to localhost, so every connection comes from the local
+      # reverse proxy; trust its X-Forwarded-For for the per-IP rate limit.
+      MCP_FORWARDED_ALLOW_IPS: "*"
+    volumes:
+      - auth:/data
     ports:
       - "127.0.0.1:8000:8000"
     # /healthz does not touch IMAP and needs no token; python:slim has no curl.
@@ -27,3 +40,6 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+volumes:
+  auth:
