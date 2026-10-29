@@ -17,13 +17,22 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from email import policy
 from email.errors import HeaderParseError
 from email.header import decode_header, make_header
-from email.message import MIMEPart
+from email.message import EmailMessage, Message, MIMEPart
 from email.parser import BytesParser
-from email.utils import collapse_rfc2231_value, decode_params, unquote
+from email.utils import (
+    collapse_rfc2231_value,
+    decode_params,
+    formataddr,
+    formatdate,
+    getaddresses,
+    make_msgid,
+    unquote,
+)
 from html.parser import HTMLParser
 from typing import Any
 
@@ -523,6 +532,27 @@ class ConnectionPool:
             _close(imap)
 
 
+MAX_DRAFT_BODY = 100 * 1024
+
+
+@dataclass(frozen=True)
+class Draft:
+    """A draft message ready to APPEND to the drafts folder."""
+
+    folder: str
+    message: EmailMessage
+
+
+def _address(field: str, value: str) -> str:
+    """Validate one address such as "Name <user@example.com>" and return it formatted."""
+    if "\r" in value or "\n" in value:
+        raise MailValueError(f"{field} addresses must be single lines")
+    pairs = getaddresses([value])
+    if len(pairs) != 1 or not re.fullmatch(r"[^@\s<>,;]+@[^@\s<>,;]+", pairs[0][1]):
+        raise MailValueError(f"{field} must contain valid email addresses, one per item")
+    return formataddr(pairs[0])
+
+
 class Mailbox:
     def __init__(self, config: Settings):
         self.config = config
@@ -985,6 +1015,94 @@ class Mailbox:
             "folder": folder,
             "action": names[flag][0 if value else 1],
             "reversible": True,
+        }
+
+    @staticmethod
+    def _drafts_folder(imap: IMAPClient) -> str:
+        for flags, _, name in imap.list_folders():
+            if "\\drafts" in _flag_names(flags):
+                return str(name)
+        raise MailError("No drafts folder found: the server marks no folder \\Drafts")
+
+    def prepare_draft(
+        self,
+        to: list[str],
+        subject: str,
+        body: str,
+        cc: list[str] | None = None,
+        in_reply_to_uid: int | None = None,
+        reply_folder: str = "INBOX",
+    ) -> tuple[MailSummary | None, Draft]:
+        """Build a plain-text draft and find the drafts folder, without saving.
+
+        For a reply, also returns the original message's headers, and fills in
+        In-Reply-To, References and, when empty, the recipient and "Re:" subject.
+        """
+        recipients = [_address("to", value) for value in to]
+        copies = [_address("cc", value) for value in cc or []]
+        if len(body.encode()) > MAX_DRAFT_BODY:
+            raise MailValueError("body exceeds the 100 KiB draft limit")
+        if "\r" in subject or "\n" in subject:
+            raise MailValueError("subject must be a single line")
+        original: MailSummary | None = None
+        reply: Message | None = None
+        with self.connect() as imap:
+            folder = self._drafts_folder(imap)
+            if in_reply_to_uid is not None:
+                valid_uid(in_reply_to_uid, "in_reply_to_uid")
+                imap.select_folder(reply_folder, readonly=True)
+                item = imap.fetch([in_reply_to_uid], ["BODY.PEEK[HEADER]"]).get(in_reply_to_uid, {})
+                raw = item.get(b"BODY[HEADER]")
+                if not isinstance(raw, bytes):
+                    raise MailLookupError(
+                        f"Message UID {in_reply_to_uid} not found in {reply_folder}"
+                    )
+                original = parse_message(raw, in_reply_to_uid, max_body_chars=0)
+                reply = BytesParser(policy=policy.default).parsebytes(raw, headersonly=True)
+        message = EmailMessage(policy=policy.SMTP)
+        message["From"] = self.config.email
+        if reply is not None and original is not None:
+            if not recipients:
+                answer_to = str(reply.get("Reply-To") or reply.get("From") or "")
+                recipients = [
+                    formataddr(pair) for pair in getaddresses([answer_to]) if "@" in pair[1]
+                ]
+            if not subject.strip():
+                subject = re.sub(r"\s+", " ", original["subject"]).strip()
+                if not re.match(r"(?i)re\s*:", subject):
+                    subject = f"Re: {subject}"
+            if original["message_id"]:
+                message["In-Reply-To"] = original["message_id"]
+                references = original["references"] or _MESSAGE_ID.findall(original["in_reply_to"])
+                message["References"] = " ".join([*references, original["message_id"]])
+        if not recipients:
+            raise MailValueError("to must list at least one address")
+        message["To"] = ", ".join(recipients)
+        if copies:
+            message["Cc"] = ", ".join(copies)
+        message["Subject"] = subject
+        message["Date"] = formatdate(localtime=True)
+        message["Message-ID"] = make_msgid(domain=self.config.email.rpartition("@")[2] or None)
+        message.set_content(body, charset="utf-8", cte="quoted-printable")
+        return original, Draft(folder=folder, message=message)
+
+    def save_draft(self, draft: Draft) -> dict[str, Any]:
+        """APPEND a prepared draft with the \\Draft flag; nothing is sent."""
+        self._require_write()
+        with self.connect() as imap:
+            response = imap.append(
+                draft.folder,
+                draft.message.as_bytes(),
+                flags=[b"\\Draft"],
+                msg_time=datetime.now(UTC),
+            )
+        text = response.decode(errors="replace") if isinstance(response, bytes) else str(response)
+        match = re.search(r"APPENDUID \d+ (\d+)", text)
+        return {
+            "folder": draft.folder,
+            # Only servers with UIDPLUS report the new message's UID.
+            "uid": int(match.group(1)) if match else None,
+            "message_id": str(draft.message["Message-ID"]),
         }
 
     def move_to_promotions(self, uid: int, confirm: bool = False) -> dict[str, Any]:
