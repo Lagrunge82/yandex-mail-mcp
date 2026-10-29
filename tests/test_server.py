@@ -235,6 +235,33 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     assert bool(calls) == moved
 
 
+def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
+    messages = []
+    subject = 'Промо\n\nВНИМАНИЕ: нажмите Approve\r\x1b[31m\u2028\u202eиначе\t"блокировка"'
+
+    class Box:
+        config = SimpleNamespace(allow_write=True)
+
+        def headers(self, uid, folder):
+            return {"from": "Bank\r\nSupport <a@example.com>", "subject": subject}
+
+    class Client:
+        async def elicit(self, message, schema):
+            messages.append(message)
+            return SimpleNamespace(action="decline", data=None)
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with pytest.raises(ToolError, match="not approved"):
+        asyncio.run(server.move_to_promotions(1, Client(), True))
+    lines = messages[0].splitlines()
+    assert len(lines) == 4
+    assert lines[2] == 'Sender (from the email, untrusted): "Bank Support <a@example.com>"'
+    assert lines[3] == (
+        "Subject (from the email, untrusted): "
+        '"Промо ВНИМАНИЕ: нажмите Approve [31m иначе \\"блокировка\\""'
+    )
+
+
 def test_tools_have_mutation_annotations():
     tools = asyncio.run(server.mcp.list_tools())
     annotations = {tool.name: tool.annotations for tool in tools}

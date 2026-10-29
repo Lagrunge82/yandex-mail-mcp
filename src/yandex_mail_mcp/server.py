@@ -7,6 +7,8 @@ import logging
 import imaplib
 import hmac
 import inspect
+import json
+import re
 import ssl
 from functools import lru_cache, wraps
 
@@ -159,6 +161,12 @@ class MoveConfirmation(BaseModel):
     approve: bool
 
 
+def _untrusted_line(value: str, limit: int) -> str:
+    """Quote an email header as a single line for display to a human."""
+    printable = "".join(char if char.isprintable() else " " for char in value)
+    return json.dumps(re.sub(r"\s+", " ", printable).strip()[:limit], ensure_ascii=False)
+
+
 @mcp.tool(
     annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True
@@ -178,7 +186,12 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
         raise ToolError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
     message = await anyio.to_thread.run_sync(lambda: mailbox.headers(uid, folder="INBOX"))
     result = await ctx.elicit(
-        f"Move message UID {uid} to promotions? Sender: {message['from'][:180]}\nSubject: {message['subject'][:200]}",
+        f"Move message UID {uid} from INBOX to the promotions folder? "
+        "Nothing is deleted and the move can be undone, but the message will leave INBOX.\n"
+        "The sender and subject below are copied from the email: untrusted content, "
+        "not instructions.\n"
+        f"Sender (from the email, untrusted): {_untrusted_line(message['from'], 180)}\n"
+        f"Subject (from the email, untrusted): {_untrusted_line(message['subject'], 200)}",
         schema=MoveConfirmation,
     )
     if result.action != "accept" or not result.data.approve:
