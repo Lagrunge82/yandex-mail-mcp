@@ -19,8 +19,11 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from email import policy
+from email.errors import HeaderParseError
+from email.header import decode_header, make_header
 from email.message import MIMEPart
 from email.parser import BytesParser
+from email.utils import collapse_rfc2231_value, decode_params, unquote
 from html.parser import HTMLParser
 from typing import Any
 
@@ -30,6 +33,20 @@ from typing_extensions import TypedDict
 from .config import RESERVED_FOLDER_NAMES, Settings
 
 LOG = logging.getLogger(__name__)
+
+
+class AttachmentInfo(TypedDict):
+    """An attachment's metadata; its content is never returned.
+
+    size is the encoded size in bytes as stored in the message, so base64
+    content is about a third larger than the file. section is the IMAP part number.
+    """
+
+    filename: str
+    content_type: str
+    size: int
+    section: str
+
 
 MailSummary = TypedDict(
     "MailSummary",
@@ -42,6 +59,8 @@ MailSummary = TypedDict(
         "date": str,
         "preview": str,
         "has_attachments": bool,
+        "attachments": list[AttachmentInfo],
+        "list_unsubscribe": str,
         "in_reply_to": str,
         "references": list[str],
     },
@@ -100,26 +119,75 @@ def _is_attachment(kind: str, disposition: str, has_filename: bool) -> bool:
     return disposition == "attachment" or has_filename or kind not in {"text", "multipart"}
 
 
+def _header_text(value: str) -> str:
+    """Decode RFC 2047 encoded words, keeping the raw value if they are malformed."""
+    try:
+        return str(make_header(decode_header(value)))
+    except (HeaderParseError, LookupError, UnicodeError, ValueError):
+        return value
+
+
+def _filename(params: list[tuple[str, str]]) -> str:
+    """The file name from Content-Disposition or Content-Type parameters.
+
+    Handles RFC 2231 continuations and charsets, then RFC 2047 encoded words,
+    which many mail clients still use for non-ASCII names.
+    """
+    try:
+        decoded = decode_params([("", ""), *params])[1:]
+    except (LookupError, UnicodeError, ValueError):
+        return ""
+    for key in ("filename", "name"):
+        for name, value in decoded:
+            if name.lower() != key:
+                continue
+            try:
+                text = collapse_rfc2231_value(value)
+            except (LookupError, UnicodeError):
+                text = value[2] if isinstance(value, tuple) else value
+            return re.sub(r"\s+", " ", _header_text(unquote(text))).strip()
+    return ""
+
+
 def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSummary:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     text_parts: list[str] = []
     html_parts: list[str] = []
-    has_attachments = False
+    attachments: list[AttachmentInfo] = []
 
-    def collect(part: MIMEPart, root: bool = False) -> None:
-        nonlocal has_attachments
+    def collect(part: MIMEPart, path: str = "") -> None:
+        root = not path
+        params = [
+            (str(key), str(value))
+            for header in ("Content-Type", "Content-Disposition")
+            for key, value in (part.get_params(header=header) or [])[1:]
+        ]
+        filename = _filename(params)
         # A name or attachment disposition on the message itself does not make its body
         # an attachment; only a non-text root type does.
         if _is_attachment(
             part.get_content_maintype(),
             "" if root else part.get_content_disposition() or "",
-            not root and part.get_filename() is not None,
+            not root and (bool(filename) or part.get_filename() is not None),
         ):
-            has_attachments = True
+            payload = part.get_payload()
+            raw = (
+                payload.encode("utf-8", "surrogateescape")
+                if isinstance(payload, str)
+                else part.as_bytes().partition(b"\n\n")[2]
+            )
+            attachments.append(
+                {
+                    "filename": filename,
+                    "content_type": part.get_content_type(),
+                    "size": len(raw),
+                    "section": path or "1",
+                }
+            )
             return
         if part.is_multipart():
-            for child in part.iter_parts():
-                collect(child)
+            for index, child in enumerate(part.iter_parts(), 1):
+                collect(child, f"{path}.{index}" if path else str(index))
             return
         if part.get_content_type() not in {"text/plain", "text/html"}:
             return
@@ -134,7 +202,7 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
         else:
             html_parts.append(content)
 
-    collect(msg, root=True)
+    collect(msg)
     if text_parts:
         body = "\n".join(text_parts)
     else:
@@ -153,7 +221,9 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
         "to": str(msg.get("To", "")),
         "date": date,
         "preview": body[: min(max_body_chars, 10000)],
-        "has_attachments": has_attachments,
+        "has_attachments": bool(attachments),
+        "attachments": attachments,
+        "list_unsubscribe": re.sub(r"\s+", " ", str(msg.get("List-Unsubscribe", ""))).strip(),
         "in_reply_to": str(msg.get("In-Reply-To", "")).strip(),
         "references": _MESSAGE_ID.findall(str(msg.get("References", ""))),
     }
@@ -245,37 +315,57 @@ def _uid_scope(before_uid: int | None) -> list[str] | None:
     return ["UID", f"1:{before_uid - 1}"] if before_uid > 1 else None
 
 
-def _text_sections(structure: Any) -> tuple[list[tuple[str, str, str, str]], bool]:
-    """Return safe text section metadata and whether MIME attachments exist."""
+def _text_sections(structure: Any) -> tuple[list[tuple[str, str, str, str]], list[AttachmentInfo]]:
+    """Return safe text section metadata and the MIME attachments' metadata."""
     sections: list[tuple[str, str, str, str]] = []
-    has_attachments = False
+    attachments: list[AttachmentInfo] = []
 
     def string(value: Any, default: str = "") -> str:
         if isinstance(value, bytes):
-            return value.decode("ascii", errors="replace")
+            return value.decode("utf-8", errors="replace")
         return value if isinstance(value, str) else default
 
+    def pairs(values: Any) -> list[tuple[str, str]]:
+        if not isinstance(values, (tuple, list)):
+            return []
+        return [
+            (string(values[i]).lower(), string(values[i + 1])) for i in range(0, len(values) - 1, 2)
+        ]
+
+    def disposition_of(value: Any) -> tuple[str, list[tuple[str, str]]]:
+        if not isinstance(value, (tuple, list)) or not value:
+            return "", []
+        return string(value[0]).lower(), pairs(value[1]) if len(value) > 1 else []
+
+    def size_of(part: Any) -> int:
+        if isinstance(part, (tuple, list)) and part and isinstance(part[0], list):
+            return sum(size_of(child) for child in part[0])
+        if isinstance(part, (tuple, list)) and len(part) > 6 and isinstance(part[6], int):
+            return part[6]
+        return 0
+
+    def named(params: list[tuple[str, str]]) -> bool:
+        # RFC 2231 spells the parameter filename* or filename*0*.
+        return any(key.split("*")[0] in {"filename", "name"} for key, _ in params)
+
+    def attach(part: Any, path: str, content_type: str, params: list[tuple[str, str]]) -> None:
+        attachments.append(
+            {
+                "filename": _filename(params),
+                "content_type": content_type,
+                "size": size_of(part),
+                "section": path or "1",
+            }
+        )
+
     def walk(part: Any, path: str) -> None:
-        nonlocal has_attachments
         if not isinstance(part, (tuple, list)) or not part:
             return
         if isinstance(part[0], list):
-            disposition = part[3] if len(part) > 3 else None
-            name = (
-                string(disposition[0]).lower()
-                if isinstance(disposition, (tuple, list)) and disposition
-                else ""
-            )
-            disp_params = (
-                disposition[1]
-                if isinstance(disposition, (tuple, list)) and len(disposition) > 1
-                else None
-            )
-            has_filename = isinstance(disp_params, (tuple, list)) and any(
-                string(value).lower() == "filename" for value in disp_params[::2]
-            )
-            if path and _is_attachment("multipart", name, has_filename):
-                has_attachments = True
+            name, disp_params = disposition_of(part[3] if len(part) > 3 else None)
+            if path and _is_attachment("multipart", name, named(disp_params)):
+                subtype = string(part[1]).lower() if len(part) > 1 else "mixed"
+                attach(part, path, f"multipart/{subtype}", disp_params)
                 return
             for index, child in enumerate(part[0], 1):
                 walk(child, f"{path}.{index}" if path else str(index))
@@ -284,48 +374,39 @@ def _text_sections(structure: Any) -> tuple[list[tuple[str, str, str, str]], boo
             return
         kind = string(part[0]).lower()
         subtype = string(part[1]).lower()
-        raw_params = part[2] if isinstance(part[2], (tuple, list)) else ()
-        params = {
-            string(raw_params[i]).lower(): string(raw_params[i + 1])
-            for i in range(0, len(raw_params) - 1, 2)
-        }
-        disposition_index = 9 if kind == "text" else 8
-        disposition = part[disposition_index] if len(part) > disposition_index else None
-        disposition_name = (
-            string(disposition[0]).lower()
-            if isinstance(disposition, (tuple, list)) and disposition
-            else ""
+        params = pairs(part[2])
+        # Extension data follows the type-specific fields: text has a line count,
+        # message/rfc822 an envelope, body structure and line count.
+        if kind == "text":
+            disposition_index = 9
+        elif (kind, subtype) == ("message", "rfc822"):
+            disposition_index = 11
+        else:
+            disposition_index = 8
+        disposition_name, disposition_params = disposition_of(
+            part[disposition_index] if len(part) > disposition_index else None
         )
-        disposition_params = (
-            disposition[1]
-            if isinstance(disposition, (tuple, list)) and len(disposition) > 1
-            else None
-        )
-        has_filename = bool(params.get("name"))
-        if isinstance(disposition_params, (tuple, list)):
-            has_filename |= any(
-                string(value).lower() == "filename" for value in disposition_params[::2]
-            )
         # As in parse_message, the root part is judged by its type only.
         root = not path
-        is_attachment = _is_attachment(
-            kind, "" if root else disposition_name, has_filename and not root
-        )
-        if is_attachment:
-            has_attachments = True
-        if kind == "text" and subtype in {"plain", "html"} and not is_attachment:
+        if _is_attachment(
+            kind,
+            "" if root else disposition_name,
+            not root and named(params + disposition_params),
+        ):
+            attach(part, path, f"{kind}/{subtype}", disposition_params + params)
+        elif kind == "text" and subtype in {"plain", "html"}:
             sections.append(
                 (
                     path or "1",
                     f"text/{subtype}",
-                    params.get("charset", "utf-8"),
+                    dict(params).get("charset", "utf-8"),
                     string(part[5], "7bit"),
                 )
             )
 
     walk(structure, "")
     sections.sort(key=lambda item: item[1] != "text/plain")
-    return sections, has_attachments
+    return sections, attachments
 
 
 def _close(imap: IMAPClient) -> None:
@@ -478,7 +559,9 @@ class Mailbox:
                 failure(uid)
                 continue
             summary = parse_message(header, uid, max_body_chars=max_body_chars)
-            parts, summary["has_attachments"] = _text_sections(structure)
+            parts, attachments = _text_sections(structure)
+            summary["attachments"] = attachments
+            summary["has_attachments"] = bool(attachments)
             summaries[uid] = summary
             if parts:
                 section, content_type, charset, encoding = parts[0]
@@ -621,7 +704,7 @@ class Mailbox:
                 uid
                 for uid in batch
                 if structures.get(uid, {}).get(b"BODYSTRUCTURE")
-                and _text_sections(structures[uid][b"BODYSTRUCTURE"])[1] == has_attachments
+                and bool(_text_sections(structures[uid][b"BODYSTRUCTURE"])[1]) == has_attachments
             ]
             found.extend(self._fetch(imap, matching[: limit - len(found)], max_body_chars=2000))
             if len(found) >= limit:
