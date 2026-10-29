@@ -871,6 +871,8 @@ class Mailbox:
             # Yandex can answer HEADER Message-ID with "[UNAVAILABLE] UID SEARCH Backend
             # error"; after that, find parents by subject for the rest of this call.
             by_message_id = True
+            # Message-ID -> UID of the subject's matches, built once per folder.
+            by_subject: dict[str, dict[str, int]] = {}
             while len(found) < limit and (pending := sorted(known - searched)):
                 searched.update(pending)
                 # IMAPClient sends other ids unquoted or as us-ascii; skipping them
@@ -897,7 +899,13 @@ class Mailbox:
                             except imaplib.IMAP4.error as exc:
                                 LOG.info("HEADER Message-ID search failed (%s); using subject", exc)
                                 by_message_id = False
-                        uids.update(self._find_message_ids(imap, set(chunk), subject))
+                        if name not in by_subject:
+                            by_subject[name] = self._message_ids_by_subject(imap, subject)
+                        uids.update(
+                            uid
+                            for message_id, uid in by_subject[name].items()
+                            if message_id in chunk
+                        )
                     new = sorted(u for u in uids if (name, u) not in found)
                     for message in self._fetch(
                         imap, new[: limit - len(found)], max_body_chars=2000
@@ -911,32 +919,31 @@ class Mailbox:
         return sorted(unique.values(), key=_date_key)[:limit]
 
     @staticmethod
-    def _find_message_ids(imap: IMAPClient, ids: set[str], subject: str) -> set[int]:
-        """UIDs in the selected folder whose Message-ID is one of ids, found without
-        HEADER Message-ID: search the base subject, then compare the 200 newest matches."""
+    def _message_ids_by_subject(imap: IMAPClient, subject: str) -> dict[str, int]:
+        """Message-ID -> UID for the 200 newest messages in the selected folder whose
+        subject contains this one: thread parents found without HEADER Message-ID."""
         if not subject:
-            return set()
+            return {}
         try:
             candidates = sorted(imap.search(["SUBJECT", subject], charset="UTF-8"))[-200:]
         except imaplib.IMAP4.abort:
             raise
         except imaplib.IMAP4.error as exc:
             LOG.info("SUBJECT search for thread parents failed: %s", exc)
-            return set()
+            return {}
         if not candidates:
-            return set()
+            return {}
         fetched = imap.fetch(candidates, ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
-        found = set()
+        found: dict[str, int] = {}
         for uid, item in fetched.items():
             # Servers echo the field list in their own spelling, so match the prefix.
             raw = next(
                 (value for key, value in item.items() if key.startswith(b"BODY[HEADER.FIELDS")),
                 None,
             )
-            if isinstance(raw, bytes) and ids & set(
-                _MESSAGE_ID.findall(raw.decode(errors="replace"))
-            ):
-                found.add(uid)
+            if isinstance(raw, bytes):
+                for message_id in _MESSAGE_ID.findall(raw.decode(errors="replace")):
+                    found.setdefault(message_id, uid)
         return found
 
     def headers(self, uid: int, folder: str = "INBOX") -> MailSummary:

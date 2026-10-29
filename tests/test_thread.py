@@ -310,3 +310,17 @@ def test_subject_fallback_reads_at_most_200_candidates():
 )
 def test_base_subject(subject, base):
     assert _base_subject(subject) == base
+
+
+def test_subject_fallback_searches_and_fetches_once_per_folder():
+    ancestors = {uid: header(f"<{uid}@x>", "") for uid in range(1, 26)}
+    references = " ".join(f"<{uid}@x>" for uid in range(1, 26))
+    child = header("<child@x>", "", "<25@x>", references)
+    folders = {"INBOX": {**ancestors, 26: child}, "Отправленные": {}, "Other": {}}
+    imap = ThreadIMAP(folders, message_id_error=True)
+    result = mailbox(imap).thread(26, limit=100)
+    assert len(result) == 26
+    subject_searches = [folder for folder, criteria in imap.searches if criteria[0] == "SUBJECT"]
+    # 25 ids are three chunks of ten, but each folder is searched and read once.
+    assert sorted(subject_searches) == ["INBOX", "Отправленные"]
+    assert len(imap.header_field_fetches) == 1
