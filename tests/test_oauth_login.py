@@ -453,6 +453,7 @@ def test_login_runs_pkce_flow_and_saves_tokens(tmp_path, monkeypatch):
 
 def test_wrong_state_is_refused_and_the_real_callback_still_works(tmp_path):
     statuses = []
+    browsers = []
 
     def open_browser(url):
         query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
@@ -464,7 +465,8 @@ def test_wrong_state_is_refused_and_the_real_callback_still_works(tmp_path):
             real = urllib.parse.urlencode({"state": query["state"], "code": "real"})
             statuses.append(visit(f"{callback}?{real}"))
 
-        threading.Thread(target=browse, daemon=True).start()
+        browsers.append(threading.Thread(target=browse, daemon=True))
+        browsers[0].start()
 
     oauth = LoginOAuth()
     login_module.login(
@@ -475,6 +477,8 @@ def test_wrong_state_is_refused_and_the_real_callback_still_works(tmp_path):
         server=loopback(),
     )
     assert [code for code, _ in oauth.exchanged] == ["real"]
+    # login returns once the server has answered; the browser may still be reading.
+    browsers[0].join(timeout=5)
     assert statuses == [400, 200]
 
 
