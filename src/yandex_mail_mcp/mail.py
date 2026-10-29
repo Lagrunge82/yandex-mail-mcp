@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 from email import policy
 from email.message import MIMEPart
 from email.parser import BytesParser
@@ -42,8 +42,19 @@ MailSummary = TypedDict(
         "date": str,
         "preview": str,
         "has_attachments": bool,
+        "in_reply_to": str,
+        "references": list[str],
     },
 )
+
+
+class ThreadMessage(MailSummary):
+    """A message found by get_thread, which can come from several folders."""
+
+    folder: str
+
+
+_MESSAGE_ID = re.compile(r"<[^<>\s]+>")
 
 
 class MailError(Exception):
@@ -143,6 +154,8 @@ def parse_message(raw: bytes, uid: int, *, max_body_chars: int = 4000) -> MailSu
         "date": date,
         "preview": body[: min(max_body_chars, 10000)],
         "has_attachments": has_attachments,
+        "in_reply_to": str(msg.get("In-Reply-To", "")).strip(),
+        "references": _MESSAGE_ID.findall(str(msg.get("References", ""))),
     }
 
 
@@ -192,10 +205,44 @@ def search_criteria(
     return criteria
 
 
-def valid_uid(uid: int) -> int:
+def valid_uid(uid: int, name: str = "uid") -> int:
     if not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0:
-        raise MailValueError("uid must be a positive integer")
+        raise MailValueError(f"{name} must be a positive integer")
     return uid
+
+
+def _thread_ids(message: MailSummary) -> set[str]:
+    ids = _MESSAGE_ID.findall(" ".join([message["message_id"], message["in_reply_to"]]))
+    return set(ids) | set(message["references"])
+
+
+def _thread_criteria(ids: list[str]) -> list[str]:
+    """SEARCH criteria matching any message that has or refers to one of the ids."""
+    keys = [
+        ["HEADER", header, message_id]
+        for message_id in ids
+        for header in ("Message-ID", "In-Reply-To", "References")
+    ]
+    # Prefix notation: n keys need n - 1 leading ORs.
+    return ["OR"] * (len(keys) - 1) + [token for key in keys for token in key]
+
+
+def _date_key(message: MailSummary) -> tuple[int, datetime]:
+    try:
+        parsed = datetime.fromisoformat(message["date"])
+    except ValueError:
+        return (1, datetime.min.replace(tzinfo=UTC))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (0, parsed)
+
+
+def _uid_scope(before_uid: int | None) -> list[str] | None:
+    """SEARCH criteria for UIDs below before_uid, or None when no UID can match."""
+    if before_uid is None:
+        return []
+    valid_uid(before_uid, "before_uid")
+    return ["UID", f"1:{before_uid - 1}"] if before_uid > 1 else None
 
 
 def _text_sections(structure: Any) -> tuple[list[tuple[str, str, str, str]], bool]:
@@ -477,12 +524,19 @@ class Mailbox:
             return [str(name) for _, _, name in imap.list_folders()]
 
     def recent(
-        self, limit: int = 20, unread_only: bool = False, folder: str = "INBOX"
+        self,
+        limit: int = 20,
+        unread_only: bool = False,
+        folder: str = "INBOX",
+        before_uid: int | None = None,
     ) -> list[MailSummary]:
         limit = max(1, min(limit, 100))
+        scope = _uid_scope(before_uid)
+        if scope is None:
+            return []
         with self.connect() as imap:
             imap.select_folder(folder, readonly=True)
-            uids = imap.search(["UNSEEN"] if unread_only else ["ALL"])
+            uids = imap.search((["UNSEEN"] if unread_only else []) + scope or ["ALL"])
             return self._fetch(imap, sorted(uids)[-limit:][::-1])
 
     def search(
@@ -499,6 +553,7 @@ class Mailbox:
         has_attachments: bool | None = None,
         limit: int = 20,
         folder: str = "INBOX",
+        before_uid: int | None = None,
     ) -> list[MailSummary]:
         """Search the server with the given criteria, newest first.
 
@@ -517,23 +572,28 @@ class Mailbox:
         if not criteria and has_attachments is None:
             raise MailValueError("Give at least one search criterion")
         limit = max(1, min(limit, 100))
+        scope = _uid_scope(before_uid)
+        if scope is None:
+            return []
         with self.connect() as imap:
             imap.select_folder(folder, readonly=True)
             try:
-                uids = sorted(imap.search(criteria or ["ALL"], charset="UTF-8"))[::-1]
+                uids = sorted(imap.search(criteria + scope or ["ALL"], charset="UTF-8"))[::-1]
             except imaplib.IMAP4.abort:
                 raise
             except imaplib.IMAP4.error:
                 if query is None or criteria != ["TEXT", query] or has_attachments is not None:
                     raise
-                return self._search_previews(imap, query, limit)
+                return self._search_previews(imap, query, limit, scope)
             if has_attachments is None:
                 return self._fetch(imap, uids[:limit], max_body_chars=2000)
             return self._filter_attachments(imap, uids, has_attachments, limit)
 
-    def _search_previews(self, imap: IMAPClient, query: str, limit: int) -> list[MailSummary]:
+    def _search_previews(
+        self, imap: IMAPClient, query: str, limit: int, scope: list[str]
+    ) -> list[MailSummary]:
         needle = query.casefold()
-        uids = sorted(imap.search(["ALL"]))[-300:][::-1]
+        uids = sorted(imap.search(scope or ["ALL"]))[-300:][::-1]
         found: list[MailSummary] = []
         for start in range(0, len(uids), 30):
             for message in self._fetch(imap, uids[start : start + 30], max_body_chars=2000):
@@ -584,6 +644,48 @@ class Mailbox:
             if not isinstance(raw, bytes):
                 raise MailLookupError(f"Message UID {uid} not found in {folder}")
             return parse_message(raw, uid, max_body_chars=10000)
+
+    def thread(self, uid: int, folder: str = "INBOX", limit: int = 50) -> list[ThreadMessage]:
+        """Collect the conversation of a message by Message-ID, In-Reply-To and References.
+
+        Searches the given folder, INBOX and the folder flagged \\Sent, repeating with
+        newly found identifiers until none are new or limit messages are found.
+        Returns the messages oldest first.
+        """
+        valid_uid(uid)
+        limit = max(1, min(limit, 100))
+        with self.connect() as imap:
+            origin = self._headers(imap, uid, folder)
+            folders = [folder]
+            for flags, _, name in imap.list_folders():
+                special = {
+                    str(flag.decode() if isinstance(flag, bytes) else flag) for flag in flags
+                }
+                if (name.upper() == "INBOX" or "\\Sent" in special) and all(
+                    name.casefold() != known.casefold() for known in folders
+                ):
+                    folders.append(name)
+            found: dict[tuple[str, int], ThreadMessage] = {
+                (folder, uid): {**origin, "folder": folder}
+            }
+            known = _thread_ids(origin)
+            searched: set[str] = set()
+            while len(found) < limit and (pending := sorted(known - searched)):
+                searched.update(pending)
+                for name in folders:
+                    imap.select_folder(name, readonly=True)
+                    uids: set[int] = set()
+                    for start in range(0, len(pending), 10):
+                        uids.update(imap.search(_thread_criteria(pending[start : start + 10])))
+                    new = sorted(u for u in uids if (name, u) not in found)
+                    for message in self._fetch(imap, new, max_body_chars=2000):
+                        found[(name, message["uid"])] = {**message, "folder": name}
+                        known |= _thread_ids(message)
+        unique: dict[str, ThreadMessage] = {}
+        for key, message in found.items():
+            # The same message can be in two folders, such as mail sent to oneself.
+            unique.setdefault(message["message_id"] or f"{key}", message)
+        return sorted(unique.values(), key=_date_key)[:limit]
 
     def headers(self, uid: int, folder: str = "INBOX") -> MailSummary:
         valid_uid(uid)

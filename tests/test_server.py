@@ -461,5 +461,6 @@ def test_search_tool_passes_structured_criteria(monkeypatch):
             "has_attachments": True,
             "limit": 20,
             "folder": "INBOX",
+            "before_uid": None,
         }
     ]

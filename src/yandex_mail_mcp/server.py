@@ -33,7 +33,7 @@ from starlette.responses import PlainTextResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .config import ConfigurationError, Settings, env_bool, env_int
-from .mail import Mailbox, MailError, MailSummary
+from .mail import Mailbox, MailError, MailSummary, ThreadMessage
 
 # One Mailbox, and so one connection pool, per account configuration.
 _mailboxes: dict[Settings, Mailbox] = {}
@@ -208,10 +208,18 @@ def list_folders() -> list[str]:
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
 @tool_errors
 def list_recent_emails(
-    limit: int = 20, unread_only: bool = False, folder: str = "INBOX"
+    limit: int = 20,
+    unread_only: bool = False,
+    folder: str = "INBOX",
+    before_uid: int | None = None,
 ) -> list[MailSummary]:
-    """Read most recent messages, without marking them read. Maximum 100."""
-    return _mailbox().recent(limit=limit, unread_only=unread_only, folder=folder)
+    """Read most recent messages, newest first, without marking them read. Maximum 100.
+
+    For the next page, pass the smallest uid of the previous page as before_uid.
+    """
+    return _mailbox().recent(
+        limit=limit, unread_only=unread_only, folder=folder, before_uid=before_uid
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
@@ -228,6 +236,7 @@ def search_emails(
     has_attachments: bool | None = None,
     limit: int = 20,
     folder: str = "INBOX",
+    before_uid: int | None = None,
 ) -> list[MailSummary]:
     """Search a folder, newest first. Give at least one criterion; all must match.
 
@@ -237,6 +246,7 @@ def search_emails(
     unread and flagged select by the Seen and Flagged flags when true or false.
     has_attachments filters by MIME structure on this server, checking at most the
     500 newest messages that match the other criteria. Maximum 100 results.
+    For the next page, pass the smallest uid of the previous page as before_uid.
     """
     return _mailbox().search(
         query=query,
@@ -250,6 +260,7 @@ def search_emails(
         has_attachments=has_attachments,
         limit=limit,
         folder=folder,
+        before_uid=before_uid,
     )
 
 
@@ -258,6 +269,18 @@ def search_emails(
 def get_email(uid: int, folder: str = "INBOX") -> MailSummary:
     """Read a message by IMAP UID, without marking it as read."""
     return _mailbox().message(uid=uid, folder=folder)
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@tool_errors
+def get_thread(uid: int, folder: str = "INBOX", limit: int = 50) -> list[ThreadMessage]:
+    """Collect the conversation a message belongs to, oldest first, without marking it read.
+
+    Follows Message-ID, In-Reply-To and References through the given folder, INBOX
+    and the Sent folder. Each result names its folder, since UIDs are per folder.
+    Maximum 100.
+    """
+    return _mailbox().thread(uid=uid, folder=folder, limit=limit)
 
 
 class MoveConfirmation(BaseModel):
