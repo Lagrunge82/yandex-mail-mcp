@@ -76,9 +76,9 @@ The server signs in to IMAP with a Yandex OAuth token (`AUTHENTICATE XOAUTH2`); 
 
 `uv run yandex-mail-mcp logout` revokes the token at Yandex and deletes it. Without `YANDEX_ALLOW_WRITE=true`, `login` asks only for read-only IMAP access; with it, for full access. A read-only token makes the changing tools fail with a hint to sign in again.
 
-Credentials come from the first of these that is set: `YANDEX_OAUTH_TOKEN` with `YANDEX_EMAIL` (a ready access token, for CI and containers; it cannot be refreshed), then the tokens saved by `login`, then the [deprecated app password](#deprecated-app-password-and-static-token).
+Credentials come from the first of these that is set: `YANDEX_OAUTH_TOKEN` with `YANDEX_EMAIL` (a ready access token, for CI and containers; it cannot be refreshed), then the tokens saved by `login`. The app password of earlier releases is no longer accepted: a set `YANDEX_APP_PASSWORD` stops the server with a message pointing at `login`.
 
-For a single-user HTTP endpoint without OAuth sign-in, set `MCP_TRANSPORT=streamable-http`: the endpoint is `http://127.0.0.1:8000/mcp`. A non-loopback `MCP_HOST` requires `MCP_PUBLIC_URL` (below) or the deprecated `MCP_AUTH_TOKEN`.
+For a single-user HTTP endpoint on this machine, set `MCP_TRANSPORT=streamable-http`: the endpoint is `http://127.0.0.1:8000/mcp`, reachable without a token from the loopback interface only. A non-loopback `MCP_HOST` requires `MCP_PUBLIC_URL` (below); the static `MCP_AUTH_TOKEN` of earlier releases is no longer accepted.
 
 ## Shared server for several users (HTTP)
 
@@ -143,7 +143,7 @@ Clients registered while writes were off can do this without re-registering: wha
 
 - **"Your access is read-only. Sign in again with write access: reconnect this server in your MCP client and allow full mail access"** means this connection's token lacks `mail.write`: either the connection was authorized before `YANDEX_ALLOW_WRITE=true`, or *read only* was chosen, or Yandex granted only `mail:imap_ro`. Reconnecting alone does not help if the client reuses its refresh token; follow [Upgrading a read-only connection](#upgrading-a-read-only-connection). `get_connection_capabilities` shows `mcp_scopes` and `yandex_full_mail_access` for the connection.
 - **"Write operations are disabled. Set YANDEX_ALLOW_WRITE=true"**: the server itself refuses changes; this is the operator's setting.
-- **"… needs the user's confirmation, but this MCP client does not support elicitation"** appears only on the local server or with the deprecated static token: there is no browser identity to confirm with. Use a client with elicitation, or the shared HTTP server.
+- **"… needs the user's confirmation, but this MCP client does not support elicitation"** appears only on the local server: there is no browser identity to confirm with. Use a client with elicitation, or the shared HTTP server.
 - **"Folder 'github/ci/cd' not found"**: nested folders are written with the server's delimiter, `|` on Yandex (`github|ci/cd`); the error names the folder it thinks you meant. `list_folders` shows the exact names.
 
 ## Configuration
@@ -156,8 +156,7 @@ Settings come from environment variables. The server and the `login` and `logout
 | `YANDEX_OAUTH_CLIENT_SECRET` | empty | Its secret. `login` uses PKCE and signs in without it, but token refresh has only been checked with the secret set. |
 | `YANDEX_OAUTH_LOOPBACK_PORT` | `8765` | Port of the `http://127.0.0.1:<port>/callback` redirect URI that `login` listens on. |
 | `YANDEX_OAUTH_TOKEN` | empty | A ready Yandex access token, used with `YANDEX_EMAIL` instead of `login`. It cannot be refreshed. |
-| `YANDEX_EMAIL` | empty | The mailbox address, required with `YANDEX_OAUTH_TOKEN` or the deprecated app password. |
-| `YANDEX_APP_PASSWORD` | empty | Deprecated: a Yandex Mail app password, stdio only. |
+| `YANDEX_EMAIL` | empty | The mailbox address, required with `YANDEX_OAUTH_TOKEN`. |
 | `YANDEX_IMAP_HOST` | `imap.yandex.com` | IMAP server. |
 | `YANDEX_IMAP_PORT` | `993` | IMAP port, 1 to 65535; the connection always uses TLS. |
 | `YANDEX_IMAP_POOL_SIZE` | `2` | Logged-in IMAP connections per user kept and reused across tool calls, at least 1. |
@@ -175,7 +174,6 @@ Settings come from environment variables. The server and the `login` and `logout
 | `MCP_AUTH_DB` | `mcp-auth.db` | SQLite file of the MCP clients registered with the shared server. |
 | `MCP_AUTH_RATE_LIMIT` | `30` | Requests per client IP and minute to the sign-in and token endpoints. |
 | `MCP_FORWARDED_ALLOW_IPS` | empty | Proxies whose `X-Forwarded-For` the HTTP server trusts for client addresses. |
-| `MCP_AUTH_TOKEN` | empty | Deprecated: one shared bearer token for the HTTP transport, required on every request except `GET /healthz`. Not combinable with `MCP_PUBLIC_URL`. |
 | `MCP_ALLOWED_HOSTS` | `localhost:*,127.0.0.1:*,[::1]:*`, plus `MCP_HOST:*` for a specific address and the host of `MCP_PUBLIC_URL` | `Host` header values accepted by the DNS rebinding protection. |
 | `MCP_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*,http://[::1]:*`, plus the origin of `MCP_PUBLIC_URL` | `Origin` header values accepted from browsers. |
 
@@ -192,12 +190,9 @@ The server keeps up to `YANDEX_IMAP_POOL_SIZE` logged-in IMAP connections per us
 
 See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
-## Deprecated: app password and static token
+## Removed: app password and static token
 
-These remain for one more release and will then be removed:
-
-- `YANDEX_APP_PASSWORD` with `YANDEX_EMAIL`: a Yandex **Mail app password** (never your account password), used only with the stdio transport and only when no OAuth token is configured. The server logs a warning; run `yandex-mail-mcp login` instead. The HTTP server refuses to start with it, since one password cannot serve several users.
-- `MCP_AUTH_TOKEN`: a single shared bearer token for the HTTP transport without OAuth. It cannot be combined with `MCP_PUBLIC_URL`, and the server logs a warning. `MCP_ALLOW_UNAUTHENTICATED_REMOTE` has been removed: a non-loopback HTTP server needs `MCP_PUBLIC_URL` or `MCP_AUTH_TOKEN`.
+Since 0.7.0 the server signs in to IMAP only with Yandex OAuth. `YANDEX_APP_PASSWORD` and the shared bearer token `MCP_AUTH_TOKEN` (deprecated in 0.5.0) are gone; a server started with either stops with a message naming the replacement: `yandex-mail-mcp login` or `YANDEX_OAUTH_TOKEN` for the local server, `MCP_PUBLIC_URL` for a server reachable from other machines. `MCP_ALLOW_UNAUTHENTICATED_REMOTE` was removed in 0.5.0.
 
 ## Docker image
 

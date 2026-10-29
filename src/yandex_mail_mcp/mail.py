@@ -43,7 +43,6 @@ from .config import RESERVED_FOLDER_NAMES, ConfigurationError, Settings
 from .credentials import (
     Credentials,
     OAuthCredentials,
-    PasswordCredentials,
     StaticTokenSource,
     StoredTokenSource,
     TokenStore,
@@ -684,8 +683,6 @@ def default_credentials(config: Settings) -> Credentials:
             )
         oauth = YandexOAuth(config.oauth_client_id, config.oauth_client_secret.get_secret_value())
         return OAuthCredentials(tokens.email, StoredTokenSource(store, tokens, oauth))
-    if config.app_password is not None:
-        return PasswordCredentials(config.email, config.app_password)
     raise MailError("No Yandex credentials are configured; run `yandex-mail-mcp login`")
 
 

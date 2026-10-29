@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import imaplib
+import logging
 import re
 import socket
 import ssl
@@ -150,14 +151,14 @@ def test_connection_error_without_settings_reaches_client(monkeypatch):
 
 
 def http_settings(monkeypatch, **values):
-    settings = {"imap_host": "imap", "imap_port": 993, "allow_write": False, "app_password": None}
+    settings = {"imap_host": "imap", "imap_port": 993, "allow_write": False}
     monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
     monkeypatch.setattr(server, "load_dotenv", lambda: None)
     monkeypatch.setattr(server, "_settings", lambda: SimpleNamespace(**settings | values))
 
 
 @pytest.mark.parametrize("override", [None, "true"])
-def test_non_loopback_requires_oauth_or_token(monkeypatch, caplog, override):
+def test_non_loopback_requires_the_oauth_server(monkeypatch, caplog, override):
     http_settings(monkeypatch)
     monkeypatch.setenv("MCP_HOST", "0.0.0.0")
     monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
@@ -172,37 +173,32 @@ def test_non_loopback_requires_oauth_or_token(monkeypatch, caplog, override):
     assert ("was removed" in caplog.text) == (override is not None)
 
 
-def test_app_password_is_refused_over_http(monkeypatch):
-    http_settings(monkeypatch, app_password="pw")
-    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
-    with pytest.raises(ValueError, match="only with the stdio transport"):
-        server.main([])
-
-
-def test_static_token_mode_warns_that_it_is_deprecated(monkeypatch, caplog):
+@pytest.mark.parametrize("token", ["secret", "   "])
+def test_static_token_is_refused_with_a_hint(monkeypatch, token):
+    # Removed in 0.7.0: a set token stops the server; a blank one is not a token.
     http_settings(monkeypatch)
-    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
-    monkeypatch.setenv("MCP_AUTH_TOKEN", "secret")
+    monkeypatch.setenv("MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("MCP_AUTH_TOKEN", token)
     monkeypatch.delenv("MCP_PUBLIC_URL", raising=False)
     monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
-    server.main([])
-    assert "MCP_AUTH_TOKEN is deprecated" in caplog.text
-
-
-def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
-    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
-    monkeypatch.setenv("MCP_HOST", "0.0.0.0")
-    monkeypatch.setenv("MCP_AUTH_TOKEN", "   ")
-    monkeypatch.delenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE", raising=False)
-    monkeypatch.setattr(
-        server,
-        "_settings",
-        lambda: SimpleNamespace(
-            imap_host="imap", imap_port=993, allow_write=False, app_password=None
-        ),
-    )
-    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
+    with pytest.raises(ValueError, match="MCP_PUBLIC_URL") as raised:
         server.main([])
+    assert ("no longer supported" in str(raised.value)) == bool(token.strip())
+    assert not hasattr(server, "BearerAuth")
+
+
+def test_loopback_http_serves_without_a_token(monkeypatch, caplog):
+    http_settings(monkeypatch)
+    monkeypatch.setenv("MCP_HOST", "127.0.0.1")
+    monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("MCP_PUBLIC_URL", raising=False)
+    served = {}
+    monkeypatch.setattr(server.mcp, "streamable_http_app", lambda **kwargs: object())
+    monkeypatch.setattr(server.uvicorn, "run", lambda app, **kwargs: served.update(kwargs))
+    with caplog.at_level(logging.INFO):
+        server.main([])
+    assert served["host"] == "127.0.0.1"
+    assert "authentication=none (loopback only)" in caplog.text
 
 
 def test_http_port_outside_the_valid_range_is_rejected(monkeypatch):
@@ -220,34 +216,30 @@ def test_http_port_outside_the_valid_range_is_rejected(monkeypatch):
         server.main([])
 
 
-def test_specific_host_is_allowed_by_default(monkeypatch):
-    monkeypatch.setenv("MCP_TRANSPORT", "streamable-http")
+def test_specific_host_and_public_host_are_allowed_by_default(monkeypatch):
+    http_settings(monkeypatch)
     monkeypatch.setenv("MCP_HOST", "192.168.1.5")
-    monkeypatch.setenv("MCP_AUTH_TOKEN", "secret")
+    monkeypatch.setenv("MCP_PUBLIC_URL", "https://mail.example")
+    monkeypatch.setenv("MCP_TOKEN_ENCRYPTION_KEYS", "k1:unused")
+    monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("MCP_ALLOWED_HOSTS", raising=False)
-    monkeypatch.setattr(server, "load_dotenv", lambda: None)
-    monkeypatch.setattr(
-        server,
-        "_settings",
-        lambda: SimpleNamespace(
-            imap_host="imap", imap_port=993, allow_write=False, app_password=None
-        ),
-    )
     captured = {}
 
-    def app(**kwargs):
-        captured.update(kwargs)
+    def build(settings, public_url, keys, db_path, *, host, security):
+        captured.update(public_url=public_url, host=host, security=security)
         return object()
 
-    monkeypatch.setattr(server.mcp, "streamable_http_app", app)
+    monkeypatch.setattr(server, "build_oauth_app", build)
     monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
     server.main([])
-    assert "192.168.1.5:*" in captured["transport_security"].allowed_hosts
+    assert captured["public_url"] == "https://mail.example"
+    assert "192.168.1.5:*" in captured["security"].allowed_hosts
+    assert "mail.example" in captured["security"].allowed_hosts
 
 
 def test_settings_are_cached_and_write_flag_does_not_change(monkeypatch):
     monkeypatch.setenv("YANDEX_EMAIL", "test@example.com")
-    monkeypatch.setenv("YANDEX_APP_PASSWORD", "test")
+    monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "test")
     monkeypatch.setenv("YANDEX_ALLOW_WRITE", "false")
     server._settings.cache_clear()
     try:
@@ -261,13 +253,13 @@ def test_settings_are_cached_and_write_flag_does_not_change(monkeypatch):
 
 def test_imported_server_loads_dotenv_before_first_tool(monkeypatch):
     monkeypatch.delenv("YANDEX_EMAIL", raising=False)
-    monkeypatch.delenv("YANDEX_APP_PASSWORD", raising=False)
+    monkeypatch.delenv("YANDEX_OAUTH_TOKEN", raising=False)
     calls = []
 
     def load():
         calls.append(1)
         monkeypatch.setenv("YANDEX_EMAIL", "test@example.com")
-        monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+        monkeypatch.setenv("YANDEX_OAUTH_TOKEN", "secret")
 
     monkeypatch.setattr(server, "load_dotenv", load)
     server._settings.cache_clear()
@@ -277,42 +269,6 @@ def test_imported_server_loads_dotenv_before_first_tool(monkeypatch):
         assert calls == [1]
     finally:
         server._settings.cache_clear()
-
-
-def test_bearer_auth_rejects_missing_and_wrong_token():
-    calls = []
-
-    async def app(scope, receive, send):
-        calls.append(scope)
-
-    async def run(headers):
-        sent = []
-
-        async def receive():
-            return {"type": "http.request", "body": b""}
-
-        async def send(message):
-            sent.append(message)
-
-        await server.BearerAuth(app, "secret")({"type": "http", "headers": headers}, receive, send)
-        return sent
-
-    for headers in (
-        [],
-        [(b"authorization", b"Bearer wrong")],
-        [(b"authorization", b"Bearer secret"), (b"authorization", b"Bearer secret")],
-    ):
-        assert asyncio.run(run(headers))[0]["status"] == 401
-    for headers in (
-        [(b"authorization", b"Basic secret")],
-        [(b"authorization", b"Bearersecret")],
-        [(b"authorization", b"Bearer")],
-        [(b"authorization", b"secret")],
-    ):
-        assert asyncio.run(run(headers))[0]["status"] == 401
-    for value in (b"Bearer secret", b"bearer secret", b"BEARER secret", b"Bearer  secret"):
-        assert asyncio.run(run([(b"authorization", value)])) == []
-    assert len(calls) == 4
 
 
 @pytest.mark.parametrize(
@@ -403,7 +359,7 @@ def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
 
     box = Mailbox(
         Settings(
-            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder="Spam|x"
+            email="test@yandex.com", oauth_token="x", allow_write=True, promotions_folder="Spam|x"
         )
     )
     box.connect = connect
@@ -422,43 +378,6 @@ def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
     assert moved == []
 
 
-def test_healthz_is_public_but_mcp_still_requires_token():
-    app = server.BearerAuth(
-        server.mcp.streamable_http_app(host="127.0.0.1", transport_security=None), "secret"
-    )
-
-    async def get(path):
-        sent = []
-
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(message):
-            sent.append(message)
-
-        scope = {
-            "type": "http",
-            "asgi": {"version": "3.0"},
-            "http_version": "1.1",
-            "method": "GET",
-            "scheme": "http",
-            "path": path,
-            "raw_path": path.encode(),
-            "root_path": "",
-            "query_string": b"",
-            "headers": [(b"host", b"127.0.0.1:8000")],
-            "client": ("127.0.0.1", 1234),
-            "server": ("127.0.0.1", 8000),
-        }
-        await app(scope, receive, send)
-        body = b"".join(message.get("body", b"") for message in sent[1:])
-        return sent[0]["status"], body
-
-    assert asyncio.run(get("/healthz")) == (200, b"ok")
-    assert asyncio.run(get("/mcp"))[0] == 401
-    assert asyncio.run(get("/healthz/"))[0] == 401
-
-
 def test_login_error_reaches_client_without_details(monkeypatch):
     class Box:
         def folders(self):
@@ -468,23 +387,6 @@ def test_login_error_reaches_client_without_details(monkeypatch):
     with pytest.raises(ToolError, match="IMAP authentication failed") as raised:
         asyncio.run(server.mcp.call_tool("list_folders", {}))
     assert "user@yandex.ru" not in str(raised.value)
-
-
-def test_bearer_auth_passes_lifespan_without_token():
-    # StreamableHTTPSessionManager starts in the lifespan, which carries no headers.
-    calls = []
-
-    async def app(scope, receive, send):
-        calls.append(scope["type"])
-
-    async def receive():
-        return {"type": "lifespan.startup"}
-
-    async def send(message):
-        raise AssertionError(f"unexpected response: {message}")
-
-    asyncio.run(server.BearerAuth(app, "secret")({"type": "lifespan"}, receive, send))
-    assert calls == ["lifespan"]
 
 
 def test_reauthentication_message_reaches_the_tool_caller(monkeypatch):

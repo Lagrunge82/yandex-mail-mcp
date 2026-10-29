@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import errno
-import hmac
 import imaplib
 import inspect
 import json
@@ -39,7 +38,7 @@ from pydantic import BaseModel, Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp
 
 from . import login
 from .auth_server import (
@@ -435,28 +434,6 @@ def _mailbox() -> Mailbox:
         return mailbox
 
 
-class BearerAuth:
-    # The health check reveals nothing, so Compose can probe it without the token.
-    public_paths = frozenset({"/healthz"})
-
-    def __init__(self, app: ASGIApp, token: str) -> None:
-        self.app = app
-        self.token = token
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope.get("path") not in self.public_paths:
-            headers = [value for key, value in scope["headers"] if key.lower() == b"authorization"]
-            scheme, _, credentials = headers[0].partition(b" ") if len(headers) == 1 else (b"",) * 3
-            if scheme.lower() != b"bearer" or not hmac.compare_digest(
-                credentials.lstrip(b" "), self.token.encode("utf-8")
-            ):
-                await PlainTextResponse(
-                    "Unauthorized", status_code=401, headers={"WWW-Authenticate": "Bearer"}
-                )(scope, receive, send)
-                return
-        await self.app(scope, receive, send)
-
-
 async def healthz(request: Request) -> Response:
     """Report that the HTTP server is serving, without logging in to IMAP."""
     return PlainTextResponse("ok")
@@ -736,7 +713,7 @@ def _browser_confirmation_available() -> bool:
     """Whether a change can be confirmed on this server's web page instead of in the client.
 
     Only users of the HTTP authorization server have a browser identity the page can
-    check; the local server and the deprecated static token have none.
+    check; the local server has none.
     """
     return (
         _confirmations is not None
@@ -1054,28 +1031,19 @@ def main(argv: list[str] | None = None) -> None:
     elif transport == "streamable-http":
         host = os.getenv("MCP_HOST", "127.0.0.1").strip()
         port = env_port("MCP_PORT", 8000)
-        token = os.getenv("MCP_AUTH_TOKEN", "").strip()
         public_url = _public_url()
-        if public_url and token:
+        if os.getenv("MCP_AUTH_TOKEN", "").strip():
+            # Removed in 0.7.0: a shared static token cannot tell users apart.
             raise ConfigurationError(
-                "Set either MCP_PUBLIC_URL (OAuth) or MCP_AUTH_TOKEN, not both"
-            )
-        if settings.app_password is not None:
-            # One password shared by every HTTP user contradicts per-user sign-in.
-            raise ConfigurationError(
-                "YANDEX_APP_PASSWORD works only with the stdio transport; over HTTP use "
-                "MCP_PUBLIC_URL (each user signs in with Yandex) or YANDEX_OAUTH_TOKEN"
+                "MCP_AUTH_TOKEN is no longer supported: set MCP_PUBLIC_URL so that each user "
+                "signs in with Yandex, and remove the token"
             )
         if os.getenv("MCP_ALLOW_UNAUTHENTICATED_REMOTE") is not None:
             logging.warning("MCP_ALLOW_UNAUTHENTICATED_REMOTE was removed in 0.5.0 and is ignored")
-        if host not in {"127.0.0.1", "localhost", "::1"} and not token and not public_url:
+        if host not in {"127.0.0.1", "localhost", "::1"} and not public_url:
             raise ConfigurationError(
-                "A non-loopback MCP_HOST requires MCP_PUBLIC_URL (OAuth) or MCP_AUTH_TOKEN"
-            )
-        if token:
-            logging.warning(
-                "MCP_AUTH_TOKEN is deprecated and will be removed in the next minor release; "
-                "set MCP_PUBLIC_URL to let users sign in with Yandex"
+                "A non-loopback MCP_HOST requires MCP_PUBLIC_URL, so that users sign in with "
+                "Yandex; a loopback host serves one user without a token"
             )
         default_hosts = "localhost:*,127.0.0.1:*,[::1]:*"
         if host not in {"localhost", "127.0.0.1", "::1", "0.0.0.0", "::"}:
@@ -1108,9 +1076,8 @@ def main(argv: list[str] | None = None) -> None:
             app = build_oauth_app(settings, public_url, keys, db_path, host=host, security=security)
             authentication = f"OAuth via {public_url}"
         else:
-            http_app = mcp.streamable_http_app(host=host, transport_security=security)
-            app = BearerAuth(http_app, token) if token else http_app
-            authentication = "static token" if token else "none"
+            app = mcp.streamable_http_app(host=host, transport_security=security)
+            authentication = "none (loopback only)"
         logging.info("MCP HTTP listening on %s:%s; authentication=%s", host, port, authentication)
         uvicorn.run(
             app,
