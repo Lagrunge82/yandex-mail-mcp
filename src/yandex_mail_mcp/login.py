@@ -19,7 +19,7 @@ from typing import Any
 
 from .config import ConfigurationError, env_bool, env_int
 from .credentials import StoredTokens, TokenStore
-from .yandex_oauth import YandexOAuth, YandexOAuthError, pkce_pair, requested_scope
+from .yandex_oauth import YandexOAuth, YandexOAuthError, can_write, pkce_pair, requested_scope
 
 CALLBACK_PATH = "/callback"
 
@@ -52,19 +52,22 @@ def wait_for_callback(
             query = urllib.parse.parse_qs(url.query)
             state = query.get("state", [""])[0]
             if not hmac.compare_digest(state.encode(), expected_state.encode()):
-                result.update(code=None, error="the state parameter did not match")
-            elif "code" in query:
+                # A stale tab or another attempt: refuse it, keep waiting for ours.
+                self._answer(400, "Sign-in failed: this link belongs to another sign-in attempt.")
+                return
+            if "code" in query:
                 result.update(code=query["code"][0], error=None)
             else:
                 error = query.get("error_description", query.get("error", ["no code"]))[0]
                 result.update(code=None, error=error)
-            message = (
-                "Signed in. You can close this tab."
-                if result.get("code")
-                else f"Sign-in failed: {result.get('error')}"
-            )
+            if result.get("code"):
+                self._answer(200, "Signed in. You can close this tab.")
+            else:
+                self._answer(400, f"Sign-in failed: {result.get('error')}")
+
+        def _answer(self, status: int, message: str) -> None:
             body = f"<!doctype html><meta charset=utf-8><p>{html.escape(message)}</p>".encode()
-            self.send_response(200 if result.get("code") else 400)
+            self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -127,7 +130,7 @@ def login(
         scope=tokens.scope,
     )
     where = store.save(stored)
-    access = "read and write" if "mail:imap_full" in stored.scope.split() else "read-only"
+    access = "read and write" if can_write(stored.scope) else "read-only"
     output(f"Signed in as {user.email} ({access} IMAP access); tokens saved in {where}.")
     return stored
 

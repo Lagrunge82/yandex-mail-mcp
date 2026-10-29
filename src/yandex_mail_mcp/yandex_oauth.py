@@ -79,6 +79,8 @@ def _send(request: urllib.request.Request) -> dict[str, Any]:
             data = json.loads(body)
         except ValueError:
             raise YandexOAuthError("http_error", f"HTTP {exc.code}") from exc
+        if not isinstance(data, dict):
+            raise YandexOAuthError("http_error", f"HTTP {exc.code}") from exc
         raise YandexOAuthError(
             str(data.get("error", f"http_{exc.code}")), str(data.get("error_description", ""))
         ) from exc

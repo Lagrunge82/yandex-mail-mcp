@@ -189,11 +189,17 @@ def test_default_credentials_follow_settings():
         default_credentials(Settings(email="a", app_password="p")), PasswordCredentials
     )
     TokenStore().save(STORED)
-    stored = default_credentials(Settings(email="ivan@yandex.ru", stored_tokens=True))
+    with pytest.raises(ConfigurationError, match="YANDEX_OAUTH_CLIENT_ID"):
+        default_credentials(Settings(email="ivan@yandex.ru", stored_tokens=True))
+    stored = default_credentials(
+        Settings(email="ivan@yandex.ru", stored_tokens=True, oauth_client_id="cid")
+    )
     assert isinstance(stored.source, StoredTokenSource)
     TokenStore().delete()
     with pytest.raises(MailError, match="login"):
-        default_credentials(Settings(email="ivan@yandex.ru", stored_tokens=True))
+        default_credentials(
+            Settings(email="ivan@yandex.ru", stored_tokens=True, oauth_client_id="cid")
+        )
     with pytest.raises(MailError, match="No Yandex credentials"):
         default_credentials(Settings(email="a"))
 
@@ -367,6 +373,13 @@ def test_send_reports_yandex_errors(monkeypatch):
     def unreachable(request, timeout):
         raise OSError("Network is unreachable")
 
+    def listed(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"[]"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", listed)
+    with pytest.raises(YandexOAuthError, match="http_error: HTTP 502"):
+        _send(urllib.request.Request("https://oauth.yandex.ru/token"))
+
     monkeypatch.setattr(urllib.request, "urlopen", unreachable)
     with pytest.raises(YandexOAuthError, match="unavailable"):
         _send(urllib.request.Request("https://oauth.yandex.ru/token"))
@@ -438,22 +451,31 @@ def test_login_runs_pkce_flow_and_saves_tokens(tmp_path, monkeypatch):
     assert "read and write" in lines[-1]
 
 
-def test_login_rejects_wrong_state(tmp_path):
+def test_wrong_state_is_refused_and_the_real_callback_still_works(tmp_path):
+    statuses = []
+
     def open_browser(url):
         query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
-        target = f"{query['redirect_uri']}?state=forged&code=stolen"
-        threading.Thread(target=visit, args=(target,), daemon=True).start()
+        callback = query["redirect_uri"]
+
+        def browse():
+            # A stale tab with another attempt's state arrives first.
+            statuses.append(visit(f"{callback}?state=forged&code=stolen"))
+            real = urllib.parse.urlencode({"state": query["state"], "code": "real"})
+            statuses.append(visit(f"{callback}?{real}"))
+
+        threading.Thread(target=browse, daemon=True).start()
 
     oauth = LoginOAuth()
-    with pytest.raises(login_module.LoginError, match="state"):
-        login_module.login(
-            oauth=oauth,
-            store=TokenStore(tmp_path / "t.json"),
-            open_browser=open_browser,
-            output=lambda line: None,
-            server=loopback(),
-        )
-    assert oauth.exchanged == []
+    login_module.login(
+        oauth=oauth,
+        store=TokenStore(tmp_path / "t.json"),
+        open_browser=open_browser,
+        output=lambda line: None,
+        server=loopback(),
+    )
+    assert [code for code, _ in oauth.exchanged] == ["real"]
+    assert statuses == [400, 200]
 
 
 def test_login_reports_denied_access(tmp_path):

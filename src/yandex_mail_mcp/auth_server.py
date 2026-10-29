@@ -45,6 +45,9 @@ SCOPE_WRITE = "mail.write"
 START_PATH = "/oauth/yandex/start"
 CALLBACK_PATH = "/oauth/yandex/callback"
 NONCE_COOKIE = "mcp_auth_nonce"
+# Yandex limits its state parameter; the sealed state carries the client's own state.
+YANDEX_MAX_STATE = 1024
+MAX_CLIENT_STATE = 256
 
 STATE_TTL = 600
 CODE_TTL = 60
@@ -210,6 +213,8 @@ class YandexAuthProvider(
     ) -> str:
         if params.resource and params.resource.rstrip("/") != self.resource:
             raise AuthorizeError("invalid_target", "This server only issues tokens for its /mcp")
+        if params.state and len(params.state) > MAX_CLIENT_STATE:
+            raise AuthorizeError("invalid_request", f"state exceeds {MAX_CLIENT_STATE} characters")
         state = self.cipher.seal(
             "state",
             {
@@ -224,6 +229,9 @@ class YandexAuthProvider(
             },
             STATE_TTL,
         )
+        if len(state) > YANDEX_MAX_STATE:
+            # Yandex rejects longer states with an error page the client never learns about.
+            raise AuthorizeError("invalid_request", "redirect_uri or state is too long")
         # The start route sets the nonce cookie: provider.authorize can only return a URL.
         return f"{self.public_url}{START_PATH}?{urlencode({'state': state})}"
 
@@ -255,6 +263,10 @@ class YandexAuthProvider(
         response.delete_cookie(NONCE_COOKIE, path=CALLBACK_PATH)
         return response
 
+    def allowed(self, login: str) -> bool:
+        """Whether a login may use the server; checked on every token, not only at sign-in."""
+        return login.casefold() in self.allowed_users
+
     async def check_user(self, user: YandexUser, yandex_token: str) -> str | None:
         """An error message when this Yandex user may not sign in, else None.
 
@@ -265,7 +277,7 @@ class YandexAuthProvider(
                 "This server lets no one sign in yet: its operator must list the allowed "
                 "Yandex logins in MCP_ALLOWED_USERS."
             )
-        elif {user.login.casefold(), user.email.casefold()} & self.allowed_users:
+        elif self.allowed(user.login) or self.allowed(user.email):
             return None
         else:
             message = f"The Yandex account {user.login} is not allowed on this server."
@@ -292,8 +304,10 @@ class YandexAuthProvider(
                 error_description=f"Yandex sign-in failed: {error}",
             )
         try:
+            # Yandex may not echo the granted scope; fall back to what start() requested.
+            scope = requested_scope(self.allow_write and SCOPE_WRITE in payload["scopes"])
             tokens = await anyio.to_thread.run_sync(
-                lambda: self.oauth.exchange_code(code, redirect_uri=self.callback_url)
+                lambda: self.oauth.exchange_code(code, redirect_uri=self.callback_url, scope=scope)
             )
             user = await anyio.to_thread.run_sync(lambda: self.oauth.user(tokens.access_token))
         except YandexOAuthError as exc:
@@ -302,7 +316,8 @@ class YandexAuthProvider(
                 payload, error="server_error", error_description="Yandex rejected the sign-in"
             )
         if (denied := await self.check_user(user, tokens.access_token)) is not None:
-            return _page(denied, status=403)
+            # Tell the MCP client at once, instead of leaving it waiting for its callback.
+            return self._client_redirect(payload, error="access_denied", error_description=denied)
         grant = {
             "yandex_access_token": tokens.access_token,
             "yandex_refresh_token": tokens.refresh_token,
@@ -345,6 +360,10 @@ class YandexAuthProvider(
             jti=payload["jti"],
         )
 
+    def _grant_allowed(self, grant: dict[str, Any]) -> bool:
+        # Removing someone from MCP_ALLOWED_USERS ends their tokens, not just new sign-ins.
+        return self.allowed(str(grant["login"])) or self.allowed(str(grant["email"]))
+
     def _issue(self, client_id: str, scopes: list[str], grant: dict[str, Any]) -> OAuthToken:
         now = self._clock()
         if not can_write(str(grant["yandex_scope"])):
@@ -377,6 +396,8 @@ class YandexAuthProvider(
         if payload is None:
             return None
         grant = payload["grant"]
+        if not self._grant_allowed(grant):
+            return None
         return AccessToken(
             token=token,
             client_id=payload["client_id"],
@@ -398,6 +419,8 @@ class YandexAuthProvider(
     ) -> YandexRefreshToken | None:
         payload = self.cipher.open(refresh_token, "refresh")
         if payload is None or payload["client_id"] != client.client_id:
+            return None
+        if not self._grant_allowed(payload["grant"]):
             return None
         return YandexRefreshToken(
             token=refresh_token,

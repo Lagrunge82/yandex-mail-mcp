@@ -21,7 +21,7 @@ from yandex_mail_mcp import server
 from yandex_mail_mcp.auth_server import RateLimit
 from yandex_mail_mcp.config import Settings
 from yandex_mail_mcp.mail import Mailbox
-from yandex_mail_mcp.yandex_oauth import YandexUser
+from yandex_mail_mcp.yandex_oauth import YandexTokens, YandexUser
 
 
 @pytest.fixture(autouse=True)
@@ -33,11 +33,11 @@ def run_sync_inline(monkeypatch):
 
 
 @contextmanager
-def signed_in(scope, login="ivan", token="ya-secret-token-123"):
+def signed_in(scope, login="ivan", token="ya-secret-token-123", scopes=("mail.read", "mail.write")):
     access = AccessToken(
         token="bearer",
         client_id="client-1",
-        scopes=["mail.read"],
+        scopes=list(scopes),
         claims={
             "yandex_access_token": token,
             "yandex_login": login,
@@ -115,17 +115,20 @@ def callback_with(yandex, allowed, monkeypatch):
 def test_user_outside_allowlist_is_refused_and_revoked(monkeypatch):
     yandex = FakeYandex(users={"yc": YandexUser("mallory", "mallory@yandex.ru")})
     response = callback_with(yandex, "ivan, anna@company.ru", monkeypatch)
-    assert response.status_code == 403
-    assert "mallory is not allowed" in response.text
-    assert "location" not in response.headers
+    # The client hears at once, with the reason, and gets no code.
+    query = query_of(response.headers["location"])
+    assert query["error"] == "access_denied"
+    assert "mallory is not allowed" in query["error_description"]
+    assert "code" not in query
     assert yandex.revoked == ["ya-access-yc"]
 
 
 def test_empty_allowlist_refuses_everyone(monkeypatch):
     yandex = FakeYandex()
     response = callback_with(yandex, "", monkeypatch)
-    assert response.status_code == 403
-    assert "MCP_ALLOWED_USERS" in response.text
+    query = query_of(response.headers["location"])
+    assert query["error"] == "access_denied"
+    assert "MCP_ALLOWED_USERS" in query["error_description"]
     assert yandex.revoked == ["ya-access-yc"]
 
 
@@ -215,3 +218,100 @@ def test_oauth_app_limits_auth_endpoints(monkeypatch):
 
     statuses, _ = run_flow(scenario)
     assert statuses == [201, 201, 429]
+
+
+def test_token_without_mail_write_cannot_change_mail(user_mailboxes):
+    # Yandex granted full access, but this client's token was narrowed to mail.read.
+    client = Client()
+    with signed_in("mail:imap_full", scopes=["mail.read"]), pytest.raises(ToolError) as raised:
+        asyncio.run(server.mark_read(3, client))
+    assert "read-only" in str(raised.value)
+    assert client.messages == []
+
+
+def test_removed_user_loses_access_and_refresh(monkeypatch):
+    async def scenario(flow):
+        client_id, tokens = await flow.sign_in()
+        app_provider = flow.provider
+        app_provider.allowed_users = frozenset()
+        listed = await flow.mcp(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "1"},
+            },
+            tokens["access_token"],
+        )
+        refreshed = await flow.client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+                "client_id": client_id,
+            },
+        )
+        return listed, refreshed
+
+    monkeypatch.setenv("MCP_ALLOWED_USERS", "ivan")
+    (listed, refreshed), yandex = run_flow(scenario)
+    assert listed.status_code == 401
+    assert refreshed.json()["error"] == "invalid_grant"
+    assert yandex.refreshed == []
+
+
+class SilentScopeYandex(FakeYandex):
+    """Yandex that does not echo the granted scope in its token response."""
+
+    def exchange_code(self, code, **kwargs):
+        tokens = super().exchange_code(code, **kwargs)
+        return YandexTokens(
+            tokens.access_token, tokens.refresh_token, tokens.expires_at, kwargs.get("scope", "")
+        )
+
+
+def test_requested_scope_is_kept_when_yandex_does_not_echo_it(monkeypatch):
+    monkeypatch.setenv("MCP_ALLOWED_USERS", "ivan")
+
+    async def scenario(flow):
+        return (await flow.sign_in())[1]
+
+    tokens, _ = run_flow(
+        scenario, yandex=SilentScopeYandex(scope=""), settings=Settings(allow_write=True)
+    )
+    assert tokens["scope"] == "mail.read mail.write"
+
+
+def test_overlong_client_state_is_refused(monkeypatch):
+    monkeypatch.setenv("MCP_ALLOWED_USERS", "ivan")
+
+    async def scenario(flow):
+        client_id = await flow.register()
+        return await flow.client.get(
+            "/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": "http://localhost:9999/cb",
+                "code_challenge": "x" * 43,
+                "code_challenge_method": "S256",
+                "state": "s" * 300,
+            },
+        )
+
+    response, _ = run_flow(scenario)
+    query = query_of(response.headers["location"])
+    assert query["error"] == "invalid_request"
+    assert "state" in query["error_description"]
+
+
+def test_typical_sealed_state_fits_yandex_limit(monkeypatch):
+    monkeypatch.setenv("MCP_ALLOWED_USERS", "ivan")
+
+    async def scenario(flow):
+        client_id = await flow.register()
+        state, _ = await flow.to_callback(client_id)
+        return state
+
+    state, _ = run_flow(scenario)
+    assert len(state) < 1024
