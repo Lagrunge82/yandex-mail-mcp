@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A client that declares elicitation over a transport that cannot deliver it (the stateless HTTP server, or the single-exchange protocol, where the SDK raises `NoBackChannelError`) is now confirmed in the browser on the shared server, like a client without elicitation: the changing tools return `confirmation_required` with a `confirm_url` instead of failing, and nothing changes until the owner approves. The server checks the channel before asking and also catches the error if the send fails anyway; a declined confirmation or any other error never falls back. On the local server the error names the transport. `get_connection_capabilities` reports `confirmation: browser_link` for such connections and a new `transport_delivers_elicitation` field.
+
 ## 0.7.0
 
 ### Removed

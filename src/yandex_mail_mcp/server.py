@@ -33,6 +33,7 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, Re
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.exceptions import NoBackChannelError
 from mcp.types import ClientCapabilities, ElicitationCapability, ToolAnnotations
 from pydantic import BaseModel, Field
 from starlette.applications import Starlette
@@ -546,7 +547,9 @@ async def get_connection_capabilities(ctx: Context) -> dict[str, Any]:
     settings = _settings()
     token, claims = _signed_in()
     mailbox = _mailbox()
-    elicitation = _client_can_elicit(ctx)
+    declared = _client_declares_elicitation(ctx)
+    deliverable = _channel_delivers_requests(ctx)
+    elicitation = declared and deliverable
     info: dict[str, Any] = {"server_allows_write": settings.allow_write}
     if token is not None and "yandex_access_token" in claims:
         info["connection"] = "http_oauth"
@@ -562,7 +565,10 @@ async def get_connection_capabilities(ctx: Context) -> dict[str, Any]:
         info["yandex_full_mail_access"] = None if scope is None else can_write(scope)
     write_error = await anyio.to_thread.run_sync(lambda: _write_error(mailbox))
     info["write_available"] = write_error is None
-    info["client_supports_elicitation"] = elicitation
+    info["client_supports_elicitation"] = declared
+    # A client may declare elicitation over a transport that cannot deliver the question
+    # (stateless HTTP, or the single-exchange protocol); it then confirms in the browser.
+    info["transport_delivers_elicitation"] = deliverable
     if elicitation:
         confirmation = "elicitation"
     elif _browser_confirmation_available():
@@ -575,9 +581,10 @@ async def get_connection_capabilities(ctx: Context) -> dict[str, Any]:
         info["action_needed"] = write_error
     elif confirmation == "unavailable":
         info["action_needed"] = (
-            "Changes cannot be confirmed from this client: it has no elicitation, and only "
-            "users of the HTTP server with MCP_PUBLIC_URL can confirm in the browser. Use "
-            "a client with elicitation"
+            "Changes cannot be confirmed from this client: "
+            + _no_elicitation_reason(declared)
+            + ", and only users of the HTTP server with MCP_PUBLIC_URL can confirm in the "
+            "browser. Use a client with elicitation"
             + (
                 "; MCP_CONFIRM_REVERSIBLE=false would skip confirmation for flags and drafts"
                 if settings.confirm_reversible
@@ -666,14 +673,7 @@ async def _confirmed_mutation(
         # The SDK would send the request anyway and surface the client's generic
         # "method not found" error; say what is missing instead.
         raise ToolError(
-            f"{name} needs the user's confirmation, but this MCP client does not support "
-            "elicitation. Use a client that does"
-            + (
-                ", or set MCP_CONFIRM_REVERSIBLE=false to skip confirmation for this "
-                "reversible change"
-                if reversible
-                else ""
-            )
+            _cannot_confirm(name, reversible, transport=_client_declares_elicitation(ctx))
         )
     message, target = await anyio.to_thread.run_sync(preview)
     if confirm:
@@ -697,15 +697,67 @@ async def _confirmed_mutation(
             )
         if not elicitation:
             return _park_for_browser(name, text, lambda: action(target))
-        result = await ctx.elicit(text, schema=MoveConfirmation)
+        try:
+            result = await ctx.elicit(text, schema=MoveConfirmation)
+        except NoBackChannelError:
+            # The client declares elicitation, but this request's channel cannot carry
+            # the question after all (the session did not say so, or closed meanwhile).
+            # Only this failure to ask falls back to the browser: a decline or any
+            # other error never does, and the user is still asked before anything.
+            if _browser_confirmation_available():
+                return _park_for_browser(name, text, lambda: action(target))
+            raise ToolError(_cannot_confirm(name, reversible, transport=True)) from None
         if result.action != "accept" or not result.data.approve:
             raise ToolError(f"{name} was not approved")
     return await anyio.to_thread.run_sync(lambda: action(target))
 
 
 def _client_can_elicit(ctx: Context) -> bool:
+    """Whether this client can be asked to confirm a change inside the conversation.
+
+    Two things must hold: the client declares the elicitation capability, and the
+    channel of this request can deliver a server-initiated request. The stateless
+    HTTP server and the single-exchange protocol (2026-07-28) answer each POST on its
+    own, so the client's reply to a question has nowhere to land, and the SDK raises
+    NoBackChannelError instead of asking. Such a client confirms in the browser.
+    """
+    return _client_declares_elicitation(ctx) and _channel_delivers_requests(ctx)
+
+
+def _client_declares_elicitation(ctx: Context) -> bool:
     return bool(
         ctx.session.check_client_capability(ClientCapabilities(elicitation=ElicitationCapability()))
+    )
+
+
+def _channel_delivers_requests(ctx: Context) -> bool:
+    # A session without the property (an older SDK) is assumed able; the failure to
+    # send is then caught where the question is asked.
+    return bool(getattr(ctx.session, "can_send_request", True))
+
+
+def _no_elicitation_reason(declared: bool) -> str:
+    if declared:
+        return (
+            "this MCP client declares elicitation, but its transport cannot deliver the "
+            "confirmation request (a stateless or single-exchange HTTP connection)"
+        )
+    return "this MCP client does not support elicitation"
+
+
+def _cannot_confirm(name: str, reversible: bool, *, transport: bool) -> str:
+    """The error for a change that cannot be confirmed anywhere; nothing is changed.
+
+    transport: the client declares elicitation and the transport is what fails.
+    """
+    return (
+        f"{name} needs the user's confirmation, but {_no_elicitation_reason(transport)}. "
+        "Use a client that does"
+        + (
+            ", or set MCP_CONFIRM_REVERSIBLE=false to skip confirmation for this reversible change"
+            if reversible
+            else ""
+        )
     )
 
 

@@ -2,6 +2,7 @@
 
 import asyncio
 import re
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -9,7 +10,9 @@ import anyio.to_thread
 import httpx2 as httpx
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import NoBackChannelError
 from test_auth_server import CHALLENGE, PUBLIC, REDIRECT, FakeYandex, query_of, run_flow
+from test_batch_move import BatchIMAP
 from test_mutations import WriteIMAP
 from test_permissions import signed_in
 
@@ -39,14 +42,23 @@ def run_sync_inline(monkeypatch):
 
 
 class Client:
-    """An MCP client; elicitation support is a parameter."""
+    """An MCP client; elicitation support, the back-channel and the answer are parameters.
 
-    def __init__(self, elicitation=True, approve=True):
-        self.session = SimpleNamespace(check_client_capability=lambda capability: elicitation)
+    back_channel is what the SDK session reports as can_send_request; fails is an
+    exception the send of the question raises, as the SDK does without a back-channel.
+    """
+
+    def __init__(self, elicitation=True, approve=True, back_channel=True, fails=None):
+        self.session = SimpleNamespace(
+            check_client_capability=lambda capability: elicitation, can_send_request=back_channel
+        )
         self.approve = approve
+        self.fails = fails
         self.messages = []
 
     async def elicit(self, message, schema):
+        if self.fails is not None:
+            raise self.fails
         self.messages.append(message)
         return SimpleNamespace(action="accept", data=SimpleNamespace(approve=self.approve))
 
@@ -369,6 +381,117 @@ def test_local_client_without_elicitation_still_gets_the_plain_error(monkeypatch
     ):
         asyncio.run(server.move_email(3, "github", Client(elicitation=False)))
     assert imap.changes == []
+
+
+# --- Elicitation declared, but the transport cannot carry it ----------------------------
+
+
+def test_declared_elicitation_without_a_back_channel_is_confirmed_in_the_browser(monkeypatch):
+    """The stateless HTTP server or the single-exchange protocol: the client declares
+    elicitation, but the SDK cannot deliver the question (NoBackChannelError)."""
+    imap = BatchIMAP()
+    clock = [0.0]
+    seen = {}
+
+    async def scenario(flow):
+        await flow.sign_in()
+        base = time.time()
+        monkeypatch.setattr(server._confirmations, "_clock", lambda: base + clock[0])
+        client = Client(back_channel=False, fails=NoBackChannelError("elicitation/create"))
+        with user_mailbox(monkeypatch, imap), signed_in(FULL):
+            seen["single"] = await server.move_email(3, "github|ci/cd", client)
+            seen["batch"] = await server.move_emails([4, 5], "github|ci/cd", client)
+            assert imap.changes == [], "nothing moves before the approval"
+            url = seen["batch"]["confirm_url"]
+            seen["page"] = await flow.client.get(url)
+            seen["approved"] = await flow.client.post(url, data={"decision": "approve"})
+            seen["again"] = await flow.client.post(url, data={"decision": "approve"})
+            clock[0] = 601  # The single move is approved too late.
+            seen["expired"] = await flow.client.post(
+                seen["single"]["confirm_url"], data={"decision": "approve"}
+            )
+        return seen
+
+    seen, _ = run_flow(scenario, settings=Settings(allow_write=True), yandex=FakeYandex(scope=FULL))
+    for parked in (seen["single"], seen["batch"]):
+        assert parked["status"] == "confirmation_required"
+        assert parked["confirm_url"].startswith(f"{PUBLIC}/confirm/")
+    page = seen["page"]
+    assert page.status_code == 200 and "UID 4" in page.text and "UID 5" in page.text
+    assert "Done." in seen["approved"].text and "Done." in seen["again"].text
+    assert "expired or does not exist" in seen["expired"].text
+    assert imap.changes == [("move", [4, 5], "github|ci/cd")], "once; the expired one never"
+    assert "moved: [4, 5]" in seen["approved"].text and "ya-" not in seen["approved"].text
+
+
+def test_a_question_the_transport_refuses_to_send_falls_back_to_the_browser(monkeypatch):
+    """The session claimed a back-channel, but the send still raised: same fallback."""
+    imap = WriteIMAP(folders=github_folders())
+
+    async def scenario(flow):
+        await flow.sign_in()
+        client = Client(fails=NoBackChannelError("elicitation/create"))
+        with user_mailbox(monkeypatch, imap), signed_in(FULL):
+            parked = await server.move_email(3, "github", client)
+            assert imap.changes == []
+            return parked, await flow.client.post(
+                parked["confirm_url"], data={"decision": "approve"}
+            )
+
+    (parked, approved), _ = run_flow(
+        scenario, settings=Settings(allow_write=True), yandex=FakeYandex(scope=FULL)
+    )
+    assert parked["status"] == "confirmation_required"
+    assert "Done." in approved.text
+    assert imap.changes == [("move", [3], "github")]
+
+
+def test_local_client_whose_transport_cannot_ask_gets_a_plain_error(monkeypatch):
+    monkeypatch.setattr(server, "_confirmations", None)
+    monkeypatch.setattr(server, "_auth_provider", None)
+    clients = [Client(back_channel=False), Client(fails=NoBackChannelError("elicitation/create"))]
+    with user_mailbox(monkeypatch, WriteIMAP(folders=github_folders())) as imap, signed_in(FULL):
+        for client in clients:
+            with pytest.raises(ToolError, match="transport cannot deliver") as raised:
+                asyncio.run(server.move_email(3, "github", client))
+            assert "declares elicitation" in str(raised.value)
+    assert imap.changes == []
+
+
+def test_a_decline_or_another_failure_never_falls_back_to_the_browser(monkeypatch):
+    imap = WriteIMAP(folders=github_folders())
+
+    async def scenario(flow):
+        await flow.sign_in()
+        with user_mailbox(monkeypatch, imap), signed_in(FULL):
+            with pytest.raises(ToolError, match="not approved"):
+                await server.move_email(3, "github", Client(approve=False))
+            with pytest.raises(RuntimeError, match="client crashed"):
+                await server.move_email(3, "github", Client(fails=RuntimeError("client crashed")))
+        return len(server._confirmations._actions)
+
+    parked, _ = run_flow(
+        scenario, settings=Settings(allow_write=True), yandex=FakeYandex(scope=FULL)
+    )
+    assert parked == 0 and imap.changes == []
+
+
+def test_connection_capabilities_follow_the_transport_not_the_declaration(monkeypatch):
+    imap = WriteIMAP(folders=github_folders())
+
+    async def scenario(flow):
+        with user_mailbox(monkeypatch, imap), signed_in(FULL):
+            http = await server.get_connection_capabilities(Client(back_channel=False))
+            monkeypatch.setattr(server, "_confirmations", None)
+            local = await server.get_connection_capabilities(Client(back_channel=False))
+        return http, local
+
+    (http, local), _ = run_flow(scenario, settings=Settings(allow_write=True))
+    assert http["client_supports_elicitation"] is True
+    assert http["transport_delivers_elicitation"] is False
+    assert http["confirmation"] == "browser_link" and http["action_needed"] is None
+    assert local["confirmation"] == "unavailable"
+    assert "transport cannot deliver" in local["action_needed"]
 
 
 def test_pending_actions_expire_and_are_decided_once():
