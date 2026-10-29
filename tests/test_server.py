@@ -157,7 +157,7 @@ def test_non_loopback_requires_auth_or_explicit_override(monkeypatch):
         lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
     )
     with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
-        server.main()
+        server.main([])
 
 
 def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
@@ -171,7 +171,7 @@ def test_blank_auth_token_does_not_count_as_authentication(monkeypatch):
         lambda: SimpleNamespace(imap_host="imap", imap_port=993, allow_write=False),
     )
     with pytest.raises(ValueError, match="MCP_AUTH_TOKEN"):
-        server.main()
+        server.main([])
 
 
 def test_specific_host_is_allowed_by_default(monkeypatch):
@@ -193,7 +193,7 @@ def test_specific_host_is_allowed_by_default(monkeypatch):
 
     monkeypatch.setattr(server.mcp, "streamable_http_app", app)
     monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
-    server.main()
+    server.main([])
     assert "192.168.1.5:*" in captured["transport_security"].allowed_hosts
 
 
@@ -282,6 +282,9 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     class Box:
         config = SimpleNamespace(allow_write=True)
 
+        def write_error(self):
+            return None
+
         def preview_promotions_move(self, uid):
             return {"from": "alice", "subject": "example"}, "AI-Promotions"
 
@@ -308,6 +311,9 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
 
     class Box:
         config = SimpleNamespace(allow_write=True)
+
+        def write_error(self):
+            return None
 
         def preview_promotions_move(self, uid):
             headers = {"from": "Bank\r\nSupport <a@example.com>", "subject": subject}
