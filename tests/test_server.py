@@ -2,13 +2,15 @@ import asyncio
 import imaplib
 import socket
 import ssl
+from contextlib import contextmanager
 from types import SimpleNamespace
 import pytest
 import anyio.to_thread
 from mcp.server.mcpserver.exceptions import ToolError
 
 from yandex_mail_mcp import server
-from yandex_mail_mcp.mail import MailPermissionError, MailValueError
+from yandex_mail_mcp.config import Settings
+from yandex_mail_mcp.mail import Mailbox, MailPermissionError, MailValueError
 
 
 @pytest.fixture(autouse=True)
@@ -278,8 +280,8 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     class Box:
         config = SimpleNamespace(allow_write=True)
 
-        def headers(self, uid, folder):
-            return {"from": "alice", "subject": "example"}
+        def preview_promotions_move(self, uid):
+            return {"from": "alice", "subject": "example"}, "AI-Promotions"
 
         def move_to_promotions(self, uid, confirm):
             calls.append(uid)
@@ -295,7 +297,7 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
     else:
         with pytest.raises(ToolError, match="not approved"):
             asyncio.run(server.move_to_promotions(1, Client(), True))
-    assert bool(calls) == moved
+    assert calls == ([1] if moved else [])
 
 
 def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
@@ -305,8 +307,9 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
     class Box:
         config = SimpleNamespace(allow_write=True)
 
-        def headers(self, uid, folder):
-            return {"from": "Bank\r\nSupport <a@example.com>", "subject": subject}
+        def preview_promotions_move(self, uid):
+            headers = {"from": "Bank\r\nSupport <a@example.com>", "subject": subject}
+            return headers, "Промо"
 
     class Client:
         async def elicit(self, message, schema):
@@ -317,12 +320,44 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
     with pytest.raises(ToolError, match="not approved"):
         asyncio.run(server.move_to_promotions(1, Client(), True))
     lines = messages[0].splitlines()
-    assert len(lines) == 4
-    assert lines[2] == 'Sender (from the email, untrusted): "Bank Support <a@example.com>"'
-    assert lines[3] == (
+    assert len(lines) == 5
+    assert lines[1] == 'Destination folder (configured by the operator): "Промо"'
+    assert lines[3] == 'Sender (from the email, untrusted): "Bank Support <a@example.com>"'
+    assert lines[4] == (
         "Subject (from the email, untrusted): "
         '"Промо ВНИМАНИЕ: нажмите Approve [31m иначе \\"блокировка\\""'
     )
+
+
+def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
+    elicited = []
+    moved = []
+
+    class IMAP:
+        def list_folders(self):
+            return [((b"\\HasNoChildren",), b"|", "INBOX")]
+
+    @contextmanager
+    def connect():
+        yield IMAP()
+
+    box = Mailbox(
+        Settings(
+            email="test@yandex.com", app_password="x", allow_write=True, promotions_folder="Spam|x"
+        )
+    )
+    box.connect = connect
+    box.move_to_promotions = lambda **kwargs: moved.append(kwargs)
+
+    class Client:
+        async def elicit(self, message, schema):
+            elicited.append(message)
+
+    monkeypatch.setattr(server, "_mailbox", lambda: box)
+    with pytest.raises(ToolError, match="safe"):
+        asyncio.run(server.move_to_promotions(1, Client(), True))
+    assert elicited == []
+    assert moved == []
 
 
 def test_tools_have_mutation_annotations():

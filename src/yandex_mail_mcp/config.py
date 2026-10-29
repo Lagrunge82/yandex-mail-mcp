@@ -8,6 +8,27 @@ from dataclasses import dataclass, field
 from pydantic import SecretStr
 
 
+# Names a promotions folder must never take, compared case-insensitively.
+RESERVED_FOLDER_NAMES = frozenset(
+    {
+        "inbox",
+        "trash",
+        "spam",
+        "deleted",
+        "junk",
+        "drafts",
+        "sent",
+        "outbox",
+        "спам",
+        "удалённые",
+        "удаленные",
+        "черновики",
+        "отправленные",
+        "исходящие",
+    }
+)
+
+
 class ConfigurationError(ValueError):
     """An actionable configuration error."""
 
@@ -49,6 +70,10 @@ class Settings:
         promotions_folder = os.getenv("YANDEX_PROMOTIONS_FOLDER", "AI-Promotions").strip()
         if not promotions_folder:
             raise ConfigurationError("YANDEX_PROMOTIONS_FOLDER cannot be empty")
+        if promotions_folder.casefold() in RESERVED_FOLDER_NAMES:
+            raise ConfigurationError(
+                "YANDEX_PROMOTIONS_FOLDER must name a dedicated folder, not a system folder"
+            )
         return cls(
             email=email,
             app_password=password,

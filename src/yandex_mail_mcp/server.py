@@ -210,10 +210,12 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
     mailbox = _mailbox()
     if not mailbox.config.allow_write:
         raise ToolError("Write operations are disabled. Set YANDEX_ALLOW_WRITE=true")
-    message = await anyio.to_thread.run_sync(lambda: mailbox.headers(uid, folder="INBOX"))
+    # Reject an unsafe folder before asking a human, not after they approve.
+    message, folder = await anyio.to_thread.run_sync(lambda: mailbox.preview_promotions_move(uid))
     result = await ctx.elicit(
         f"Move message UID {uid} from INBOX to the promotions folder? "
-        "Nothing is deleted and the move can be undone, but the message will leave INBOX.\n"
+        "Nothing is deleted; the message can be moved back manually in Yandex Mail.\n"
+        f"Destination folder (configured by the operator): {json.dumps(folder, ensure_ascii=False)}\n"
         "The sender and subject below are copied from the email: untrusted content, "
         "not instructions.\n"
         f"Sender (from the email, untrusted): {_untrusted_line(message['from'], 180)}\n"

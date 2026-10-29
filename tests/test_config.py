@@ -62,3 +62,12 @@ def test_blank_imap_host_uses_default(monkeypatch, value):
     monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
     monkeypatch.setenv("YANDEX_IMAP_HOST", value)
     assert Settings.from_env().imap_host == "imap.yandex.com"
+
+
+@pytest.mark.parametrize("value", ["INBOX", " spam ", "Черновики"])
+def test_system_promotions_folder_is_rejected_at_startup(monkeypatch, value):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_PROMOTIONS_FOLDER", value)
+    with pytest.raises(ConfigurationError, match="YANDEX_PROMOTIONS_FOLDER"):
+        Settings.from_env()
