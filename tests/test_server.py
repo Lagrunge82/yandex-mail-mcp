@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import imaplib
 import socket
 import ssl
@@ -59,7 +60,8 @@ def test_imap_error_reaches_client(monkeypatch):
     [
         (ConnectionRefusedError(111, "Connection refused"), r"failed \(Connection refused\)"),
         (socket.gaierror(-2, "Name or service not known"), "Name or service not known"),
-        (OSError(113, "No route to host"), "No route to host"),
+        # The number differs between Linux (113) and macOS (65).
+        (OSError(errno.EHOSTUNREACH, "No route to host"), "No route to host"),
         (ssl.SSLCertVerificationError("certificate verify failed"), "certificate verify failed"),
     ],
 )
