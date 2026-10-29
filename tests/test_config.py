@@ -118,3 +118,12 @@ def test_blank_boolean_uses_default(monkeypatch):
     settings = Settings.from_env()
     assert settings.confirm_reversible is True
     assert settings.allow_write is False
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "70000"])
+def test_port_outside_the_valid_range_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("YANDEX_EMAIL", "a@example.com")
+    monkeypatch.setenv("YANDEX_APP_PASSWORD", "secret")
+    monkeypatch.setenv("YANDEX_IMAP_PORT", value)
+    with pytest.raises(ConfigurationError, match="YANDEX_IMAP_PORT must be a port number"):
+        Settings.from_env()

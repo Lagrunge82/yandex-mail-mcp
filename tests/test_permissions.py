@@ -53,6 +53,8 @@ def signed_in(scope, login="ivan", token="ya-secret-token-123", scopes=("mail.re
 
 
 class Client:
+    session = SimpleNamespace(check_client_capability=lambda capability: True)
+
     def __init__(self):
         self.messages = []
 

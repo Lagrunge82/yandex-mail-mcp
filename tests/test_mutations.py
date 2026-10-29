@@ -80,6 +80,8 @@ def box_with(imap, **settings):
 
 
 class Client:
+    session = SimpleNamespace(check_client_capability=lambda capability: True)
+
     def __init__(self, action="accept", approve=True):
         self.action = action
         self.approve = approve
@@ -206,6 +208,60 @@ def test_move_elicitation_names_folders_and_quotes_headers(monkeypatch):
     assert lines[1] == 'From folder (requested by the assistant): "INBOX"'
     assert lines[2] == 'To folder (requested by the assistant): "Налоги"'
     assert lines[4] == 'Sender (from the email, untrusted): "shop@example.com"'
+
+
+def test_mutation_fails_clearly_when_the_client_cannot_elicit(monkeypatch):
+    imap = WriteIMAP()
+    monkeypatch.setattr(server, "_mailbox", lambda: box_with(imap, allow_write=True))
+    asked = []
+
+    def unsupported(capability):
+        asked.append(capability)
+        return False
+
+    client = Client()
+    client.session = SimpleNamespace(check_client_capability=unsupported)
+    with pytest.raises(ToolError, match="does not support elicitation") as raised:
+        asyncio.run(server.move_email(3, "Налоги", client))
+    # Moves cannot skip confirmation, so the message must not suggest it.
+    assert "MCP_CONFIRM_REVERSIBLE" not in str(raised.value)
+    assert asked[0].elicitation is not None
+    with pytest.raises(ToolError, match="MCP_CONFIRM_REVERSIBLE=false"):
+        asyncio.run(server.mark_read(3, client))
+    assert client.messages == []
+    assert imap.selected == []
+    assert imap.changes == []
+
+
+def test_skipped_confirmation_needs_no_elicitation_support(monkeypatch):
+    imap = WriteIMAP()
+    box = box_with(imap, allow_write=True, confirm_reversible=False)
+    monkeypatch.setattr(server, "_mailbox", lambda: box)
+    client = Client()
+    client.session = SimpleNamespace(check_client_capability=lambda capability: False)
+    asyncio.run(server.mark_read(3, client))
+    assert imap.changes == [("add_flags", [3], ["\\Seen"])]
+
+
+def test_destination_prefers_the_exact_name_and_rejects_case_ambiguity():
+    imap = WriteIMAP(
+        folders=[
+            ((b"\\HasNoChildren",), b"|", "INBOX"),
+            ((b"\\HasNoChildren",), b"|", "Work"),
+            ((b"\\HasNoChildren",), b"|", "work"),
+            ((b"\\HasNoChildren",), b"|", "Налоги"),
+        ]
+    )
+    box = box_with(imap, allow_write=True)
+    assert box.move(3, "Work")["folder"] == "Work"
+    assert box.move(3, "work")["folder"] == "work"
+    assert box.move(3, "налоги")["folder"] == "Налоги"
+    assert [change[2] for change in imap.changes] == ["Work", "work", "Налоги"]
+    with pytest.raises(MailValueError, match="differ only by case"):
+        box.preview_move(3, "WORK")
+    with pytest.raises(MailValueError, match="differ only by case"):
+        box.move(3, "WORK")
+    assert len(imap.changes) == 3
 
 
 def test_move_to_missing_folder_is_not_created():
