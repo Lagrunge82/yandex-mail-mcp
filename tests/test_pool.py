@@ -111,7 +111,7 @@ def test_idle_connection_is_replaced_without_noop():
 
 def test_move_returns_connection_without_selected_folder(fake_imap):
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
-    box.move_to_promotions(3, confirm=True)
+    box.move_to_promotions(3, confirm=True, uidvalidity=None)
     imap = fake_imap[0]
     assert ("select", "INBOX", False) in imap.calls
     assert imap.calls[-1] == "unselect"
@@ -123,11 +123,11 @@ def test_move_returns_connection_without_selected_folder(fake_imap):
 
 def test_move_email_returns_connection_without_selected_folder(fake_imap):
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
-    assert box.move(3, "AI-Promotions")["folder"] == "AI-Promotions"
+    assert box.move(3, "AI-Promotions", uidvalidity=None)["folder"] == "AI-Promotions"
     imap = fake_imap[0]
     assert imap.calls[-2:] == [("move", [3], "AI-Promotions"), "unselect"]
     assert imap._imap.state == "AUTH"
-    box.set_flag(3, "\\Seen", True)
+    box.set_flag(3, "\\Seen", True, uidvalidity=None)
     assert len(fake_imap) == 1
     assert imap.calls[-1] == "unselect"
 
@@ -221,7 +221,7 @@ def test_mail_error_keeps_healthy_connection(fake_imap):
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
     for _ in range(3):
         with pytest.raises(MailError, match="not found"):
-            box.move(3, "Missing")
+            box.move(3, "Missing", uidvalidity=None)
     assert len(fake_imap) == 1
     assert fake_imap[0].logins == 1
 

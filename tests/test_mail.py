@@ -152,7 +152,7 @@ def test_invalid_uid_rejected():
 def test_no_mutation_without_explicit_opt_in():
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="not-a-real-password"))
     with pytest.raises(PermissionError, match="disabled"):
-        box.move_to_promotions(3, confirm=True)
+        box.move_to_promotions(3, confirm=True, uidvalidity=None)
 
 
 def test_no_mutation_without_confirmation():
@@ -160,7 +160,7 @@ def test_no_mutation_without_confirmation():
         Settings(email="test@yandex.com", oauth_token="not-a-real-password", allow_write=True)
     )
     with pytest.raises(PermissionError, match="confirm"):
-        box.move_to_promotions(3)
+        box.move_to_promotions(3, uidvalidity=None)
 
 
 def test_system_folder_flag_is_rejected():
@@ -180,7 +180,7 @@ def test_system_folder_flag_is_rejected():
 
     box.connect = connect
     with pytest.raises(ValueError, match="safe"):
-        box.move_to_promotions(3, confirm=True)
+        box.move_to_promotions(3, confirm=True, uidvalidity=None)
 
 
 def test_promotions_folder_with_whitespace_uses_existing_folder():
@@ -218,7 +218,7 @@ def test_promotions_folder_with_whitespace_uses_existing_folder():
         yield IMAP()
 
     box.connect = connect
-    assert box.move_to_promotions(3, confirm=True)["moved_to"] == "AI-Promotions"
+    assert box.move_to_promotions(3, confirm=True, uidvalidity=None)["moved_to"] == "AI-Promotions"
     assert calls == [("move", "AI-Promotions")]
 
 
@@ -228,7 +228,7 @@ def test_system_folder_name_is_rejected(name):
         Settings(email="test@yandex.com", oauth_token="x", allow_write=True, promotions_folder=name)
     )
     with pytest.raises(ValueError, match="safe"):
-        box.move_to_promotions(3, confirm=True)
+        box.move_to_promotions(3, confirm=True, uidvalidity=None)
 
 
 @pytest.mark.parametrize(
@@ -250,7 +250,7 @@ def test_nested_promotions_folder_is_rejected(name, delimiter):
 
     box.connect = connect
     with pytest.raises(MailValueError, match="safe"):
-        box.move_to_promotions(3, confirm=True)
+        box.move_to_promotions(3, confirm=True, uidvalidity=None)
 
 
 def test_preview_fetches_only_bounded_text_section():
@@ -452,7 +452,7 @@ def test_preview_validates_folder_and_reads_headers_in_one_connection():
     box.connect = connect
     headers, folder = box.preview_promotions_move(3)
     assert headers["subject"] == "Sale"
-    assert folder == "AI-Promotions"
+    assert folder.folder == "AI-Promotions"
     assert connections == [1]
 
 
@@ -517,16 +517,18 @@ def writable_box(imap):
     return box
 
 
-def test_move_creates_missing_folder_then_moves():
+def test_move_checks_the_message_then_creates_missing_folder_then_moves():
     imap = MoveIMAP(folders=[((b"\\HasNoChildren",), b"|", "INBOX")])
-    result = writable_box(imap).move_to_promotions(3, confirm=True)
+    result = writable_box(imap).move_to_promotions(3, confirm=True, uidvalidity=None)
     assert result == {"uid": 3, "moved_to": "AI-Promotions", "deleted_permanently": False}
+    # The message is checked before the folder is created, so a refused move
+    # leaves no new folder behind.
     assert imap.calls == [
         ("list_folders",),
         ("has_capability", "MOVE"),
-        ("create_folder", "AI-Promotions"),
         ("select_folder", "INBOX", False),
         ("search", ["UID", "3"]),
+        ("create_folder", "AI-Promotions"),
         ("move", [3], "AI-Promotions"),
     ]
 
@@ -534,14 +536,14 @@ def test_move_creates_missing_folder_then_moves():
 def test_move_requires_move_capability():
     imap = MoveIMAP(move=False)
     with pytest.raises(MailError, match="MOVE"):
-        writable_box(imap).move_to_promotions(3, confirm=True)
+        writable_box(imap).move_to_promotions(3, confirm=True, uidvalidity=None)
     assert [call[0] for call in imap.calls] == ["list_folders", "has_capability"]
 
 
 def test_move_of_uid_missing_from_inbox_does_not_move():
     imap = MoveIMAP(folders=[((b"\\HasNoChildren",), b"|", "AI-Promotions")], inbox=[])
     with pytest.raises(MailLookupError, match="UID 3 not found in INBOX"):
-        writable_box(imap).move_to_promotions(3, confirm=True)
+        writable_box(imap).move_to_promotions(3, confirm=True, uidvalidity=None)
     assert not any(call[0] in {"move", "create_folder"} for call in imap.calls)
 
 

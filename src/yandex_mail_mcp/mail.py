@@ -111,6 +111,51 @@ class MailPermissionError(MailError, PermissionError):
     pass
 
 
+class MailChangedError(MailError):
+    """The folder changed between the confirmation and the change; nothing was changed."""
+
+
+@dataclass(frozen=True)
+class Target:
+    """What a confirmation pins down besides the UIDs.
+
+    folder is the folder the confirmation names: the destination of a move, or the
+    folder of a flag change. uidvalidity is the source folder's UIDVALIDITY when the
+    messages were read for the confirmation. A UID means the same message only while
+    UIDVALIDITY stays the same: a folder deleted and created again starts over, and
+    the confirmed UID may then belong to another message.
+    """
+
+    folder: str
+    uidvalidity: int | None
+
+
+def _uidvalidity(response: Any) -> int | None:
+    """The UIDVALIDITY in an IMAPClient SELECT or EXAMINE response, if reported."""
+    value = response.get(b"UIDVALIDITY") if isinstance(response, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _check_uidvalidity(folder: str, uidvalidity: int | None, response: Any) -> None:
+    """Refuse a change when the folder is no longer the one the user confirmed.
+
+    A value reported when the messages were read must be reported again, equal:
+    one that differs or has disappeared is refused, since the check was possible
+    and now is not. uidvalidity None means the server reported none then, so there
+    is nothing to compare, and the change goes ahead whatever SELECT reports now.
+    Refusing it would stop every change on a server that leaves UIDVALIDITY out of
+    EXAMINE; such a server gets the old name-and-UID check only. Every change method
+    takes uidvalidity without a default, so a caller passes None only on purpose.
+    """
+    if uidvalidity is not None and _uidvalidity(response) != uidvalidity:
+        raise MailChangedError(
+            f"The folder {folder} changed after the confirmation (its UIDVALIDITY is "
+            "different, as when a folder is deleted and created again), so the "
+            "confirmed UIDs may now be other messages. Nothing was changed; ask again "
+            "to confirm the messages as they are now"
+        )
+
+
 class _TextFromHTML(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -961,7 +1006,7 @@ class Mailbox:
         valid_uid(uid)
         limit = max(1, min(limit, 100))
         with self.connect() as imap:
-            origin = self._headers(imap, uid, folder)
+            origin, _ = self._headers(imap, uid, folder)
             folders = [folder]
             for flags, _, name in imap.list_folders():
                 if (name.upper() == "INBOX" or "\\sent" in _flag_names(flags)) and all(
@@ -1055,28 +1100,31 @@ class Mailbox:
     def headers(self, uid: int, folder: str = "INBOX") -> MailSummary:
         valid_uid(uid)
         with self.connect() as imap:
-            return self._headers(imap, uid, folder)
+            return self._headers(imap, uid, folder)[0]
 
     @staticmethod
-    def _headers(imap: IMAPClient, uid: int, folder: str) -> MailSummary:
-        imap.select_folder(folder, readonly=True)
+    def _headers(imap: IMAPClient, uid: int, folder: str) -> tuple[MailSummary, int | None]:
+        """The message headers and the folder's UIDVALIDITY when they were read."""
+        uidvalidity = _uidvalidity(imap.select_folder(folder, readonly=True))
         item = imap.fetch([uid], ["BODY.PEEK[HEADER]"]).get(uid, {})
         raw = item.get(b"BODY[HEADER]")
         if not isinstance(raw, bytes):
             raise MailLookupError(f"Message UID {uid} not found or header unavailable in {folder}")
-        return parse_message(raw, uid, max_body_chars=0)
+        return parse_message(raw, uid, max_body_chars=0), uidvalidity
 
-    def preview_promotions_move(self, uid: int) -> tuple[MailSummary, str]:
+    def preview_promotions_move(self, uid: int) -> tuple[MailSummary, Target]:
         """Validate the promotions folder and read the INBOX message headers.
 
-        Returns the headers and the folder name as the server spells it, so the
-        caller can show both to a human before calling move_to_promotions.
+        Returns the headers and the target: the folder name as the server spells it,
+        so the caller can show both to a human before calling move_to_promotions,
+        and the UIDVALIDITY of INBOX to pass on to it.
         """
         valid_uid(uid)
         self._promotions_folder_name()
         with self.connect() as imap:
             folder, _ = self.validate_promotions_folder(imap)
-            return self._headers(imap, uid, "INBOX"), folder
+            headers, uidvalidity = self._headers(imap, uid, "INBOX")
+            return headers, Target(folder, uidvalidity)
 
     def _promotions_folder_name(self) -> str:
         # Checks that need no connection; Settings.from_env runs the same ones.
@@ -1195,14 +1243,21 @@ class Mailbox:
             raise MailPermissionError(error)
 
     @staticmethod
-    def _select_message(imap: IMAPClient, uid: int, folder: str) -> None:
-        imap.select_folder(folder, readonly=False)
+    def _select_message(imap: IMAPClient, uid: int, folder: str, uidvalidity: int | None) -> None:
+        """Select the folder for a change and check that the message is still there.
+
+        uidvalidity is the folder's UIDVALIDITY when the user confirmed the change;
+        a different one now means the UID may be another message, and nothing changes.
+        """
+        _check_uidvalidity(folder, uidvalidity, imap.select_folder(folder, readonly=False))
         if uid not in imap.search(["UID", str(uid)]):
             raise MailLookupError(f"Message UID {uid} not found in {folder}")
 
     @staticmethod
-    def _select_messages(imap: IMAPClient, uids: list[int], folder: str) -> None:
-        imap.select_folder(folder, readonly=False)
+    def _select_messages(
+        imap: IMAPClient, uids: list[int], folder: str, uidvalidity: int | None
+    ) -> None:
+        _check_uidvalidity(folder, uidvalidity, imap.select_folder(folder, readonly=False))
         present = set(imap.search(["UID", ",".join(str(uid) for uid in uids)]))
         missing = [uid for uid in uids if uid not in present]
         if missing:
@@ -1211,9 +1266,14 @@ class Mailbox:
             )
 
     @staticmethod
-    def _headers_many(imap: IMAPClient, uids: list[int], folder: str) -> list[MailSummary]:
-        """The headers of every UID, in the given order; any missing one is an error."""
-        imap.select_folder(folder, readonly=True)
+    def _headers_many(
+        imap: IMAPClient, uids: list[int], folder: str
+    ) -> tuple[list[MailSummary], int | None]:
+        """The headers of every UID, in the given order, and the folder's UIDVALIDITY.
+
+        Any missing UID is an error.
+        """
+        uidvalidity = _uidvalidity(imap.select_folder(folder, readonly=True))
         fetched = imap.fetch(uids, ["BODY.PEEK[HEADER]"])
         summaries: list[MailSummary] = []
         missing: list[int] = []
@@ -1227,21 +1287,27 @@ class Mailbox:
             raise MailLookupError(
                 f"Messages not found in {folder}: UID {', '.join(map(str, missing))}"
             )
-        return summaries
+        return summaries, uidvalidity
 
     def preview_moves(
         self, uids: list[int], folder: str, source_folder: str = "INBOX"
-    ) -> tuple[list[MailSummary], str]:
+    ) -> tuple[list[MailSummary], Target]:
         """Validate a batch move and read every message's headers for the confirmation."""
         uids = batch_uids(uids)
         with self.connect() as imap:
             destination = self._destination(imap, folder)
             if destination.casefold() == source_folder.strip().casefold():
                 raise MailValueError("The messages are already in that folder")
-            return self._headers_many(imap, uids, source_folder), destination
+            headers, uidvalidity = self._headers_many(imap, uids, source_folder)
+            return headers, Target(destination, uidvalidity)
 
     def move_many(
-        self, uids: list[int], folder: str, source_folder: str = "INBOX"
+        self,
+        uids: list[int],
+        folder: str,
+        source_folder: str = "INBOX",
+        *,
+        uidvalidity: int | None,
     ) -> dict[str, Any]:
         """Move a batch of messages with one MOVE and report what actually moved.
 
@@ -1253,6 +1319,9 @@ class Mailbox:
         - without it, ``moved`` is None: ``not_moved`` lists the UIDs still in the
           source folder, and ``left_source`` those that are gone, by this move or
           otherwise, with a warning to check the destination.
+
+        uidvalidity is the source folder's UIDVALIDITY from the confirmation: if the
+        folder has another one now, nothing moves.
         """
         uids = batch_uids(uids)
         self._require_write()
@@ -1261,7 +1330,7 @@ class Mailbox:
             destination = self._destination(imap, folder)
             if destination.casefold() == source_folder.strip().casefold():
                 raise MailValueError("The messages are already in that folder")
-            self._select_messages(imap, uids, source_folder)
+            self._select_messages(imap, uids, source_folder, uidvalidity)
             # A COPYUID from an earlier command on this connection must not be mistaken
             # for this move's.
             _response_codes(imap).pop("COPYUID", None)
@@ -1336,11 +1405,11 @@ class Mailbox:
 
     def preview_move(
         self, uid: int, folder: str | None = None, source_folder: str = "INBOX"
-    ) -> tuple[MailSummary, str]:
+    ) -> tuple[MailSummary, Target]:
         """Validate a move and read the message headers for the confirmation request.
 
-        folder=None means the archive folder. Returns the headers and the
-        destination as the server spells it.
+        folder=None means the archive folder. Returns the headers and the target:
+        the destination as the server spells it and the source folder's UIDVALIDITY.
         """
         valid_uid(uid)
         with self.connect() as imap:
@@ -1351,12 +1420,22 @@ class Mailbox:
             )
             if destination.casefold() == source_folder.strip().casefold():
                 raise MailValueError("The message is already in that folder")
-            return self._headers(imap, uid, source_folder), destination
+            headers, uidvalidity = self._headers(imap, uid, source_folder)
+            return headers, Target(destination, uidvalidity)
 
     def move(
-        self, uid: int, folder: str | None = None, source_folder: str = "INBOX"
+        self,
+        uid: int,
+        folder: str | None = None,
+        source_folder: str = "INBOX",
+        *,
+        uidvalidity: int | None,
     ) -> dict[str, Any]:
-        """Move one message; folder=None means the archive folder."""
+        """Move one message; folder=None means the archive folder.
+
+        uidvalidity is the source folder's UIDVALIDITY from the confirmation: if the
+        folder has another one now, the message is not moved.
+        """
         valid_uid(uid)
         self._require_write()
         with self.connect() as imap:
@@ -1367,7 +1446,7 @@ class Mailbox:
             )
             if destination.casefold() == source_folder.strip().casefold():
                 raise MailValueError("The message is already in that folder")
-            self._select_message(imap, uid, source_folder)
+            self._select_message(imap, uid, source_folder, uidvalidity)
             imap.move([uid], destination)
         return {
             "uid": uid,
@@ -1376,19 +1455,33 @@ class Mailbox:
             "reversible": True,
         }
 
-    def preview_flag(self, uid: int, folder: str = "INBOX") -> MailSummary:
+    def preview_flag(self, uid: int, folder: str = "INBOX") -> tuple[MailSummary, Target]:
+        """The message headers, and the target: its folder and that folder's UIDVALIDITY."""
         valid_uid(uid)
         with self.connect() as imap:
-            return self._headers(imap, uid, folder)
+            headers, uidvalidity = self._headers(imap, uid, folder)
+            return headers, Target(folder, uidvalidity)
 
-    def set_flag(self, uid: int, flag: str, value: bool, folder: str = "INBOX") -> dict[str, Any]:
-        """Add or remove \\Seen or \\Flagged on one message."""
+    def set_flag(
+        self,
+        uid: int,
+        flag: str,
+        value: bool,
+        folder: str = "INBOX",
+        *,
+        uidvalidity: int | None,
+    ) -> dict[str, Any]:
+        """Add or remove \\Seen or \\Flagged on one message.
+
+        uidvalidity is the folder's UIDVALIDITY from the confirmation: if the folder
+        has another one now, nothing changes.
+        """
         valid_uid(uid)
         if flag not in {"\\Seen", "\\Flagged"}:
             raise MailValueError("Only the \\Seen and \\Flagged flags can be changed")
         self._require_write()
         with self.connect() as imap:
-            self._select_message(imap, uid, folder)
+            self._select_message(imap, uid, folder, uidvalidity)
             if value:
                 imap.add_flags([uid], [flag])
             else:
@@ -1489,7 +1582,9 @@ class Mailbox:
             "message_id": str(draft.message["Message-ID"]),
         }
 
-    def move_to_promotions(self, uid: int, confirm: bool = False) -> dict[str, Any]:
+    def move_to_promotions(
+        self, uid: int, confirm: bool = False, *, uidvalidity: int | None
+    ) -> dict[str, Any]:
         valid_uid(uid)
         self._require_write()
         if confirm is not True:
@@ -1497,8 +1592,9 @@ class Mailbox:
         self._promotions_folder_name()
         with self.connect() as imap:
             folder, exists = self.validate_promotions_folder(imap)
+            # The message first: a refused change must not leave a new folder behind.
+            self._select_message(imap, uid, "INBOX", uidvalidity)
             if not exists:
                 imap.create_folder(folder)
-            self._select_message(imap, uid, "INBOX")
             imap.move([uid], folder)
         return {"uid": uid, "moved_to": folder, "deleted_permanently": False}

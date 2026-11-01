@@ -9,6 +9,7 @@
 
 ### Fixed
 
+- A confirmed change could act on another message. The confirmation and the change were tied only by folder name and UID, and after a folder is deleted and created again the same UID can name another message. The confirmation now records the source folder's `UIDVALIDITY` when it reads the messages, and the change compares it right after `SELECT`. If it differs, or is no longer reported, nothing moves or is flagged, `move_to_promotions` creates no folder, and the error asks for a new confirmation. This applies to `move_email`, `move_emails`, `archive_email`, `mark_read`, `set_flag` and `move_to_promotions`, confirmed through elicitation or in the browser.
 - A change approved on the shared HTTP server could be refused as read-only. Requests of one authorization replaced the credentials of its shared mailbox, so a request with another token arriving while the user decided changed what the approved write was checked against. Each request now works on its own view of the mailbox: it shares the connection pool but keeps the request's credentials. The write check, the logins of new connections, and a change waiting for elicitation or browser approval all use the credentials of the request that asked. A pool is shared only by tokens of one sign-in with the same Yandex scope, so a connection logged in read-only never serves a full-access request. A read-only token still cannot write.
 
 ### Changed

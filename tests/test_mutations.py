@@ -253,14 +253,14 @@ def test_destination_prefers_the_exact_name_and_rejects_case_ambiguity():
         ]
     )
     box = box_with(imap, allow_write=True)
-    assert box.move(3, "Work")["folder"] == "Work"
-    assert box.move(3, "work")["folder"] == "work"
-    assert box.move(3, "налоги")["folder"] == "Налоги"
+    assert box.move(3, "Work", uidvalidity=None)["folder"] == "Work"
+    assert box.move(3, "work", uidvalidity=None)["folder"] == "work"
+    assert box.move(3, "налоги", uidvalidity=None)["folder"] == "Налоги"
     assert [change[2] for change in imap.changes] == ["Work", "work", "Налоги"]
     with pytest.raises(MailValueError, match="differ only by case"):
         box.preview_move(3, "WORK")
     with pytest.raises(MailValueError, match="differ only by case"):
-        box.move(3, "WORK")
+        box.move(3, "WORK", uidvalidity=None)
     assert len(imap.changes) == 3
 
 
@@ -269,7 +269,7 @@ def test_move_to_missing_folder_is_not_created():
     with pytest.raises(MailLookupError, match="not found; moves do not create folders"):
         box.preview_move(3, "Новая")
     with pytest.raises(MailLookupError, match="not found"):
-        box.move(3, "Новая")
+        box.move(3, "Новая", uidvalidity=None)
 
 
 def test_move_into_the_source_folder_is_rejected():
@@ -281,13 +281,13 @@ def test_move_into_the_source_folder_is_rejected():
 def test_move_requires_move_capability():
     box = box_with(WriteIMAP(capabilities=()), allow_write=True)
     with pytest.raises(Exception, match="MOVE"):
-        box.move(3, "Налоги")
+        box.move(3, "Налоги", uidvalidity=None)
 
 
 def test_move_of_missing_uid_changes_nothing():
     imap = WriteIMAP(inbox=())
     with pytest.raises(MailLookupError, match="UID 3 not found in INBOX"):
-        box_with(imap, allow_write=True).move(3, "Налоги")
+        box_with(imap, allow_write=True).move(3, "Налоги", uidvalidity=None)
     assert imap.changes == []
     assert imap.selected == [("INBOX", False)]
 
@@ -295,21 +295,21 @@ def test_move_of_missing_uid_changes_nothing():
 def test_mailbox_mutations_require_write_opt_in():
     box = box_with(WriteIMAP())
     with pytest.raises(MailPermissionError):
-        box.move(3, "Налоги")
+        box.move(3, "Налоги", uidvalidity=None)
     with pytest.raises(MailPermissionError):
-        box.set_flag(3, "\\Seen", True)
+        box.set_flag(3, "\\Seen", True, uidvalidity=None)
 
 
 def test_only_seen_and_flagged_can_be_set():
     box = box_with(WriteIMAP(), allow_write=True)
     with pytest.raises(MailValueError, match="Seen"):
-        box.set_flag(3, "\\Deleted", True)
+        box.set_flag(3, "\\Deleted", True, uidvalidity=None)
 
 
 def test_archive_uses_configured_folder():
     imap = WriteIMAP()
     box = box_with(imap, allow_write=True, archive_folder="Налоги")
-    assert box.move(3, None)["folder"] == "Налоги"
+    assert box.move(3, None, uidvalidity=None)["folder"] == "Налоги"
     assert imap.changes == [("move", [3], "Налоги")]
 
 
@@ -343,5 +343,5 @@ def test_archive_lists_folders_once_per_connection():
     box = box_with(imap, allow_write=True)
     box.preview_move(3, None)
     assert len(calls) == 1
-    box.move(3, None)
+    box.move(3, None, uidvalidity=None)
     assert len(calls) == 2
