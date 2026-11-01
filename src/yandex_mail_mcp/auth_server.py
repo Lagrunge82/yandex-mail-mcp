@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import anyio.to_thread
 from mcp.server.auth.provider import (
@@ -234,12 +234,37 @@ _STYLE = (
 )
 
 
+# Every page of this server: never cached, never shown inside another site's frame,
+# so a page elsewhere cannot overlay the consent or confirmation buttons.
+PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+}
+
+
 def _document(title: str, body: str, status: int = 200) -> HTMLResponse:
     page = (
         f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
         f"<title>{html.escape(title)}</title>{_STYLE}<h1>{html.escape(title)}</h1>{body}"
     )
-    return HTMLResponse(page, status_code=status, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(page, status_code=status, headers=PAGE_HEADERS)
+
+
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """The scheme, lowercase host and port of an http(s) URL; None if it is not one.
+
+    The port defaults by scheme, so https://host and https://host:443 are one origin.
+    A malformed URL is no origin at all, never an error.
+    """
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        return None
+    return parts.scheme, parts.hostname.lower(), port or (443 if parts.scheme == "https" else 80)
 
 
 def _page(message: str, status: int = 400) -> HTMLResponse:
@@ -404,11 +429,26 @@ class YandexAuthProvider(
             samesite="lax",
         )
 
-    def _set_browser_cookie(self, response: Response, user: YandexUser) -> None:
-        """Remember who signed in through this browser, for confirmation pages."""
+    def _set_browser_cookie(self, request: Request, response: Response, user: YandexUser) -> None:
+        """Remember who signed in through this browser, for confirmation pages.
+
+        The cookie carries a random id of the browser, which confirmation forms are
+        bound to. A new sign-in of the same user in the same browser keeps the id, so
+        a confirmation page opened before it still works; another user gets a new one.
+        """
+        session = self._browser_session(request)
+        browser = (
+            session[1]
+            if session is not None and session[0].login.casefold() == user.login.casefold()
+            else secrets.token_hex(16)
+        )
         response.set_cookie(
             BROWSER_COOKIE,
-            self.cipher.seal("browser", {"login": user.login, "email": user.email}, BROWSER_TTL),
+            self.cipher.seal(
+                "browser",
+                {"login": user.login, "email": user.email, "browser": browser},
+                BROWSER_TTL,
+            ),
             max_age=BROWSER_TTL,
             path="/",
             secure=self.public_url.startswith("https://"),
@@ -416,15 +456,51 @@ class YandexAuthProvider(
             samesite="lax",
         )
 
-    def browser_user(self, request: Request) -> YandexUser | None:
-        """The allowed Yandex user who signed in through this browser, if any."""
+    def _browser_session(self, request: Request) -> tuple[YandexUser, str] | None:
+        """The allowed user who signed in through this browser, and the browser's id."""
         payload = self.cipher.open(request.cookies.get(BROWSER_COOKIE, ""), "browser")
         if payload is None:
             return None
         user = YandexUser(login=str(payload["login"]), email=str(payload["email"]))
         if not (self.allowed(user.login) or self.allowed(user.email)):
             return None
-        return user
+        # Cookies set before browsers had an id: the cookie's own id stands in, and the
+        # next sign-in in this browser keeps it.
+        return user, str(payload.get("browser") or payload["jti"])
+
+    def _same_origin(self, request: Request) -> bool:
+        """Whether a form was posted from a page of this server.
+
+        Browsers send Origin with every POST; Referer stands in when a privacy setting
+        drops it. Without either, the request is refused. A sibling subdomain of the
+        same site carries the user's SameSite=Lax cookie, but not this origin.
+        """
+        source = request.headers.get("origin") or request.headers.get("referer") or ""
+        actual = _origin(source)
+        return actual is not None and actual == _origin(self.public_url)
+
+    def _csrf_token(self, pending: PendingAction, user: YandexUser, browser: str) -> str:
+        """A token for the confirmation form: this action, this user, this browser.
+
+        It expires with the action.
+        """
+        assert self.pending is not None
+        return self.cipher.seal(
+            "csrf",
+            {"action": pending.id, "login": user.login, "browser": browser},
+            max(1, self.pending.seconds_left(pending)),
+        )
+
+    def _csrf_valid(
+        self, token: str, pending: PendingAction, user: YandexUser, browser: str
+    ) -> bool:
+        payload = self.cipher.open(token, "csrf")
+        return (
+            payload is not None
+            and payload.get("action") == pending.id
+            and str(payload.get("login", "")).casefold() == user.login.casefold()
+            and payload.get("browser") == browser
+        )
 
     def _client_redirect(self, payload: dict[str, Any], **params: str | None) -> Response:
         url = construct_redirect_uri(payload["redirect_uri"], state=payload["state"], **params)
@@ -517,7 +593,7 @@ class YandexAuthProvider(
             CODE_TTL,
         )
         response = self._client_redirect(payload, code=code_blob)
-        self._set_browser_cookie(response, user)
+        self._set_browser_cookie(request, response, user)
         return response
 
     # Confirmation of changes in the browser
@@ -556,7 +632,7 @@ class YandexAuthProvider(
             headers={"Cache-Control": "no-store"},
         )
         response.delete_cookie(NONCE_COOKIE, path=CALLBACK_PATH)
-        self._set_browser_cookie(response, user)
+        self._set_browser_cookie(request, response, user)
         return response
 
     async def confirm(self, request: Request) -> Response:
@@ -575,14 +651,32 @@ class YandexAuthProvider(
                 "The connection that asked for this change was signed out. Nothing was changed.",
                 404,
             )
-        user = self.browser_user(request)
-        if user is None or user.login.casefold() != pending.login.casefold():
+        session = self._browser_session(request)
+        if session is None or session[0].login.casefold() != pending.login.casefold():
             return self._confirm_signin(pending)
+        user, browser = session
         if pending.decided:
             return self._decision_page(pending)
         if request.method != "POST":
-            return self._confirm_page(pending)
+            return self._confirm_page(pending, self._csrf_token(pending, user, browser))
+        # The cookie alone proves nothing about who sent the form: a page on a sibling
+        # subdomain gets it too. The decision must come from this server's own page,
+        # opened in this browser for this change.
+        if not self._same_origin(request):
+            LOG.warning("Confirmation %s refused: posted from another origin", pending.name)
+            return _page(
+                "This decision did not come from this server's confirmation page. "
+                "Nothing was changed; open the link from the assistant and decide there.",
+                403,
+            )
         form = await request.form()
+        if not self._csrf_valid(str(form.get("csrf", "")), pending, user, browser):
+            LOG.warning("Confirmation %s refused: invalid form token", pending.name)
+            return _page(
+                "This confirmation form is out of date or was opened in another browser. "
+                "Nothing was changed; reload the link and decide again.",
+                403,
+            )
         decision = str(form.get("decision", ""))
         if decision not in {"approve", "reject"}:
             return _page("Choose Approve or Reject.")
@@ -606,7 +700,7 @@ class YandexAuthProvider(
             self.pending.finish(pending, result=result, error=None)
         return self._decision_page(pending)
 
-    def _confirm_page(self, pending: PendingAction) -> Response:
+    def _confirm_page(self, pending: PendingAction, csrf: str) -> Response:
         assert self.pending is not None
         minutes = max(1, self.pending.seconds_left(pending) // 60)
         body = (
@@ -614,6 +708,7 @@ class YandexAuthProvider(
             f"change; it happens only if you approve it here within {minutes} min.</p>"
             f"<pre>{html.escape(pending.question)}</pre>"
             "<form method=post>"
+            f"<input type=hidden name=csrf value='{html.escape(csrf, quote=True)}'>"
             "<button name=decision value=approve class=primary>Approve</button>"
             "<button name=decision value=reject>Reject</button>"
             "</form>"
