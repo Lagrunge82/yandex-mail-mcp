@@ -469,6 +469,7 @@ def test_expired_access_token_is_rejected():
     clock.now += 541
     assert asyncio.run(provider.load_access_token(issued.access_token)) is None
     provider.clients.close()
+    provider.revoked.close()
 
 
 def test_only_clients_and_revoked_ids_are_on_disk(tmp_path):
@@ -542,14 +543,17 @@ def test_two_users_get_separate_mailboxes(monkeypatch):
         auth_context_var.reset(reset)
     reset = _as_user("ivan", "ivan@yandex.ru", "token-3")
     try:
-        assert server._mailbox() is ivan
+        refreshed = server._mailbox()
     finally:
         auth_context_var.reset(reset)
-    assert ivan is not anna
+    assert ivan.pool is not anna.pool
     assert ivan.credentials.email == "ivan@yandex.ru"
     assert anna.credentials.email == "anna@yandex.ru"
-    # A refreshed token replaces the old one for new connections.
-    assert ivan.credentials.source.access_token() == "token-3"
+    # A refreshed token of the same authorization shares the pool and logs in new
+    # connections, while the earlier request keeps its own token.
+    assert refreshed.pool is ivan.pool
+    assert refreshed.credentials.source.access_token() == "token-3"
+    assert ivan.credentials.source.access_token() == "token-1"
     assert ivan.write_error() is not None
 
 

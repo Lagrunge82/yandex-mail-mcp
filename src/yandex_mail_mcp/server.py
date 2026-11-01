@@ -435,8 +435,14 @@ def _write_error(mailbox: Mailbox) -> str | None:
     return None
 
 
-def _authorization_key(login: str, authorization: str) -> tuple[str, str, str]:
-    return ("authorization", login.casefold(), authorization)
+def _authorization_key(login: str, authorization: str, scope: str) -> tuple[str, str, str, str]:
+    """The pool of one sign-in's tokens of one Yandex scope.
+
+    The scope is part of the key because idle connections are shared within a pool:
+    a refreshed token that Yandex gave other rights must not reuse connections logged
+    in with the old ones, nor lend its own to them.
+    """
+    return ("authorization", login.casefold(), authorization, scope)
 
 
 def _mailbox() -> Mailbox:
@@ -451,7 +457,9 @@ def _mailbox() -> Mailbox:
         )
         authorization = str(claims["authorization_id"])
         settings = _settings()
-        key = _authorization_key(str(claims["yandex_login"]), authorization)
+        key = _authorization_key(
+            str(claims["yandex_login"]), authorization, str(claims["yandex_scope"])
+        )
         with _mailboxes_lock:
             # Under the lock that closing a revoked authorization's pools takes, and
             # the revocation is recorded before that: a request that passed the token
@@ -460,15 +468,16 @@ def _mailbox() -> Mailbox:
                 raise ReauthenticationRequired(
                     f"This connection was signed out. To continue, {HTTP_RELOGIN_HINT}."
                 )
-            mailbox = _mailboxes.get(key)
-            if mailbox is None:
-                mailbox = _mailboxes[key] = Mailbox(settings, credentials)
-            else:
-                # A refresh of the same authorization brings a new Yandex token: new
-                # connections use it, open ones stay logged in.
-                mailbox.use_credentials(credentials)
+            shared = _mailboxes.get(key)
+            if shared is None:
+                shared = _mailboxes[key] = Mailbox(settings, credentials)
             _mailbox_used[key] = time.monotonic()
-        return mailbox
+        # The shared Mailbox is never changed: each request gets its own Mailbox over
+        # the shared pool, with its own credentials kept by everything it starts, a
+        # change waiting for confirmation included. Another request of the same
+        # authorization, say with a refreshed token, cannot alter what this one is
+        # checked against.
+        return shared.with_credentials(credentials)
     settings = _settings()
     with _mailboxes_lock:
         mailbox = _mailboxes.get(settings)
