@@ -469,8 +469,7 @@ def test_expired_access_token_is_rejected():
     clock.now += 541
     assert asyncio.run(provider.load_access_token(issued.access_token)) is None
     provider.clients.close()
-    provider.revoked.close()
-    provider.generations.close()
+    provider.authorizations.close()
 
 
 def test_only_clients_revoked_ids_and_refresh_generations_are_on_disk(tmp_path):
@@ -621,8 +620,7 @@ def test_oauth_server_starts_and_allows_the_public_host(monkeypatch, tmp_path):
     server.main([])
     # uvicorn did not run the lifespan that closes the stores.
     stores[0].close()
-    server._auth_provider.revoked.close()
-    server._auth_provider.generations.close()
+    server._auth_provider.authorizations.close()
     assert captured["public_url"] == "https://mail.example.com"
     assert "mail.example.com" in captured["security"].allowed_hosts
     assert "https://mail.example.com" in captured["security"].allowed_origins

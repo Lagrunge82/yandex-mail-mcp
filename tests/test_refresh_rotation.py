@@ -6,6 +6,7 @@ own and do not rely on Yandex.
 """
 
 import asyncio
+import sqlite3
 import threading
 from types import SimpleNamespace
 
@@ -14,9 +15,10 @@ from test_auth_server import PUBLIC, Clock, FakeYandex, _raw_keys, run_flow
 from test_revocation import call_tool, imap  # noqa: F401 (fixture)
 
 from yandex_mail_mcp.auth_server import (
+    GENERATION_MARGIN,
+    REFRESH_TTL,
+    AuthorizationStore,
     ClientStore,
-    RefreshGenerations,
-    RevokedAuthorizations,
     YandexAuthProvider,
 )
 from yandex_mail_mcp.crypto import TokenCipher, generate_key
@@ -102,29 +104,45 @@ def test_reuse_in_one_authorization_leaves_another_alone(imap):  # noqa: F811
     assert not other_call.get("isError"), other_call
 
 
-def test_two_concurrent_refreshes_with_one_token_leave_no_working_pair():
+class Gated(FakeYandex):
+    """A Yandex whose first refresh waits until the test lets it answer."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.go = threading.Event()
+
+    def refresh(self, refresh_token, scope=""):
+        if not self.entered.is_set():
+            self.entered.set()
+            assert self.go.wait(5)
+        return super().refresh(refresh_token, scope)
+
+
+def test_second_of_two_concurrent_refreshes_revokes_the_first_in_flight():
+    yandex = Gated()
+
     async def scenario(flow):
         client_id, tokens = await flow.sign_in()
-        responses = await asyncio.gather(
-            refresh(flow, client_id, tokens["refresh_token"]),
-            refresh(flow, client_id, tokens["refresh_token"]),
-        )
-        # A pair handed out before the reuse was noticed is revoked by it.
-        later = [
-            await refresh(flow, client_id, response.json()["refresh_token"])
-            for response in responses
-            if response.status_code == 200
-        ]
-        return responses, later
+        first = asyncio.ensure_future(refresh(flow, client_id, tokens["refresh_token"]))
+        # The first request has claimed the generation and waits on Yandex.
+        await asyncio.to_thread(yandex.entered.wait, 5)
+        second = await refresh(flow, client_id, tokens["refresh_token"])
+        yandex.go.set()
+        return await first, second
 
-    (responses, later), _ = run_flow(scenario)
-    errors = [response.json() for response in responses if response.status_code != 200]
-    assert any("already used" in error["error_description"] for error in errors)
-    assert all(response.json()["error"] == "invalid_grant" for response in later)
+    (first, second), _ = run_flow(scenario, yandex=yandex)
+    # Exactly one request claimed the generation; the other is the reuse, and it
+    # revoked the sign-in before the first could hand out a pair.
+    assert second.json()["error_description"].endswith("already used; sign in again")
+    assert first.json() == {
+        "error": "invalid_grant",
+        "error_description": "the authorization was revoked",
+    }
 
 
 def test_claims_are_atomic_across_threads():
-    generations = RefreshGenerations(":memory:")
+    generations = AuthorizationStore(":memory:")
     won = []
     barrier = threading.Barrier(16)
 
@@ -164,25 +182,121 @@ def test_failed_yandex_refresh_lets_the_same_token_be_used_again():
     assert retried.status_code == 200, retried.text
 
 
-def provider(db, cipher, clock):
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+def test_exchange_stopped_by_anything_leaves_the_token_usable(failure):
+    clock = Clock()
+    cipher = TokenCipher(list(_raw_keys(generate_key())), clock)
+    entered, go = threading.Event(), threading.Event()
+
+    class Breaking(FakeYandex):
+        broken = True
+
+        def refresh(self, refresh_token, scope=""):
+            if self.broken:
+                self.broken = False
+                if failure == "error":
+                    raise RuntimeError("unexpected")
+                entered.set()
+                go.wait(5)
+            return super().refresh(refresh_token, scope)
+
+    server = provider(":memory:", cipher, clock, oauth=Breaking())
+    issued = server._issue(
+        "client", ["mail.read"], {**GRANT, "yandex_expires_at": clock.now + 3600}
+    )
+
+    async def stopped():
+        loaded = await server.load_refresh_token(CLIENT, issued.refresh_token)
+        task = asyncio.ensure_future(server.exchange_refresh_token(CLIENT, loaded, ["mail.read"]))
+        if failure == "cancel":
+            await asyncio.to_thread(entered.wait, 5)
+            task.cancel()
+            go.set()
+        with pytest.raises((RuntimeError, asyncio.CancelledError)):
+            await task
+
+    asyncio.run(stopped())
+    # No new token went out, so the same one works and is not taken for a reuse.
+    assert exchange(server, issued.refresh_token) is not None
+    close(server)
+
+
+def test_store_writes_run_off_the_event_loop(monkeypatch):
+    clock = Clock()
+    cipher = TokenCipher(list(_raw_keys(generate_key())), clock)
+    server = provider(":memory:", cipher, clock)
+    threads = []
+    for name in ("claim", "revoke"):
+        original = getattr(AuthorizationStore, name)
+
+        def recording(self, *args, original=original, name=name):
+            threads.append((name, threading.current_thread() is threading.main_thread()))
+            return original(self, *args)
+
+        monkeypatch.setattr(AuthorizationStore, name, recording)
+    issued = server._issue(
+        "client", ["mail.read"], {**GRANT, "yandex_expires_at": clock.now + 3600}
+    )
+    exchange(server, issued.refresh_token)
+    with pytest.raises(Exception, match="already used"):
+        exchange(server, issued.refresh_token)  # The reuse revokes: a write too.
+    assert threads and all(not on_loop for _, on_loop in threads), threads
+    assert {name for name, _ in threads} == {"claim", "revoke"}
+    close(server)
+
+
+def test_generation_outlives_the_refresh_token_issued_after_a_slow_yandex():
+    clock = Clock()
+    cipher = TokenCipher(list(_raw_keys(generate_key())), clock)
+
+    class Slow(FakeYandex):
+        def refresh(self, refresh_token, scope=""):
+            clock.now += 5  # Yandex takes five seconds to answer.
+            return super().refresh(refresh_token, scope)
+
+    server = provider(":memory:", cipher, clock, oauth=Slow())
+    start = clock.now
+    first = server._issue("client", ["mail.read"], {**GRANT, "yandex_expires_at": clock.now + 3600})
+    second = exchange(server, first.refresh_token)
+    # The second refresh token is still valid three seconds before its end, which
+    # falls after the end of a row kept for exactly REFRESH_TTL from the claim.
+    clock.now = start + REFRESH_TTL + 2
+    assert exchange(server, second.refresh_token) is not None
+    close(server)
+
+
+def test_expired_generations_are_removed_when_the_store_opens(tmp_path):
+    clock = Clock()
+    db = str(tmp_path / "auth.db")
+    store = AuthorizationStore(db, clock)
+    assert store.claim("a" * 32, 0)
+    store.close()
+    clock.now += REFRESH_TTL + GENERATION_MARGIN + 1
+    AuthorizationStore(db, clock).close()
+    connection = sqlite3.connect(db)
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM refresh_generations").fetchone() == (0,)
+    finally:
+        connection.close()
+
+
+def provider(db, cipher, clock, oauth=None):
     return YandexAuthProvider(
         cipher=cipher,
         clients=ClientStore(db, cipher),
-        oauth=FakeYandex(),
+        oauth=oauth or FakeYandex(),
         public_url=PUBLIC,
         allow_write=False,
         allowed_users=frozenset({"ivan"}),
         clock=clock,
-        revoked=RevokedAuthorizations(db, clock),
-        generations=RefreshGenerations(db, clock),
+        authorizations=AuthorizationStore(db, clock),
     )
 
 
 def close(*providers):
     for each in providers:
         each.clients.close()
-        each.revoked.close()
-        each.generations.close()
+        each.authorizations.close()
 
 
 GRANT = {

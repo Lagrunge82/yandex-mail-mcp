@@ -20,7 +20,7 @@ from test_permissions import signed_in
 from test_pool import FakeIMAP
 
 from yandex_mail_mcp import mail, server
-from yandex_mail_mcp.auth_server import ClientStore, RevokedAuthorizations, YandexAuthProvider
+from yandex_mail_mcp.auth_server import AuthorizationStore, ClientStore, YandexAuthProvider
 from yandex_mail_mcp.config import Settings
 from yandex_mail_mcp.confirmations import ConfirmationFailed, PendingActions
 from yandex_mail_mcp.crypto import TokenCipher, generate_key
@@ -218,7 +218,7 @@ def test_revocation_survives_a_restart(tmp_path):
             allow_write=False,
             allowed_users=frozenset({"ivan"}),
             clock=clock,
-            revoked=RevokedAuthorizations(db, clock),
+            authorizations=AuthorizationStore(db, clock),
         )
 
     before = provider()
@@ -226,17 +226,15 @@ def test_revocation_survives_a_restart(tmp_path):
     assert asyncio.run(before.load_access_token(issued.access_token)) is not None
     asyncio.run(before.revoke_authorization("a" * 32, "ivan"))
     before.clients.close()
-    before.revoked.close()
-    before.generations.close()
+    before.authorizations.close()
     after = provider()
     assert asyncio.run(after.load_access_token(issued.access_token)) is None
     after.clients.close()
-    after.revoked.close()
-    after.generations.close()
+    after.authorizations.close()
     # The record goes once the last token it could stop has expired anyway.
     clock.now += 31 * 24 * 3600
-    later = RevokedAuthorizations(db, clock)
-    assert "a" * 32 not in later
+    later = AuthorizationStore(db, clock)
+    assert not later.is_revoked("a" * 32)
     later.close()
 
 
@@ -265,8 +263,7 @@ def test_tokens_issued_without_an_authorization_id_are_refused():
     client = SimpleNamespace(client_id="client")
     assert asyncio.run(provider.load_refresh_token(client, issued.refresh_token)) is None
     provider.clients.close()
-    provider.revoked.close()
-    provider.generations.close()
+    provider.authorizations.close()
 
 
 # --- Changes waiting for confirmation when the connection is signed out ----------------
@@ -301,8 +298,7 @@ def write_provider(monkeypatch):
     monkeypatch.setattr(server, "_confirmations", pending)
     yield SimpleNamespace(provider=provider, pending=pending, imap=imap)
     provider.clients.close()
-    provider.revoked.close()
-    provider.generations.close()
+    provider.authorizations.close()
 
 
 class SignedOutWhileAsked:
@@ -351,7 +347,7 @@ def test_confirmation_page_of_a_revoked_connection_changes_nothing(write_provide
         parked = asyncio.run(server.mark_read(3, NoElicitation()))
     action_id = parked["confirm_url"].rsplit("/", 1)[1]
     # Revoked in the list only, as by another server path: the page still refuses.
-    write_provider.provider.revoked.revoke("auth-1")
+    write_provider.provider.authorizations.revoke("auth-1")
     request = SimpleNamespace(path_params={"action_id": action_id}, cookies={}, method="GET")
     page = asyncio.run(write_provider.provider.confirm(request))
     assert page.status_code == 404
@@ -375,7 +371,7 @@ class RevokedJustBeforeTheLock:
     def __enter__(self):
         if not self.revoked:
             self.revoked = True
-            self.provider.revoked.revoke("auth-1")
+            self.provider.authorizations.revoke("auth-1")
             server._close_user_mailboxes("auth-1", "ivan")  # Takes the lock itself.
         return self.lock.__enter__()
 

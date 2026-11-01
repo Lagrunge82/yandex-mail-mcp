@@ -70,6 +70,8 @@ STATE_TTL = 600
 CODE_TTL = 60
 ACCESS_TTL = 3600
 REFRESH_TTL = 30 * 24 * 3600
+# How much longer a refresh generation is kept than the refresh token issued with it.
+GENERATION_MARGIN = 24 * 3600
 
 
 class ClientStore:
@@ -121,30 +123,47 @@ class ClientStore:
         self._db.close()
 
 
-class RevokedAuthorizations:
-    """Ids of revoked authorizations in SQLite, kept until their last token has expired.
+class AuthorizationStore:
+    """What the server keeps about authorizations, in SQLite: random ids and counters.
 
-    Read into memory at start, so the check on every request is a set lookup; the
-    table makes a revocation survive a restart. One server process owns the file,
-    like the rest of its state. The lock serializes writers only: each revocation
-    publishes a new dict in one assignment, so readers never wait on SQLite.
+    Two tables share one connection. revoked_authorizations holds the ids of revoked
+    authorizations, until their last token has expired. refresh_generations holds
+    the refresh generation each authorization is at.
+
+    A refresh token carries the generation it was issued in. Exchanging it claims
+    the next generation, atomically: only a token of the current generation can,
+    and only once. So a used refresh token, or a copy of one, is detected however
+    the upstream Yandex refresh token behaves. An authorization with no generation
+    row is at generation 0, the one its first refresh token was issued in.
+
+    The revoked ids are read into memory at start, so the check on every request is
+    a dict lookup that never waits on SQLite; each revocation publishes a new dict in
+    one assignment. The writes may wait on the file, so callers on an event loop run
+    them in a worker thread. One server process owns the file, like the rest of its
+    state, and a restart keeps both tables.
     """
 
     def __init__(self, path: str, clock: Callable[[], float] = time.time) -> None:
         self._clock = clock
         self._lock = threading.Lock()
         self._db = sqlite3.connect(path, check_same_thread=False)
+        now = int(clock())
         with self._lock, self._db:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS revoked_authorizations ("
                 "id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)"
             )
             self._db.execute(
-                "DELETE FROM revoked_authorizations WHERE expires_at <= ?", (int(clock()),)
+                "CREATE TABLE IF NOT EXISTS refresh_generations ("
+                "id TEXT PRIMARY KEY, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL)"
             )
+            self._db.execute("DELETE FROM revoked_authorizations WHERE expires_at <= ?", (now,))
+            self._db.execute("DELETE FROM refresh_generations WHERE expires_at <= ?", (now,))
             self._revoked: dict[str, int] = dict(
                 self._db.execute("SELECT id, expires_at FROM revoked_authorizations").fetchall()
             )
+
+    # Revocations
 
     def revoke(self, authorization: str) -> None:
         # No token of the authorization outlives this: a refresh token issued just now
@@ -163,34 +182,10 @@ class RevokedAuthorizations:
             revoked[authorization] = expires_at
             self._revoked = revoked
 
-    def __contains__(self, authorization: object) -> bool:
+    def is_revoked(self, authorization: str) -> bool:
         return authorization in self._revoked
 
-    def close(self) -> None:
-        self._db.close()
-
-
-class RefreshGenerations:
-    """The refresh generation each authorization is at, in SQLite.
-
-    A refresh token carries the generation it was issued in. Exchanging it claims
-    the next generation, atomically: only a token of the current generation can,
-    and only once, so a used refresh token, or a copy of one, is detected however
-    the upstream Yandex refresh token behaves. An authorization with no row is at
-    generation 0, the one its first refresh token was issued in. A row is kept
-    until the refresh token issued with it has expired. One server process owns
-    the file, like the rest of its state.
-    """
-
-    def __init__(self, path: str, clock: Callable[[], float] = time.time) -> None:
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._db = sqlite3.connect(path, check_same_thread=False)
-        with self._lock, self._db:
-            self._db.execute(
-                "CREATE TABLE IF NOT EXISTS refresh_generations ("
-                "id TEXT PRIMARY KEY, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL)"
-            )
+    # Refresh generations
 
     def claim(self, authorization: str, generation: int) -> bool:
         """Move the authorization from generation to the next one; False if not at it.
@@ -199,7 +194,10 @@ class RefreshGenerations:
         exchanged before, by its holder or by someone with a copy.
         """
         now = self._clock()
-        expires_at = int(now + REFRESH_TTL) + 1
+        # The token of the new generation is issued after Yandex answers, so its
+        # REFRESH_TTL ends a little later than now + REFRESH_TTL. The row must outlive
+        # it: a missing row would read as generation 0 and flag the token as reused.
+        expires_at = int(now + REFRESH_TTL + GENERATION_MARGIN)
         with self._lock, self._db:
             self._db.execute("DELETE FROM refresh_generations WHERE expires_at <= ?", (int(now),))
             row = self._db.execute(
@@ -285,7 +283,7 @@ class YandexAuthorizationCode(AuthorizationCode):
 
 class YandexRefreshToken(RefreshToken):
     grant: dict[str, Any]
-    # The refresh generation the token was issued in; see RefreshGenerations.
+    # The refresh generation the token was issued in; see AuthorizationStore.
     generation: int
 
 
@@ -351,14 +349,12 @@ class YandexAuthProvider(
         allowed_users: frozenset[str] = frozenset(),
         clock: Callable[[], float] = time.time,
         pending: PendingActions | None = None,
-        revoked: RevokedAuthorizations | None = None,
-        generations: RefreshGenerations | None = None,
+        authorizations: AuthorizationStore | None = None,
     ) -> None:
         self.cipher = cipher
         self.clients = clients
-        # Without a file (tests), revocations live in memory only.
-        self.revoked = revoked or RevokedAuthorizations(":memory:", clock)
-        self.generations = generations or RefreshGenerations(":memory:", clock)
+        # Without a file (tests), revocations and refresh generations live in memory.
+        self.authorizations = authorizations or AuthorizationStore(":memory:", clock)
         # Told about each revocation, with the authorization id and the Yandex login,
         # so the MCP server can close the IMAP connections opened for it.
         self.on_revoke: Callable[[str, str], None] | None = None
@@ -712,7 +708,7 @@ class YandexAuthProvider(
                 "ask the assistant again if you still want it.",
                 404,
             )
-        if pending.authorization in self.revoked:
+        if self.authorizations.is_revoked(pending.authorization):
             return _page(
                 "The connection that asked for this change was signed out. Nothing was changed.",
                 404,
@@ -822,13 +818,13 @@ class YandexAuthProvider(
         # Tokens issued before authorizations had ids cannot be revoked one by one,
         # so they are refused and the client signs in again.
         authorization = grant.get("authorization")
-        if not isinstance(authorization, str) or authorization in self.revoked:
+        if not isinstance(authorization, str) or self.authorizations.is_revoked(authorization):
             return False
         # Removing someone from MCP_ALLOWED_USERS ends their tokens, not just new sign-ins.
         return self.allowed(str(grant["login"])) or self.allowed(str(grant["email"]))
 
     def authorization_revoked(self, authorization: str) -> bool:
-        return authorization in self.revoked
+        return self.authorizations.is_revoked(authorization)
 
     async def revoke_authorization(self, authorization: str, login: str) -> None:
         """End every token of this authorization here, without waiting for Yandex.
@@ -836,7 +832,7 @@ class YandexAuthProvider(
         Changes the authorization left waiting for the browser are dropped, and the
         MCP server closes the IMAP connections opened for it.
         """
-        self.revoked.revoke(authorization)
+        await anyio.to_thread.run_sync(lambda: self.authorizations.revoke(authorization))
         if self.pending is not None:
             self.pending.discard(authorization)
         LOG.info("Authorization of Yandex login %s revoked", login)
@@ -931,15 +927,18 @@ class YandexAuthProvider(
 
         The generation is claimed before Yandex is asked, so a replayed token never
         reaches Yandex, and of two requests with one token only one can win. If the
-        Yandex refresh fails, the claim is released and the client may retry with the
-        same token. A token that is not of the current generation was exchanged
+        exchange fails for any reason before a new token is issued, the claim is
+        released and the client may retry with the same token. A token that is not of the current generation was exchanged
         before: either a copy of it is in other hands or the client replayed it. Both
         copies are then useless, the authorization is revoked, and the user signs in
         again.
         """
         grant = refresh_token.grant
         authorization, generation = str(grant["authorization"]), refresh_token.generation
-        if not self.generations.claim(authorization, generation):
+        claimed = await anyio.to_thread.run_sync(
+            lambda: self.authorizations.claim(authorization, generation)
+        )
+        if not claimed:
             LOG.warning(
                 "Refresh token of Yandex login %s used again: authorization revoked",
                 grant["login"],
@@ -947,23 +946,35 @@ class YandexAuthProvider(
             await self.revoke_authorization(authorization, str(grant["login"]))
             raise TokenError("invalid_grant", "this refresh token was already used; sign in again")
         try:
-            tokens = await anyio.to_thread.run_sync(
-                lambda: self.oauth.refresh(grant["yandex_refresh_token"], grant["yandex_scope"])
-            )
-        except YandexOAuthError as exc:
-            self.generations.release(authorization, generation)
-            raise TokenError("invalid_grant", f"Yandex refused the refresh ({exc.error})") from exc
-        if not self._grant_valid(grant):
-            # Revoked while Yandex was answering.
-            raise TokenError("invalid_grant", "the authorization was revoked")
-        fresh = {
-            **grant,
-            "yandex_access_token": tokens.access_token,
-            "yandex_refresh_token": tokens.refresh_token,
-            "yandex_expires_at": tokens.expires_at,
-            "yandex_scope": tokens.scope,
-        }
-        return self._issue(client.client_id, scopes, fresh, generation + 1)
+            try:
+                tokens = await anyio.to_thread.run_sync(
+                    lambda: self.oauth.refresh(grant["yandex_refresh_token"], grant["yandex_scope"])
+                )
+            except YandexOAuthError as exc:
+                raise TokenError(
+                    "invalid_grant", f"Yandex refused the refresh ({exc.error})"
+                ) from exc
+            if not self._grant_valid(grant):
+                # Revoked while Yandex was answering.
+                raise TokenError("invalid_grant", "the authorization was revoked")
+            fresh = {
+                **grant,
+                "yandex_access_token": tokens.access_token,
+                "yandex_refresh_token": tokens.refresh_token,
+                "yandex_expires_at": tokens.expires_at,
+                "yandex_scope": tokens.scope,
+            }
+            return self._issue(client.client_id, scopes, fresh, generation + 1)
+        except BaseException:
+            # No new token went out, whatever stopped the exchange (Yandex, an error,
+            # the request cancelled): the client's token must stay usable, or its retry
+            # would read as a reuse and end the sign-in. Shielded, so a cancellation
+            # cannot skip the release.
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(
+                    lambda: self.authorizations.release(authorization, generation)
+                )
+            raise
 
     async def revoke_token(self, token: AccessToken | YandexRefreshToken) -> None:
         """Revoke the token's authorization here, then the Yandex grant inside.
