@@ -989,9 +989,11 @@ async def move_email(
             "the message can be moved back.\n"
             + _folder_line("From folder (requested by the assistant)", source_folder)
             + "\n"
-            + _folder_line("To folder (requested by the assistant)", target)
+            + _folder_line("To folder (requested by the assistant)", target.folder)
         ),
-        lambda target: mailbox.move(uid, target, source_folder),
+        lambda target: mailbox.move(
+            uid, target.folder, source_folder, uidvalidity=target.uidvalidity
+        ),
         name="Move",
     )
 
@@ -1025,9 +1027,11 @@ async def move_emails(
             "they can be moved back.\n"
             + _folder_line("From folder (requested by the assistant)", source_folder)
             + "\n"
-            + _folder_line("To folder (requested by the assistant)", target)
+            + _folder_line("To folder (requested by the assistant)", target.folder)
         ),
-        lambda target: mailbox.move_many(uids, target, source_folder),
+        lambda target: mailbox.move_many(
+            uids, target.folder, source_folder, uidvalidity=target.uidvalidity
+        ),
         name="Move",
     )
 
@@ -1049,9 +1053,9 @@ async def archive_email(uid: int, ctx: Context, source_folder: str = "INBOX") ->
             f"Archive message UID {uid}? Nothing is deleted; the message can be moved back.\n"
             + _folder_line("From folder (requested by the assistant)", source_folder)
             + "\n"
-            + _folder_line("Archive folder", target)
+            + _folder_line("Archive folder", target.folder)
         ),
-        lambda target: mailbox.move(uid, None, source_folder),
+        lambda target: mailbox.move(uid, None, source_folder, uidvalidity=target.uidvalidity),
         name="Archive",
     )
 
@@ -1063,11 +1067,13 @@ async def _flag_change(
     return await _confirmed_mutation(
         ctx,
         mailbox,
-        lambda: (mailbox.preview_flag(uid, folder), folder),
+        lambda: mailbox.preview_flag(uid, folder),
         lambda target: (
-            f"{question}\n" + _folder_line("Folder (requested by the assistant)", target)
+            f"{question}\n" + _folder_line("Folder (requested by the assistant)", target.folder)
         ),
-        lambda target: mailbox.set_flag(uid, flag, value, target),
+        lambda target: mailbox.set_flag(
+            uid, flag, value, target.folder, uidvalidity=target.uidvalidity
+        ),
         name=name,
         confirm=mailbox.config.confirm_reversible,
         reversible=True,
@@ -1180,9 +1186,11 @@ async def move_to_promotions(uid: int, ctx: Context, confirm: bool = False) -> d
             f"Move message UID {uid} from INBOX to the promotions folder? "
             "Nothing is deleted; the message can be moved back manually in Yandex Mail.\n"
             f"Destination folder (configured by the operator): "
-            f"{json.dumps(target, ensure_ascii=False)}"
+            f"{json.dumps(target.folder, ensure_ascii=False)}"
         ),
-        lambda target: mailbox.move_to_promotions(uid=uid, confirm=True),
+        lambda target: mailbox.move_to_promotions(
+            uid=uid, confirm=True, uidvalidity=target.uidvalidity
+        ),
         name="Move",
     )
 

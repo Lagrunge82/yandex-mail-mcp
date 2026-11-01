@@ -176,7 +176,7 @@ def test_preview_reads_every_header_at_once_and_names_missing_messages():
     messages, destination = box.preview_moves([4, 3], "github|ci/cd")
     assert [m["uid"] for m in messages] == [4, 3]
     assert messages[0]["subject"] == "Run failed: Build image"
-    assert destination == "github|ci/cd"
+    assert destination.folder == "github|ci/cd"
     assert imap.fetches == [[4, 3]]
     assert imap.selected == [("INBOX", True)]
     with pytest.raises(MailLookupError, match="UID 9, 10"):

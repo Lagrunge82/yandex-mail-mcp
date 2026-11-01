@@ -16,7 +16,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from yandex_mail_mcp import server
 from yandex_mail_mcp.config import Settings
 from yandex_mail_mcp.credentials import ReauthenticationRequired
-from yandex_mail_mcp.mail import Mailbox, MailPermissionError, MailValueError
+from yandex_mail_mcp.mail import Mailbox, MailPermissionError, MailValueError, Target
 
 
 @pytest.fixture(autouse=True)
@@ -290,9 +290,10 @@ def test_move_requires_client_acceptance(monkeypatch, action, approved, moved):
             return None
 
         def preview_promotions_move(self, uid):
-            return {"from": "alice", "subject": "example"}, "AI-Promotions"
+            return {"from": "alice", "subject": "example"}, Target("AI-Promotions", 7)
 
-        def move_to_promotions(self, uid, confirm):
+        def move_to_promotions(self, uid, confirm, uidvalidity):
+            assert uidvalidity == 7, "the UIDVALIDITY of the preview reaches the move"
             calls.append(uid)
             return {"uid": uid}
 
@@ -323,7 +324,7 @@ def test_move_elicitation_shows_untrusted_headers_on_one_line(monkeypatch):
 
         def preview_promotions_move(self, uid):
             headers = {"from": "Bank\r\nSupport <a@example.com>", "subject": subject}
-            return headers, "Промо"
+            return headers, Target("Промо", 7)
 
     class Client:
         session = SimpleNamespace(check_client_capability=lambda capability: True)

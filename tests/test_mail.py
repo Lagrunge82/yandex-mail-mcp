@@ -452,7 +452,7 @@ def test_preview_validates_folder_and_reads_headers_in_one_connection():
     box.connect = connect
     headers, folder = box.preview_promotions_move(3)
     assert headers["subject"] == "Sale"
-    assert folder == "AI-Promotions"
+    assert folder.folder == "AI-Promotions"
     assert connections == [1]
 
 
