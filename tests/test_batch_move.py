@@ -329,7 +329,10 @@ def test_batch_from_a_client_without_elicitation_waits_for_the_browser(monkeypat
     monkeypatch.setattr(
         server,
         "_auth_provider",
-        SimpleNamespace(confirm_url=lambda action_id: f"https://mail.example/confirm/{action_id}"),
+        SimpleNamespace(
+            confirm_url=lambda action_id: f"https://mail.example/confirm/{action_id}",
+            authorization_revoked=lambda authorization: False,
+        ),
     )
     with signed_in(FULL):
         parked = asyncio.run(server.move_emails([3, 5], "github", Client(elicitation=False)))

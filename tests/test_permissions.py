@@ -18,8 +18,9 @@ from test_auth_server import FakeYandex, query_of, run_flow
 from test_mutations import WriteIMAP
 
 from yandex_mail_mcp import server
-from yandex_mail_mcp.auth_server import RateLimit
+from yandex_mail_mcp.auth_server import ClientStore, RateLimit, YandexAuthProvider
 from yandex_mail_mcp.config import Settings
+from yandex_mail_mcp.crypto import TokenCipher, generate_key
 from yandex_mail_mcp.mail import Mailbox
 from yandex_mail_mcp.yandex_oauth import YandexTokens, YandexUser
 
@@ -33,12 +34,19 @@ def run_sync_inline(monkeypatch):
 
 
 @contextmanager
-def signed_in(scope, login="ivan", token="ya-secret-token-123", scopes=("mail.read", "mail.write")):
+def signed_in(
+    scope,
+    login="ivan",
+    token="ya-secret-token-123",
+    scopes=("mail.read", "mail.write"),
+    authorization="auth-1",
+):
     access = AccessToken(
         token="bearer",
         client_id="client-1",
         scopes=list(scopes),
         claims={
+            "authorization_id": authorization,
             "yandex_access_token": token,
             "yandex_login": login,
             "yandex_email": f"{login}@yandex.ru",
@@ -152,12 +160,29 @@ def test_allowlist_matches_login_or_address_case_insensitively(monkeypatch):
 
 def test_logout_revokes_the_token_of_the_request(monkeypatch, user_mailboxes):
     yandex = FakeYandex()
+    cipher = TokenCipher.from_env(generate_key())
+    provider = YandexAuthProvider(
+        cipher=cipher,
+        clients=ClientStore(":memory:", cipher),
+        oauth=yandex,
+        public_url="http://127.0.0.1:8000",
+        allow_write=False,
+        allowed_users=frozenset({"ivan"}),
+    )
+    provider.on_revoke = server._close_user_mailboxes
     monkeypatch.setattr(server, "_yandex_oauth", yandex)
+    monkeypatch.setattr(server, "_auth_provider", provider)
     with signed_in("mail:imap_ro", token="ya-token-of-ivan"):
         server._mailbox()
-        assert asyncio.run(server.logout()) == {"signed_out": "ivan", "revoked": True}
+        assert asyncio.run(server.logout()) == {
+            "signed_out": "ivan",
+            "revoked": True,
+            "yandex_revoked": True,
+        }
     assert yandex.revoked == ["ya-token-of-ivan"]
-    assert ("user", "ivan") not in server._mailboxes
+    assert provider.authorization_revoked("auth-1")
+    assert server._mailboxes == {}
+    provider.clients.close()
 
 
 def test_logout_without_a_signed_in_user_points_to_the_command(monkeypatch):

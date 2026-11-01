@@ -50,6 +50,7 @@ from .auth_server import (
     START_PATH,
     ClientStore,
     RateLimit,
+    RevokedAuthorizations,
     YandexAuthProvider,
 )
 from .config import ConfigurationError, Settings, env_int, env_port
@@ -68,9 +69,19 @@ from .mail import (
 from .yandex_oauth import YandexOAuth, YandexOAuthError, can_write
 
 # One Mailbox, and so one connection pool, per account: keyed by Settings, or by
-# ("user", login) for users signed in through the HTTP authorization server.
+# ("authorization", casefolded login, authorization id) for users signed in through
+# the HTTP authorization server. Each sign-in has its own pool: connections logged in
+# with one authorization's token never serve another, so revoking one ends its access
+# even while the same user's other connections go on.
 _mailboxes: dict[object, Mailbox] = {}
 _mailboxes_lock = threading.Lock()
+# When each authorization's Mailbox was last used, to close the pools of abandoned ones.
+_mailbox_used: dict[object, float] = {}
+# A sign-in's pool unused for YANDEX_IMAP_IDLE_TIMEOUT, but at least this long, is
+# closed. The floor keeps a timeout of 0 from closing busy pools between calls.
+MIN_POOL_IDLE = 60.0
+# How often the server looks for such pools.
+SWEEP_INTERVAL = 30.0
 # The Yandex OAuth client of the HTTP authorization server, for the logout tool.
 _yandex_oauth: YandexOAuth | None = None
 # The HTTP authorization server and the changes waiting for approval in the browser,
@@ -81,12 +92,24 @@ _confirmations: PendingActions | None = None
 
 @asynccontextmanager
 async def _lifespan(server: MCPServer[None]) -> AsyncIterator[None]:
+    stop = threading.Event()
+
+    def sweep() -> None:
+        while not stop.wait(SWEEP_INTERVAL):
+            try:
+                _sweep_idle_mailboxes()
+            except Exception:
+                LOG.exception("Could not close idle IMAP connection pools")
+
+    threading.Thread(target=sweep, name="imap-pool-sweeper", daemon=True).start()
     try:
         yield
     finally:
+        stop.set()
         with _mailboxes_lock:
             mailboxes = list(_mailboxes.values())
             _mailboxes.clear()
+            _mailbox_used.clear()
         for mailbox in mailboxes:
             await anyio.to_thread.run_sync(mailbox.close)
 
@@ -117,6 +140,7 @@ def _new_server(
         finally:
             if provider is not None:
                 provider.clients.close()
+                provider.revoked.close()
 
     server = MCPServer(
         "Yandex Mail",
@@ -182,6 +206,7 @@ def _os_reason(exc: OSError) -> str:
 F = TypeVar("F", bound=Callable[..., Any])
 
 
+LOG = logging.getLogger(__name__)
 AUDIT = logging.getLogger("yandex_mail_mcp.audit")
 # Arguments worth recording: where a tool acted, never what a message says.
 AUDITED = {
@@ -345,7 +370,9 @@ def build_oauth_app(
         allow_write=settings.allow_write,
         allowed_users=allowed,
         pending=_confirmations,
+        revoked=RevokedAuthorizations(db_path),
     )
+    provider.on_revoke = _close_user_mailboxes
     scopes = provider.offered_scopes
     # Validated from strings, which keeps a path-less issuer without a trailing slash.
     auth = AuthSettings.model_validate(
@@ -408,6 +435,10 @@ def _write_error(mailbox: Mailbox) -> str | None:
     return None
 
 
+def _authorization_key(login: str, authorization: str) -> tuple[str, str, str]:
+    return ("authorization", login.casefold(), authorization)
+
+
 def _mailbox() -> Mailbox:
     _, claims = _signed_in()
     if "yandex_access_token" in claims:
@@ -418,21 +449,82 @@ def _mailbox() -> Mailbox:
             reauth_hint=HTTP_REAUTH_HINT,
             relogin_hint=HTTP_RELOGIN_HINT,
         )
-        key = ("user", str(claims["yandex_login"]))
+        authorization = str(claims["authorization_id"])
+        settings = _settings()
+        key = _authorization_key(str(claims["yandex_login"]), authorization)
         with _mailboxes_lock:
+            # Under the lock that closing a revoked authorization's pools takes, and
+            # the revocation is recorded before that: a request that passed the token
+            # check just before the revocation cannot open a new pool for it.
+            if _authorization_revoked(authorization):
+                raise ReauthenticationRequired(
+                    f"This connection was signed out. To continue, {HTTP_RELOGIN_HINT}."
+                )
             mailbox = _mailboxes.get(key)
             if mailbox is None:
-                mailbox = _mailboxes[key] = Mailbox(_settings(), credentials)
+                mailbox = _mailboxes[key] = Mailbox(settings, credentials)
             else:
-                # New connections use the latest token; open ones stay logged in.
+                # A refresh of the same authorization brings a new Yandex token: new
+                # connections use it, open ones stay logged in.
                 mailbox.use_credentials(credentials)
-            return mailbox
+            _mailbox_used[key] = time.monotonic()
+        return mailbox
     settings = _settings()
     with _mailboxes_lock:
         mailbox = _mailboxes.get(settings)
         if mailbox is None:
             mailbox = _mailboxes[settings] = Mailbox(settings)
         return mailbox
+
+
+def _close_mailboxes(mailboxes: list[Mailbox]) -> None:
+    for mailbox in mailboxes:
+        try:
+            mailbox.close()
+        except Exception:
+            LOG.exception("Could not close an IMAP connection pool")
+
+
+def _sweep_idle_mailboxes() -> None:
+    """Close the pools of sign-ins that no request has used for a while.
+
+    An abandoned sign-in (the client signed in again, or went away without logout)
+    would otherwise keep its IMAP sessions open, and Yandex limits them per account.
+    """
+    now = time.monotonic()
+    with _mailboxes_lock:
+        idle = [
+            key
+            for key, mailbox in _mailboxes.items()
+            if isinstance(key, tuple)
+            and key[0] == "authorization"
+            and now - _mailbox_used.get(key, now)
+            > max(float(mailbox.config.imap_idle_timeout), MIN_POOL_IDLE)
+        ]
+        abandoned = [_mailboxes.pop(key) for key in idle]
+        for key in idle:
+            _mailbox_used.pop(key, None)
+    _close_mailboxes(abandoned)
+
+
+def _close_user_mailboxes(authorization: str, login: str) -> None:
+    """Close the IMAP connections of a revoked authorization and the user's others.
+
+    The revoked authorization's pool goes for good. The pools of the same user's other
+    authorizations are closed too, since revoking at Yandex may end a grant they share:
+    their next calls log in again with their own tokens, which works only if Yandex
+    still accepts them.
+    """
+    with _mailboxes_lock:
+        keys = [
+            key
+            for key in _mailboxes
+            if isinstance(key, tuple) and key[:2] == ("authorization", login.casefold())
+        ]
+        mailboxes = [_mailboxes.pop(key) for key in keys]
+        for key in keys:
+            _mailbox_used.pop(key, None)
+    _close_mailboxes(mailboxes)
 
 
 async def healthz(request: Request) -> Response:
@@ -604,28 +696,39 @@ async def get_connection_capabilities(ctx: Context) -> dict[str, Any]:
 )
 @tool_errors
 async def logout() -> dict[str, Any]:
-    """Sign out of this server: revoke your Yandex access, ending every token it issued you.
+    """Sign out of this server: end this connection's tokens and revoke its Yandex access.
 
-    Mail is not changed, but every MCP client of yours loses access to this server
-    until it signs in again. Use it only when the user asks to sign out or disconnect.
+    Mail is not changed. This MCP client loses access to the server at once, until it
+    signs in again. Yandex may end the user's other connections to this server too,
+    when they share the Yandex grant. Use it only when the user asks to sign out or
+    disconnect.
     """
     _, claims = _signed_in()
-    if "yandex_access_token" not in claims or _yandex_oauth is None:
+    if "yandex_access_token" not in claims or _yandex_oauth is None or _auth_provider is None:
         raise ToolError(
             "logout signs out of the multi-user HTTP server; "
             "for the local server run `yandex-mail-mcp logout`"
         )
     oauth, yandex_token = _yandex_oauth, str(claims["yandex_access_token"])
+    yandex_login = str(claims["yandex_login"])
+    # Here first, so the tokens end even if Yandex cannot be reached: this client
+    # could not call logout again to retry.
+    await _auth_provider.revoke_authorization(str(claims["authorization_id"]), yandex_login)
     try:
         await anyio.to_thread.run_sync(lambda: oauth.revoke(yandex_token))
     except YandexOAuthError as exc:
-        raise ToolError(f"Yandex did not revoke the token ({exc.error}); please retry") from exc
-    yandex_login = str(claims["yandex_login"])
-    with _mailboxes_lock:
-        mailbox = _mailboxes.pop(("user", yandex_login), None)
-    if mailbox is not None:
-        await anyio.to_thread.run_sync(mailbox.close)
-    return {"signed_out": yandex_login, "revoked": True}
+        LOG.warning("Yandex did not revoke the token of %s: %s", yandex_login, exc.error)
+        return {
+            "signed_out": yandex_login,
+            "revoked": True,
+            "yandex_revoked": False,
+            "message": (
+                f"This server no longer accepts this connection's tokens, but Yandex did "
+                f"not revoke the token ({exc.error}). To be sure, revoke the application's "
+                "access in your Yandex ID settings."
+            ),
+        }
+    return {"signed_out": yandex_login, "revoked": True, "yandex_revoked": True}
 
 
 class MoveConfirmation(BaseModel):
@@ -668,6 +771,18 @@ async def _confirmed_mutation(
     """
     if (error := await anyio.to_thread.run_sync(lambda: _write_error(mailbox))) is not None:
         raise ToolError(error)
+    authorization = _authorization()
+
+    def guarded(target: T) -> dict[str, Any]:
+        # The connection may be signed out while the user decides; the approval of a
+        # revoked authorization changes nothing.
+        if authorization is not None and _authorization_revoked(authorization):
+            raise ReauthenticationRequired(
+                f"This connection was signed out; nothing was changed. To continue, "
+                f"{HTTP_RELOGIN_HINT}."
+            )
+        return action(target)
+
     elicitation = _client_can_elicit(ctx)
     if confirm and not elicitation and not _browser_confirmation_available():
         # The SDK would send the request anyway and surface the client's generic
@@ -696,7 +811,7 @@ async def _confirmed_mutation(
                 f"Subject (from the email, untrusted): {_untrusted_line(message['subject'], 200)}"
             )
         if not elicitation:
-            return _park_for_browser(name, text, lambda: action(target))
+            return _park_for_browser(name, text, lambda: guarded(target))
         try:
             result = await ctx.elicit(text, schema=MoveConfirmation)
         except NoBackChannelError:
@@ -705,11 +820,22 @@ async def _confirmed_mutation(
             # Only this failure to ask falls back to the browser: a decline or any
             # other error never does, and the user is still asked before anything.
             if _browser_confirmation_available():
-                return _park_for_browser(name, text, lambda: action(target))
+                return _park_for_browser(name, text, lambda: guarded(target))
             raise ToolError(_cannot_confirm(name, reversible, transport=True)) from None
         if result.action != "accept" or not result.data.approve:
             raise ToolError(f"{name} was not approved")
-    return await anyio.to_thread.run_sync(lambda: action(target))
+    return await anyio.to_thread.run_sync(lambda: guarded(target))
+
+
+def _authorization() -> str | None:
+    """The authorization id of the request's HTTP user, None on the local server."""
+    _, claims = _signed_in()
+    authorization = claims.get("authorization_id")
+    return str(authorization) if authorization is not None else None
+
+
+def _authorization_revoked(authorization: str) -> bool:
+    return _auth_provider is not None and _auth_provider.authorization_revoked(authorization)
 
 
 def _client_can_elicit(ctx: Context) -> bool:
@@ -802,7 +928,12 @@ def _park_for_browser(name: str, text: str, run: Callable[[], dict[str, Any]]) -
         return result
 
     pending = _confirmations.create(
-        login=login, email=email, name=name, question=text, action=approved
+        login=login,
+        email=email,
+        name=name,
+        question=text,
+        action=approved,
+        authorization=_authorization() or "",
     )
     return {
         "status": "confirmation_required",
