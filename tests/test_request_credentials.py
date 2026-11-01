@@ -14,6 +14,7 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 from test_mutations import HEADER
 from test_permissions import signed_in
+from test_pool import FakeIMAP
 from test_revocation import TokenIMAP, write_provider  # noqa: F401 (fixture)
 
 from yandex_mail_mcp import mail, server
@@ -141,14 +142,31 @@ def test_tokens_of_different_scopes_do_not_share_a_pool(real_pool):
     assert read_only.pool is not full.pool
 
 
-def test_approved_write_logs_in_with_the_token_of_the_request_that_asked(real_pool):
-    # The pool is empty when the user approves, so the write opens a connection, and
-    # it must log in with the token of the request that asked, not the later one.
-    client = AnotherRequestWhileAsked("auth-1")
+class LaterRequestWhileAsked(AnotherRequestWhileAsked):
+    """The user approves after a request of the same sign-in and scope, with a newer
+    token, has used the server: the same pool, so the old code logged in with its token."""
+
+    async def elicit(self, message, schema):
+        self.asked.append(message)
+        with signed_in(FULL, token="ya-later", authorization=self.authorization):
+            server._mailbox()
+        return SimpleNamespace(action="accept", data=SimpleNamespace(approve=True))
+
+
+def test_approved_write_logs_in_with_the_token_of_the_request_that_asked(real_pool, monkeypatch):
+    # With no idle connection kept, the write opens its own connection after the later
+    # request; it must log in with the token of the request that asked.
+    monkeypatch.setattr(
+        server, "_settings", lambda: Settings(allow_write=True, imap_idle_timeout=0)
+    )
+    FakeIMAP.instances = []
+    client = LaterRequestWhileAsked("auth-1")
     with signed_in(FULL, token="ya-asked"):
         result = asyncio.run(server.mark_read(3, client))
     assert client.asked and result["uid"] == 3
     assert real_pool == [("ya-asked", [3], ["\\Seen"])]
+    # The preview and the write each logged in: the write did not reuse a connection.
+    assert [session.token for session in FakeIMAP.instances] == ["ya-asked", "ya-asked"]
 
 
 def test_mailbox_over_a_shared_pool_does_not_close_it(real_pool):
