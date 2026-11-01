@@ -139,8 +139,13 @@ def _uidvalidity(response: Any) -> int | None:
 def _check_uidvalidity(folder: str, uidvalidity: int | None, response: Any) -> None:
     """Refuse a change when the folder is no longer the one the user confirmed.
 
-    uidvalidity None means the server reported none when the messages were read,
-    so there is nothing to compare; a reported value must be reported again, equal.
+    A value reported when the messages were read must be reported again, equal:
+    one that differs or has disappeared is refused, since the check was possible
+    and now is not. uidvalidity None means the server reported none then, so there
+    is nothing to compare, and the change goes ahead whatever SELECT reports now.
+    Refusing it would stop every change on a server that leaves UIDVALIDITY out of
+    EXAMINE; such a server gets the old name-and-UID check only. Every change method
+    takes uidvalidity without a default, so a caller passes None only on purpose.
     """
     if uidvalidity is not None and _uidvalidity(response) != uidvalidity:
         raise MailChangedError(
@@ -1238,9 +1243,7 @@ class Mailbox:
             raise MailPermissionError(error)
 
     @staticmethod
-    def _select_message(
-        imap: IMAPClient, uid: int, folder: str, uidvalidity: int | None = None
-    ) -> None:
+    def _select_message(imap: IMAPClient, uid: int, folder: str, uidvalidity: int | None) -> None:
         """Select the folder for a change and check that the message is still there.
 
         uidvalidity is the folder's UIDVALIDITY when the user confirmed the change;
@@ -1252,7 +1255,7 @@ class Mailbox:
 
     @staticmethod
     def _select_messages(
-        imap: IMAPClient, uids: list[int], folder: str, uidvalidity: int | None = None
+        imap: IMAPClient, uids: list[int], folder: str, uidvalidity: int | None
     ) -> None:
         _check_uidvalidity(folder, uidvalidity, imap.select_folder(folder, readonly=False))
         present = set(imap.search(["UID", ",".join(str(uid) for uid in uids)]))
@@ -1304,7 +1307,7 @@ class Mailbox:
         folder: str,
         source_folder: str = "INBOX",
         *,
-        uidvalidity: int | None = None,
+        uidvalidity: int | None,
     ) -> dict[str, Any]:
         """Move a batch of messages with one MOVE and report what actually moved.
 
@@ -1426,7 +1429,7 @@ class Mailbox:
         folder: str | None = None,
         source_folder: str = "INBOX",
         *,
-        uidvalidity: int | None = None,
+        uidvalidity: int | None,
     ) -> dict[str, Any]:
         """Move one message; folder=None means the archive folder.
 
@@ -1466,7 +1469,7 @@ class Mailbox:
         value: bool,
         folder: str = "INBOX",
         *,
-        uidvalidity: int | None = None,
+        uidvalidity: int | None,
     ) -> dict[str, Any]:
         """Add or remove \\Seen or \\Flagged on one message.
 
@@ -1580,7 +1583,7 @@ class Mailbox:
         }
 
     def move_to_promotions(
-        self, uid: int, confirm: bool = False, *, uidvalidity: int | None = None
+        self, uid: int, confirm: bool = False, *, uidvalidity: int | None
     ) -> dict[str, Any]:
         valid_uid(uid)
         self._require_write()
@@ -1589,8 +1592,9 @@ class Mailbox:
         self._promotions_folder_name()
         with self.connect() as imap:
             folder, exists = self.validate_promotions_folder(imap)
+            # The message first: a refused change must not leave a new folder behind.
+            self._select_message(imap, uid, "INBOX", uidvalidity)
             if not exists:
                 imap.create_folder(folder)
-            self._select_message(imap, uid, "INBOX", uidvalidity)
             imap.move([uid], folder)
         return {"uid": uid, "moved_to": folder, "deleted_permanently": False}

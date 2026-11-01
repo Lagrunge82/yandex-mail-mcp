@@ -191,7 +191,7 @@ def test_preview_reads_every_header_at_once_and_names_missing_messages():
 def test_move_many_issues_one_move_for_the_whole_batch():
     imap = BatchIMAP()
     box = box_with(imap, allow_write=True)
-    result = box.move_many([3, 4], "github|ci/cd")
+    result = box.move_many([3, 4], "github|ci/cd", uidvalidity=None)
     assert result == {
         "uids": [3, 4],
         "moved": [3, 4],
@@ -207,7 +207,7 @@ def test_move_many_issues_one_move_for_the_whole_batch():
 def test_copyuid_is_read_from_imaplibs_response_codes_and_cleared_first():
     imap = BatchIMAP()
     imap._imap.untagged_responses["COPYUID"] = [b"1 999 1"]  # left by an earlier command
-    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
+    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd", uidvalidity=None)
     assert (result["moved"], result["not_moved"]) == ([3, 4], [])
     assert "warning" not in result
     assert "COPYUID" not in imap._imap.untagged_responses
@@ -215,28 +215,30 @@ def test_copyuid_is_read_from_imaplibs_response_codes_and_cleared_first():
 
 def test_partial_move_is_reported_from_copyuid_even_when_the_server_says_no():
     imap = BatchIMAP(moves=[3])
-    result = box_with(imap, allow_write=True).move_many([3, 4, 5], "github|ci/cd")
+    result = box_with(imap, allow_write=True).move_many([3, 4, 5], "github|ci/cd", uidvalidity=None)
     assert (result["moved"], result["not_moved"]) == ([3], [4, 5])
     assert "moved only part of the batch; 2 messages are still in INBOX" in result["warning"]
     refused = BatchIMAP(moves=[4], refuse=True)
-    result = box_with(refused, allow_write=True).move_many([3, 4], "github|ci/cd")
+    result = box_with(refused, allow_write=True).move_many([3, 4], "github|ci/cd", uidvalidity=None)
     assert (result["moved"], result["not_moved"]) == ([4], [3])
     assert "Partial move" in result["warning"]
     # Nothing moved before the refusal: the error is the caller's to see.
     with pytest.raises(imaplib.IMAP4.error, match="Partial move"):
-        box_with(BatchIMAP(moves=[], refuse=True), allow_write=True).move_many([3], "github")
+        box_with(BatchIMAP(moves=[], refuse=True), allow_write=True).move_many(
+            [3], "github", uidvalidity=None
+        )
 
 
 def test_message_removed_by_another_client_is_not_counted_as_moved():
     imap = BatchIMAP(vanish=[4])
-    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
+    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd", uidvalidity=None)
     assert (result["moved"], result["not_moved"]) == ([3], [4])
     assert "1 messages are still in INBOX" in result["warning"]
 
 
 def test_without_copyuid_the_outcome_is_undetermined_but_the_source_is_reported():
     imap = BatchIMAP(copyuid=False, moves=[3], vanish=[4])
-    result = box_with(imap, allow_write=True).move_many([3, 4, 5], "github|ci/cd")
+    result = box_with(imap, allow_write=True).move_many([3, 4, 5], "github|ci/cd", uidvalidity=None)
     assert result["moved"] is None
     assert result["left_source"] == [3, 4]  # moved, or removed by another client
     assert result["not_moved"] == [5]
@@ -244,7 +246,7 @@ def test_without_copyuid_the_outcome_is_undetermined_but_the_source_is_reported(
     # A NO without COPYUID and nothing gone from the source is a plain error.
     with pytest.raises(imaplib.IMAP4.error):
         box_with(BatchIMAP(copyuid=False, moves=[], refuse=True), allow_write=True).move_many(
-            [3], "github"
+            [3], "github", uidvalidity=None
         )
 
     class Unreadable(BatchIMAP):
@@ -254,7 +256,7 @@ def test_without_copyuid_the_outcome_is_undetermined_but_the_source_is_reported(
             return super().search(criteria)
 
     imap = Unreadable(copyuid=False)
-    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd")
+    result = box_with(imap, allow_write=True).move_many([3, 4], "github|ci/cd", uidvalidity=None)
     assert (result["moved"], result["not_moved"], result["left_source"]) == (None, None, None)
     assert "check both folders" in result["warning"]
 
@@ -262,9 +264,9 @@ def test_without_copyuid_the_outcome_is_undetermined_but_the_source_is_reported(
 def test_move_many_moves_nothing_when_a_message_is_missing_or_writes_are_off():
     imap = BatchIMAP()
     with pytest.raises(MailLookupError, match="UID 9"):
-        box_with(imap, allow_write=True).move_many([3, 9], "github|ci/cd")
+        box_with(imap, allow_write=True).move_many([3, 9], "github|ci/cd", uidvalidity=None)
     with pytest.raises(MailPermissionError):
-        box_with(imap).move_many([3], "github|ci/cd")
+        box_with(imap).move_many([3], "github|ci/cd", uidvalidity=None)
     assert imap.changes == []
 
 
