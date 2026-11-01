@@ -84,6 +84,15 @@ def user_mailbox(monkeypatch, imap):
     yield imap
 
 
+async def decide(client, url, decision, origin=PUBLIC):
+    """Decide on a confirmation as the user's browser does: open the page, then post
+    its form, with the form's token and this server's Origin."""
+    page = await client.get(url)
+    token = re.search(r"name=csrf value='([^']*)'", page.text)
+    data = {"decision": decision, **({"csrf": token.group(1)} if token else {})}
+    return await client.post(url, data=data, headers={"Origin": origin})
+
+
 # --- Scope negotiation -------------------------------------------------------------
 
 
@@ -288,13 +297,11 @@ def test_move_from_a_client_without_elicitation_is_confirmed_in_the_browser(monk
             seen["parked"] = parked
             url = parked["confirm_url"]
             seen["page"] = await flow.client.get(url)
-            seen["approved"] = await flow.client.post(url, data={"decision": "approve"})
-            seen["again"] = await flow.client.post(url, data={"decision": "approve"})
+            seen["approved"] = await decide(flow.client, url, "approve")
+            seen["again"] = await decide(flow.client, url, "approve")
             # A second change, rejected this time.
             rejected = await server.move_email(3, "github", Client(elicitation=False))
-            seen["rejected"] = await flow.client.post(
-                rejected["confirm_url"], data={"decision": "reject"}
-            )
+            seen["rejected"] = await decide(flow.client, rejected["confirm_url"], "reject")
         return seen
 
     seen, _ = run_flow(scenario, settings=Settings(allow_write=True), yandex=FakeYandex(scope=FULL))
@@ -361,7 +368,7 @@ def test_approved_change_that_fails_shows_the_reason(monkeypatch):
         with user_mailbox(monkeypatch, imap), signed_in(FULL):
             url = (await server.move_email(3, "github", Client(elicitation=False)))["confirm_url"]
             imap.inbox.clear()  # The message is gone before the user approves.
-            return await flow.client.post(url, data={"decision": "approve"})
+            return await decide(flow.client, url, "approve")
 
     response, _ = run_flow(
         scenario, settings=Settings(allow_write=True), yandex=FakeYandex(scope=FULL)
@@ -404,12 +411,10 @@ def test_declared_elicitation_without_a_back_channel_is_confirmed_in_the_browser
             assert imap.changes == [], "nothing moves before the approval"
             url = seen["batch"]["confirm_url"]
             seen["page"] = await flow.client.get(url)
-            seen["approved"] = await flow.client.post(url, data={"decision": "approve"})
-            seen["again"] = await flow.client.post(url, data={"decision": "approve"})
+            seen["approved"] = await decide(flow.client, url, "approve")
+            seen["again"] = await decide(flow.client, url, "approve")
             clock[0] = 601  # The single move is approved too late.
-            seen["expired"] = await flow.client.post(
-                seen["single"]["confirm_url"], data={"decision": "approve"}
-            )
+            seen["expired"] = await decide(flow.client, seen["single"]["confirm_url"], "approve")
         return seen
 
     seen, _ = run_flow(scenario, settings=Settings(allow_write=True), yandex=FakeYandex(scope=FULL))
@@ -434,9 +439,7 @@ def test_a_question_the_transport_refuses_to_send_falls_back_to_the_browser(monk
         with user_mailbox(monkeypatch, imap), signed_in(FULL):
             parked = await server.move_email(3, "github", client)
             assert imap.changes == []
-            return parked, await flow.client.post(
-                parked["confirm_url"], data={"decision": "approve"}
-            )
+            return parked, await decide(flow.client, parked["confirm_url"], "approve")
 
     (parked, approved), _ = run_flow(
         scenario, settings=Settings(allow_write=True), yandex=FakeYandex(scope=FULL)
