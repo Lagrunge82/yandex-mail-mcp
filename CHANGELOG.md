@@ -5,7 +5,7 @@
 ### Security
 
 - Revoking access on the shared HTTP server ends that sign-in's tokens on the server's own record. Each sign-in now has a random authorization id that its tokens carry, refreshed ones included. The `logout` tool and `/revoke` record the id in `MCP_AUTH_DB` for 30 days, and every request and refresh checks it, so a revoked token stops working at once whatever Yandex does, and signing in again never revives it. Changes of the revoked sign-in waiting for browser confirmation are dropped, and an approval that arrives after the revocation changes nothing.
-- IMAP connections on the shared server are pooled per sign-in instead of per Yandex login. A connection logged in with one sign-in's token never serves another, so the user's other connections can no longer keep a revoked one working. A revoked sign-in's pool is closed at once, along with the same user's other pools, which log in again with their own tokens. A pool unused for `YANDEX_IMAP_IDLE_TIMEOUT` seconds is closed.
+- IMAP connections on the shared server are pooled per sign-in instead of per Yandex login. A connection logged in with one sign-in's token never serves another, so the user's other connections can no longer keep a revoked one working. A revoked sign-in's pool is closed at once, along with the same user's other pools, which log in again with their own tokens. Every 30 seconds the server closes the pools unused for `YANDEX_IMAP_IDLE_TIMEOUT` seconds, but at least a minute, so abandoned sign-ins do not hold IMAP sessions.
 
 ### Changed
 

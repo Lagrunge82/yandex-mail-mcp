@@ -353,10 +353,36 @@ def test_confirmation_page_of_a_revoked_connection_changes_nothing(write_provide
     assert write_provider.imap.changes == []
 
 
-def test_request_admitted_before_the_revocation_opens_no_new_pool(write_provider):
-    asyncio.run(write_provider.provider.revoke_authorization("auth-1", "ivan"))
+class RevokedJustBeforeTheLock:
+    """The registry lock, with the revocation landing just before a request takes it.
+
+    That is the latest moment a revocation can race a request that already passed
+    the token check: the revocation is recorded and the user's pools closed, then the
+    request gets the lock.
+    """
+
+    def __init__(self, provider, lock):
+        self.provider = provider
+        self.lock = lock
+        self.revoked = False
+
+    def __enter__(self):
+        if not self.revoked:
+            self.revoked = True
+            self.provider.revoked.revoke("auth-1")
+            server._close_user_mailboxes("auth-1", "ivan")  # Takes the lock itself.
+        return self.lock.__enter__()
+
+    def __exit__(self, *exc):
+        return self.lock.__exit__(*exc)
+
+
+def test_request_admitted_before_the_revocation_opens_no_new_pool(write_provider, monkeypatch):
+    lock = RevokedJustBeforeTheLock(write_provider.provider, server._mailboxes_lock)
+    monkeypatch.setattr(server, "_mailboxes_lock", lock)
     with signed_in(FULL), pytest.raises(ToolError, match="signed out"):
         server.list_folders()
+    assert lock.revoked
     assert server._mailboxes == {}
 
 
@@ -382,19 +408,52 @@ def test_pools_of_abandoned_authorizations_are_closed(imap, monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
     with signed_in("mail:imap_ro", authorization="old"):
-        old = server._mailbox()
-        old.folders()
+        server._mailbox().folders()
     now[0] += 299
     with signed_in("mail:imap_ro", authorization="new"):
         server._mailbox()
+    server._sweep_idle_mailboxes()
     assert server._authorization_key("ivan", "old") in server._mailboxes
-    now[0] += 2  # Past YANDEX_IMAP_IDLE_TIMEOUT since the old pool was last used.
-    with signed_in("mail:imap_ro", authorization="new"):
-        server._mailbox()
+    # Past YANDEX_IMAP_IDLE_TIMEOUT since the old pool was last used; no other request
+    # is needed for it to go.
+    now[0] += 2
+    server._sweep_idle_mailboxes()
     assert server._authorization_key("ivan", "old") not in server._mailboxes
     assert server._authorization_key("ivan", "new") in server._mailboxes
-    for _ in range(100):  # The pool is closed in the background.
-        if imap[0].closed:
-            break
-        asyncio.run(asyncio.sleep(0.01))
+    assert imap[0].closed
+
+
+def test_idle_timeout_of_zero_keeps_busy_pools_of_other_sign_ins(imap, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(server, "_settings", lambda: Settings(imap_idle_timeout=0))
+    with signed_in("mail:imap_ro", authorization="first"):
+        first = server._mailbox()
+    now[0] += 30
+    with signed_in("mail:imap_ro", authorization="second"):
+        server._mailbox()
+    server._sweep_idle_mailboxes()
+    with signed_in("mail:imap_ro", authorization="first"):
+        assert server._mailbox() is first
+    now[0] += server.MIN_POOL_IDLE + 1
+    server._sweep_idle_mailboxes()
+    assert server._mailboxes == {}
+
+
+def test_the_server_sweeps_idle_pools_while_it_runs(imap, monkeypatch):
+    monkeypatch.setattr(server, "SWEEP_INTERVAL", 0.01)
+    monkeypatch.setattr(server, "MIN_POOL_IDLE", 0.0)
+    monkeypatch.setattr(server, "_settings", lambda: Settings(imap_idle_timeout=0))
+    with signed_in("mail:imap_ro", authorization="old"):
+        server._mailbox().folders()
+
+    async def run():
+        async with server._lifespan(server.mcp):
+            for _ in range(200):
+                if not server._mailboxes:
+                    return True
+                await asyncio.sleep(0.01)
+            return False
+
+    assert asyncio.run(run())
     assert imap[0].closed

@@ -77,6 +77,11 @@ _mailboxes: dict[object, Mailbox] = {}
 _mailboxes_lock = threading.Lock()
 # When each authorization's Mailbox was last used, to close the pools of abandoned ones.
 _mailbox_used: dict[object, float] = {}
+# A sign-in's pool unused for YANDEX_IMAP_IDLE_TIMEOUT, but at least this long, is
+# closed. The floor keeps a timeout of 0 from closing busy pools between calls.
+MIN_POOL_IDLE = 60.0
+# How often the server looks for such pools.
+SWEEP_INTERVAL = 30.0
 # The Yandex OAuth client of the HTTP authorization server, for the logout tool.
 _yandex_oauth: YandexOAuth | None = None
 # The HTTP authorization server and the changes waiting for approval in the browser,
@@ -87,9 +92,20 @@ _confirmations: PendingActions | None = None
 
 @asynccontextmanager
 async def _lifespan(server: MCPServer[None]) -> AsyncIterator[None]:
+    stop = threading.Event()
+
+    def sweep() -> None:
+        while not stop.wait(SWEEP_INTERVAL):
+            try:
+                _sweep_idle_mailboxes()
+            except Exception:
+                LOG.exception("Could not close idle IMAP connection pools")
+
+    threading.Thread(target=sweep, name="imap-pool-sweeper", daemon=True).start()
     try:
         yield
     finally:
+        stop.set()
         with _mailboxes_lock:
             mailboxes = list(_mailboxes.values())
             _mailboxes.clear()
@@ -434,27 +450,16 @@ def _mailbox() -> Mailbox:
             relogin_hint=HTTP_RELOGIN_HINT,
         )
         authorization = str(claims["authorization_id"])
-        if _authorization_revoked(authorization):
-            # A request that passed the token check just before the revocation must
-            # not open a new pool for it.
-            raise ReauthenticationRequired(
-                f"This connection was signed out. To continue, {HTTP_RELOGIN_HINT}."
-            )
         settings = _settings()
         key = _authorization_key(str(claims["yandex_login"]), authorization)
-        now = time.monotonic()
         with _mailboxes_lock:
-            idle = [
-                other
-                for other in _mailboxes
-                if isinstance(other, tuple)
-                and other[0] == "authorization"
-                and other != key
-                and now - _mailbox_used.get(other, now) > settings.imap_idle_timeout
-            ]
-            abandoned = [_mailboxes.pop(other) for other in idle]
-            for other in idle:
-                _mailbox_used.pop(other, None)
+            # Under the lock that closing a revoked authorization's pools takes, and
+            # the revocation is recorded before that: a request that passed the token
+            # check just before the revocation cannot open a new pool for it.
+            if _authorization_revoked(authorization):
+                raise ReauthenticationRequired(
+                    f"This connection was signed out. To continue, {HTTP_RELOGIN_HINT}."
+                )
             mailbox = _mailboxes.get(key)
             if mailbox is None:
                 mailbox = _mailboxes[key] = Mailbox(settings, credentials)
@@ -462,10 +467,7 @@ def _mailbox() -> Mailbox:
                 # A refresh of the same authorization brings a new Yandex token: new
                 # connections use it, open ones stay logged in.
                 mailbox.use_credentials(credentials)
-            _mailbox_used[key] = now
-        if abandoned:
-            # Logging out may wait on the network; the request does not.
-            threading.Thread(target=_close_mailboxes, args=(abandoned,), daemon=True).start()
+            _mailbox_used[key] = time.monotonic()
         return mailbox
     settings = _settings()
     with _mailboxes_lock:
@@ -481,6 +483,28 @@ def _close_mailboxes(mailboxes: list[Mailbox]) -> None:
             mailbox.close()
         except Exception:
             LOG.exception("Could not close an IMAP connection pool")
+
+
+def _sweep_idle_mailboxes() -> None:
+    """Close the pools of sign-ins that no request has used for a while.
+
+    An abandoned sign-in (the client signed in again, or went away without logout)
+    would otherwise keep its IMAP sessions open, and Yandex limits them per account.
+    """
+    now = time.monotonic()
+    with _mailboxes_lock:
+        idle = [
+            key
+            for key, mailbox in _mailboxes.items()
+            if isinstance(key, tuple)
+            and key[0] == "authorization"
+            and now - _mailbox_used.get(key, now)
+            > max(float(mailbox.config.imap_idle_timeout), MIN_POOL_IDLE)
+        ]
+        abandoned = [_mailboxes.pop(key) for key in idle]
+        for key in idle:
+            _mailbox_used.pop(key, None)
+    _close_mailboxes(abandoned)
 
 
 def _close_user_mailboxes(authorization: str, login: str) -> None:

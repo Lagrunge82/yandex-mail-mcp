@@ -123,7 +123,8 @@ class RevokedAuthorizations:
 
     Read into memory at start, so the check on every request is a set lookup; the
     table makes a revocation survive a restart. One server process owns the file,
-    like the rest of its state.
+    like the rest of its state. The lock serializes writers only: each revocation
+    publishes a new dict in one assignment, so readers never wait on SQLite.
     """
 
     def __init__(self, path: str, clock: Callable[[], float] = time.time) -> None:
@@ -138,7 +139,7 @@ class RevokedAuthorizations:
             self._db.execute(
                 "DELETE FROM revoked_authorizations WHERE expires_at <= ?", (int(clock()),)
             )
-            self._revoked = dict(
+            self._revoked: dict[str, int] = dict(
                 self._db.execute("SELECT id, expires_at FROM revoked_authorizations").fetchall()
             )
 
@@ -155,14 +156,12 @@ class RevokedAuthorizations:
                 "INSERT OR REPLACE INTO revoked_authorizations VALUES (?, ?)",
                 (authorization, expires_at),
             )
-            self._revoked = {
-                key: expires for key, expires in self._revoked.items() if expires > now
-            }
-            self._revoked[authorization] = expires_at
+            revoked = {key: expires for key, expires in self._revoked.items() if expires > now}
+            revoked[authorization] = expires_at
+            self._revoked = revoked
 
     def __contains__(self, authorization: object) -> bool:
-        with self._lock:
-            return authorization in self._revoked
+        return authorization in self._revoked
 
     def close(self) -> None:
         self._db.close()
