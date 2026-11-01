@@ -8,11 +8,12 @@ has used the server in between.
 
 import asyncio
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
+from test_mutations import HEADER
 from test_permissions import signed_in
-from test_pool import FakeIMAP
 from test_revocation import TokenIMAP, write_provider  # noqa: F401 (fixture)
 
 from yandex_mail_mcp import mail, server
@@ -89,12 +90,33 @@ def test_read_only_request_still_cannot_write_after_a_full_access_one(
     assert write_provider.imap.changes == []
 
 
-def test_new_connections_log_in_with_the_requests_own_token(monkeypatch):
-    FakeIMAP.instances = []
-    monkeypatch.setattr(mail, "IMAPClient", TokenIMAP)
+class TokenWriteIMAP(TokenIMAP):
+    """A TokenIMAP that answers the header fetch and search a flag change needs."""
+
+    changes: ClassVar[list] = []
+
+    def fetch(self, uids, fields):
+        return {uid: {b"BODY[HEADER]": HEADER} for uid in uids}
+
+    def search(self, criteria, charset=None):
+        return [3]
+
+    def add_flags(self, uids, flags):
+        TokenWriteIMAP.changes.append((self.token, uids, flags))
+
+
+@pytest.fixture
+def real_pool(monkeypatch):
+    """The real connection pool behind the server, with sessions that remember tokens."""
+    TokenWriteIMAP.changes = []
+    monkeypatch.setattr(mail, "IMAPClient", TokenWriteIMAP)
     monkeypatch.setattr(server, "_mailboxes", {})
     monkeypatch.setattr(server, "_mailbox_used", {})
-    monkeypatch.setattr(server, "_settings", lambda: Settings())
+    monkeypatch.setattr(server, "_settings", lambda: Settings(allow_write=True))
+    return TokenWriteIMAP.changes
+
+
+def test_new_connections_log_in_with_the_requests_own_token(real_pool):
     with signed_in(READ_ONLY, token="ya-first"):
         first = server._mailbox()
     with signed_in(READ_ONLY, token="ya-refreshed"):
@@ -104,3 +126,38 @@ def test_new_connections_log_in_with_the_requests_own_token(monkeypatch):
     with first.connect() as one, refreshed.connect() as other:
         assert (one.token, other.token) == ("ya-first", "ya-refreshed")
     assert first.credentials.source.access_token() == "ya-first"
+
+
+def test_tokens_of_different_scopes_do_not_share_a_pool(real_pool):
+    # Within a pool idle connections are shared, so a pool holds tokens of one scope
+    # only: a connection logged in read-only never serves a full-access request.
+    with signed_in(READ_ONLY, token="ya-read-only"):
+        read_only = server._mailbox()
+        read_only.folders()
+    with signed_in(FULL, token="ya-full"):
+        full = server._mailbox()
+        with full.connect() as imap:
+            assert imap.token == "ya-full"
+    assert read_only.pool is not full.pool
+
+
+def test_approved_write_logs_in_with_the_token_of_the_request_that_asked(real_pool):
+    # The pool is empty when the user approves, so the write opens a connection, and
+    # it must log in with the token of the request that asked, not the later one.
+    client = AnotherRequestWhileAsked("auth-1")
+    with signed_in(FULL, token="ya-asked"):
+        result = asyncio.run(server.mark_read(3, client))
+    assert client.asked and result["uid"] == 3
+    assert real_pool == [("ya-asked", [3], ["\\Seen"])]
+
+
+def test_mailbox_over_a_shared_pool_does_not_close_it(real_pool):
+    with signed_in(READ_ONLY, token="ya-first"):
+        request = server._mailbox()
+    (shared,) = server._mailboxes.values()
+    request.close()
+    with request.connect() as imap:
+        pass
+    assert not imap.closed, "the shared pool still keeps connections"
+    shared.close()
+    assert imap.closed

@@ -9,7 +9,7 @@
 
 ### Fixed
 
-- A change approved on the shared HTTP server could be refused as read-only. Requests of one authorization replaced the credentials of its shared mailbox, so a request with another token arriving while the user decided changed what the approved write was checked against. Each request now works on its own view of the mailbox: it shares the connection pool but keeps the request's credentials. The write check, the logins of new connections, and a change waiting for elicitation or browser approval all use the credentials of the request that asked. A read-only token still cannot write.
+- A change approved on the shared HTTP server could be refused as read-only. Requests of one authorization replaced the credentials of its shared mailbox, so a request with another token arriving while the user decided changed what the approved write was checked against. Each request now works on its own view of the mailbox: it shares the connection pool but keeps the request's credentials. The write check, the logins of new connections, and a change waiting for elicitation or browser approval all use the credentials of the request that asked. A pool is shared only by tokens of one sign-in with the same Yandex scope, so a connection logged in read-only never serves a full-access request. A read-only token still cannot write.
 
 ### Changed
 

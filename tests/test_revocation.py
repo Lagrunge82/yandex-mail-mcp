@@ -415,13 +415,13 @@ def test_pools_of_abandoned_authorizations_are_closed(imap, monkeypatch):
     with signed_in("mail:imap_ro", authorization="new"):
         server._mailbox()
     server._sweep_idle_mailboxes()
-    assert server._authorization_key("ivan", "old") in server._mailboxes
+    assert server._authorization_key("ivan", "old", "mail:imap_ro") in server._mailboxes
     # Past YANDEX_IMAP_IDLE_TIMEOUT since the old pool was last used; no other request
     # is needed for it to go.
     now[0] += 2
     server._sweep_idle_mailboxes()
-    assert server._authorization_key("ivan", "old") not in server._mailboxes
-    assert server._authorization_key("ivan", "new") in server._mailboxes
+    assert server._authorization_key("ivan", "old", "mail:imap_ro") not in server._mailboxes
+    assert server._authorization_key("ivan", "new", "mail:imap_ro") in server._mailboxes
     assert imap[0].closed
 
 

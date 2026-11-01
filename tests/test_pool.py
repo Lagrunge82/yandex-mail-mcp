@@ -99,11 +99,11 @@ def test_idle_connection_is_replaced_without_noop():
         opened.append(FakeIMAP())
         return opened[-1]
 
-    pool = ConnectionPool(factory, size=1, idle_timeout=300, clock=lambda: now[0])
-    with pool.connection():
+    pool = ConnectionPool(size=1, idle_timeout=300, clock=lambda: now[0])
+    with pool.connection(factory):
         pass
     now[0] = 301
-    with pool.connection() as imap:
+    with pool.connection(factory) as imap:
         assert imap is opened[1]
     assert opened[0].closed
     assert "noop" not in opened[0].calls
@@ -166,18 +166,22 @@ def test_failed_login_closes_the_socket_and_frees_the_slot(monkeypatch):
 
 
 def test_pool_limits_open_connections():
-    pool = ConnectionPool(FakeIMAP, size=1, wait_timeout=0.01)
-    with pool.connection(), pytest.raises(MailError, match="busy"), pool.connection():
+    pool = ConnectionPool(size=1, wait_timeout=0.01)
+    with (
+        pool.connection(FakeIMAP),
+        pytest.raises(MailError, match="busy"),
+        pool.connection(FakeIMAP),
+    ):
         pass
-    with pool.connection():
+    with pool.connection(FakeIMAP):
         pass
 
 
 def test_close_logs_out_idle_connections_and_later_returns():
-    pool = ConnectionPool(FakeIMAP, size=2)
-    with pool.connection() as first:
+    pool = ConnectionPool(size=2)
+    with pool.connection(FakeIMAP) as first:
         pass
-    with pool.connection() as again, pool.connection() as second:
+    with pool.connection(FakeIMAP) as again, pool.connection(FakeIMAP) as second:
         assert again is first
         pool.close()
         assert not first.closed

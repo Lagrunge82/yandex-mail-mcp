@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import copy
 import imaplib
 import logging
 import queue
@@ -478,14 +477,12 @@ class ConnectionPool:
 
     def __init__(
         self,
-        factory: Callable[[], IMAPClient],
         size: int = 2,
         idle_timeout: float = 300,
         *,
         wait_timeout: float = 60,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._factory = factory
         self._idle: queue.LifoQueue[tuple[IMAPClient, float]] = queue.LifoQueue()
         self._slots = threading.BoundedSemaphore(size)
         self._idle_timeout = idle_timeout
@@ -494,12 +491,16 @@ class ConnectionPool:
         self._closed = False
 
     @contextmanager
-    def connection(self, factory: Callable[[], IMAPClient] | None = None) -> Iterator[IMAPClient]:
-        """A logged-in connection: an idle one, or a new one from factory (or the pool's)."""
+    def connection(self, factory: Callable[[], IMAPClient]) -> Iterator[IMAPClient]:
+        """A logged-in connection: an idle one, or a new one from factory.
+
+        The pool has no login of its own: the caller's factory logs in new connections,
+        so every caller must be entitled to reuse the others' idle ones.
+        """
         if not self._slots.acquire(timeout=self._wait_timeout):
             raise MailError("All IMAP connections are busy; please retry")
         try:
-            imap = self._checkout(factory or self._factory)
+            imap = self._checkout(factory)
             try:
                 yield imap
             except MailError:
@@ -689,11 +690,22 @@ def default_credentials(config: Settings) -> Credentials:
 
 
 class Mailbox:
-    def __init__(self, config: Settings, credentials: Credentials | None = None):
+    def __init__(
+        self,
+        config: Settings,
+        credentials: Credentials | None = None,
+        *,
+        pool: ConnectionPool | None = None,
+    ):
+        """A mailbox over its own connection pool, or over a pool shared with others.
+
+        A Mailbox given a pool never closes it: the owner is the Mailbox that created it.
+        """
         self.config = config
         self._credentials = credentials
-        self.pool = ConnectionPool(
-            self._open, size=config.imap_pool_size, idle_timeout=config.imap_idle_timeout
+        self._owns_pool = pool is None
+        self.pool = pool or ConnectionPool(
+            size=config.imap_pool_size, idle_timeout=config.imap_idle_timeout
         )
 
     def _open(self) -> IMAPClient:
@@ -720,15 +732,16 @@ class Mailbox:
     def with_credentials(self, credentials: Credentials) -> Mailbox:
         """This mailbox for one request: the same connection pool, its own credentials.
 
-        The write check and the logins of new connections use these credentials for
-        as long as the returned Mailbox lives, whatever later requests bring, so a
-        change waiting for confirmation is checked against the request that asked for
-        it. Idle connections are shared: the caller keeps one pool per authorization,
-        so they were logged in with tokens of the same grant.
+        These credentials decide what the returned Mailbox may change (its Yandex scope,
+        through write_error) and log in the connections it opens, for as long as it
+        lives and whatever later requests bring: a change waiting for confirmation runs
+        with the credentials of the request that asked for it. Idle connections stay
+        shared, so a command may run on a connection logged in with another token of the
+        pool; the caller keeps one pool per authorization and Yandex scope, so those
+        tokens carry the same rights. On the shared HTTP server the MCP scopes of a
+        request are checked by the server from the request itself, not here.
         """
-        view = copy.copy(self)
-        view._credentials = credentials
-        return view
+        return Mailbox(self.config, credentials, pool=self.pool)
 
     def write_error(self) -> str | None:
         """Why this mailbox may not change mail, or None when it may."""
@@ -744,7 +757,9 @@ class Mailbox:
             yield imap
 
     def close(self) -> None:
-        self.pool.close()
+        """Close the pool this Mailbox created; a Mailbox over a shared pool closes nothing."""
+        if self._owns_pool:
+            self.pool.close()
 
     @staticmethod
     def _fetch(imap: IMAPClient, uids: list[int], max_body_chars: int = 4000) -> list[MailSummary]:
