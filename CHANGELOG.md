@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- Revoking access on the shared HTTP server ends that sign-in's tokens on the server's own record. Each sign-in now has a random authorization id that its tokens carry, refreshed ones included. The `logout` tool and `/revoke` record the id in `MCP_AUTH_DB` for 30 days, and every request and refresh checks it, so a revoked token stops working at once whatever Yandex does, and signing in again never revives it. Changes of the revoked sign-in waiting for browser confirmation are dropped, and an approval that arrives after the revocation changes nothing.
+- IMAP connections on the shared server are pooled per sign-in instead of per Yandex login. A connection logged in with one sign-in's token never serves another, so the user's other connections can no longer keep a revoked one working. A revoked sign-in's pool is closed at once, along with the same user's other pools, which log in again with their own tokens. A pool unused for `YANDEX_IMAP_IDLE_TIMEOUT` seconds is closed.
+
+### Changed
+
+- Tokens issued by earlier versions carry no authorization id and are refused: every MCP client of the shared server signs in again once after the upgrade.
+- `logout` ends the calling connection's sign-in even when Yandex cannot be reached, and its result has a new `yandex_revoked` field. When Yandex did not revoke its token, the result says so instead of failing, since the connection could not call `logout` again.
+- Losing `MCP_AUTH_DB` now also forgets revocations; README suggests replacing `MCP_TOKEN_ENCRYPTION_KEYS` with a new key after such a loss.
+
 ## 0.7.1
 
 ### Fixed

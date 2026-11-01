@@ -33,6 +33,8 @@ class PendingAction:
     question: str
     action: Callable[[], dict[str, Any]] = field(repr=False)
     expires_at: float
+    # The authorization of the MCP connection that asked; revoking it drops the change.
+    authorization: str = ""
     decision: str | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
@@ -62,6 +64,7 @@ class PendingActions:
         name: str,
         question: str,
         action: Callable[[], dict[str, Any]],
+        authorization: str = "",
     ) -> PendingAction:
         """Park a change for the user; the newest ones replace the oldest past the cap."""
         with self._lock:
@@ -84,6 +87,7 @@ class PendingActions:
                 question=question,
                 action=action,
                 expires_at=self._clock() + self._ttl,
+                authorization=authorization,
             )
             self._actions[pending.id] = pending
             return pending
@@ -92,6 +96,16 @@ class PendingActions:
         with self._lock:
             self._prune()
             return self._actions.get(action_id)
+
+    def discard(self, authorization: str) -> None:
+        """Drop the undecided changes of a revoked authorization; they never happen."""
+        with self._lock:
+            for key in [
+                key
+                for key, item in self._actions.items()
+                if item.authorization == authorization and not item.decided
+            ]:
+                del self._actions[key]
 
     def claim(self, action_id: str, login: str, decision: str) -> PendingAction | None:
         """Record the decision of the user who owns the change; None if it is not theirs.

@@ -1,9 +1,11 @@
-"""A stateless OAuth authorization server for MCP clients, federated to Yandex.
+"""An OAuth authorization server for MCP clients, federated to Yandex.
 
-The server stores nothing about users. Yandex tokens travel inside the
-encrypted tokens it issues (see crypto.TokenCipher) and are decrypted on each
-request. The only table on disk holds the clients registered through dynamic
-client registration, with their secrets encrypted.
+The server stores no user tokens. Yandex tokens travel inside the encrypted
+tokens it issues (see crypto.TokenCipher) and are decrypted on each request.
+Each sign-in is an authorization with a random id that every token issued for
+it carries, refreshed ones included. On disk are two tables: the clients
+registered through dynamic client registration, with their secrets encrypted,
+and the ids of revoked authorizations, which hold no user data.
 """
 
 from __future__ import annotations
@@ -116,6 +118,56 @@ class ClientStore:
         self._db.close()
 
 
+class RevokedAuthorizations:
+    """Ids of revoked authorizations in SQLite, kept until their last token has expired.
+
+    Read into memory at start, so the check on every request is a set lookup; the
+    table makes a revocation survive a restart. One server process owns the file,
+    like the rest of its state.
+    """
+
+    def __init__(self, path: str, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        with self._lock, self._db:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS revoked_authorizations ("
+                "id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)"
+            )
+            self._db.execute(
+                "DELETE FROM revoked_authorizations WHERE expires_at <= ?", (int(clock()),)
+            )
+            self._revoked = dict(
+                self._db.execute("SELECT id, expires_at FROM revoked_authorizations").fetchall()
+            )
+
+    def revoke(self, authorization: str) -> None:
+        # No token of the authorization outlives this: a refresh token issued just now
+        # lives REFRESH_TTL, and none is issued after the revocation.
+        now = self._clock()
+        expires_at = int(now + REFRESH_TTL) + 1
+        with self._lock, self._db:
+            self._db.execute(
+                "DELETE FROM revoked_authorizations WHERE expires_at <= ?", (int(now),)
+            )
+            self._db.execute(
+                "INSERT OR REPLACE INTO revoked_authorizations VALUES (?, ?)",
+                (authorization, expires_at),
+            )
+            self._revoked = {
+                key: expires for key, expires in self._revoked.items() if expires > now
+            }
+            self._revoked[authorization] = expires_at
+
+    def __contains__(self, authorization: object) -> bool:
+        with self._lock:
+            return authorization in self._revoked
+
+    def close(self) -> None:
+        self._db.close()
+
+
 class RateLimit:
     """At most `limit` requests per client IP and minute to the given paths.
 
@@ -211,9 +263,15 @@ class YandexAuthProvider(
         allowed_users: frozenset[str] = frozenset(),
         clock: Callable[[], float] = time.time,
         pending: PendingActions | None = None,
+        revoked: RevokedAuthorizations | None = None,
     ) -> None:
         self.cipher = cipher
         self.clients = clients
+        # Without a file (tests), revocations live in memory only.
+        self.revoked = revoked or RevokedAuthorizations(":memory:", clock)
+        # Told about each revocation, with the authorization id and the Yandex login,
+        # so the MCP server can close the IMAP connections opened for it.
+        self.on_revoke: Callable[[str, str], None] | None = None
         self.oauth = oauth
         self.public_url = public_url.rstrip("/")
         self.resource = f"{self.public_url}/mcp"
@@ -437,6 +495,9 @@ class YandexAuthProvider(
             # Tell the MCP client at once, instead of leaving it waiting for its callback.
             return self._client_redirect(payload, error="access_denied", error_description=denied)
         grant = {
+            # Every token issued for this sign-in carries the id, refreshed ones too;
+            # revoking the authorization ends them all, and only them.
+            "authorization": secrets.token_hex(16),
             "yandex_access_token": tokens.access_token,
             "yandex_refresh_token": tokens.refresh_token,
             "yandex_expires_at": tokens.expires_at,
@@ -508,6 +569,11 @@ class YandexAuthProvider(
             return _page(
                 "This confirmation has expired or does not exist. Nothing was changed; "
                 "ask the assistant again if you still want it.",
+                404,
+            )
+        if pending.authorization in self.revoked:
+            return _page(
+                "The connection that asked for this change was signed out. Nothing was changed.",
                 404,
             )
         user = self.browser_user(request)
@@ -591,9 +657,32 @@ class YandexAuthProvider(
             jti=payload["jti"],
         )
 
-    def _grant_allowed(self, grant: dict[str, Any]) -> bool:
+    def _grant_valid(self, grant: dict[str, Any]) -> bool:
+        """Whether tokens of this grant may be used now; checked on every token."""
+        # Tokens issued before authorizations had ids cannot be revoked one by one,
+        # so they are refused and the client signs in again.
+        authorization = grant.get("authorization")
+        if not isinstance(authorization, str) or authorization in self.revoked:
+            return False
         # Removing someone from MCP_ALLOWED_USERS ends their tokens, not just new sign-ins.
         return self.allowed(str(grant["login"])) or self.allowed(str(grant["email"]))
+
+    def authorization_revoked(self, authorization: str) -> bool:
+        return authorization in self.revoked
+
+    async def revoke_authorization(self, authorization: str, login: str) -> None:
+        """End every token of this authorization here, without waiting for Yandex.
+
+        Changes the authorization left waiting for the browser are dropped, and the
+        MCP server closes the IMAP connections opened for it.
+        """
+        self.revoked.revoke(authorization)
+        if self.pending is not None:
+            self.pending.discard(authorization)
+        LOG.info("Authorization of Yandex login %s revoked", login)
+        if self.on_revoke is not None:
+            callback = self.on_revoke
+            await anyio.to_thread.run_sync(lambda: callback(authorization, login))
 
     def _issue(self, client_id: str, scopes: list[str], grant: dict[str, Any]) -> OAuthToken:
         now = self._clock()
@@ -627,7 +716,7 @@ class YandexAuthProvider(
         if payload is None:
             return None
         grant = payload["grant"]
-        if not self._grant_allowed(grant):
+        if not self._grant_valid(grant):
             return None
         return AccessToken(
             token=token,
@@ -638,6 +727,7 @@ class YandexAuthProvider(
             subject=grant["login"],
             # Lives only in memory for the request; never logged or stored.
             claims={
+                "authorization_id": grant["authorization"],
                 "yandex_access_token": grant["yandex_access_token"],
                 "yandex_login": grant["login"],
                 "yandex_email": grant["email"],
@@ -651,7 +741,7 @@ class YandexAuthProvider(
         payload = self.cipher.open(refresh_token, "refresh")
         if payload is None or payload["client_id"] != client.client_id:
             return None
-        if not self._grant_allowed(payload["grant"]):
+        if not self._grant_valid(payload["grant"]):
             return None
         return YandexRefreshToken(
             token=refresh_token,
@@ -676,6 +766,9 @@ class YandexAuthProvider(
             )
         except YandexOAuthError as exc:
             raise TokenError("invalid_grant", f"Yandex refused the refresh ({exc.error})") from exc
+        if not self._grant_valid(grant):
+            # Revoked while Yandex was answering.
+            raise TokenError("invalid_grant", "the authorization was revoked")
         fresh = {
             **grant,
             "yandex_access_token": tokens.access_token,
@@ -686,7 +779,16 @@ class YandexAuthProvider(
         return self._issue(client.client_id, scopes, fresh)
 
     async def revoke_token(self, token: AccessToken | YandexRefreshToken) -> None:
-        """Revoke the Yandex grant inside: every token issued for it then stops working."""
+        """Revoke the token's authorization here, then the Yandex grant inside.
+
+        Every token of the authorization stops working at once, whatever Yandex does.
+        """
+        if isinstance(token, YandexRefreshToken):
+            authorization, login = token.grant["authorization"], token.grant["login"]
+        else:
+            claims = token.claims or {}
+            authorization, login = claims["authorization_id"], claims["yandex_login"]
+        await self.revoke_authorization(str(authorization), str(login))
         try:
             if isinstance(token, YandexRefreshToken):
                 # Yandex revokes by access token; a refresh yields one for this grant.

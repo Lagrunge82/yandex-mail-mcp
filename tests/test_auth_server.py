@@ -452,6 +452,7 @@ def test_expired_access_token_is_rejected():
         clock=clock,
     )
     grant = {
+        "authorization": "a1",
         "yandex_access_token": "ya",
         "yandex_refresh_token": "yr",
         "yandex_expires_at": clock.now + 600,
@@ -470,19 +471,28 @@ def test_expired_access_token_is_rejected():
     provider.clients.close()
 
 
-def test_only_the_clients_table_is_on_disk(tmp_path):
+def test_only_clients_and_revoked_ids_are_on_disk(tmp_path):
     db = tmp_path / "auth.db"
 
     async def scenario(flow):
-        return await flow.sign_in()
+        client_id, tokens = await flow.sign_in()
+        await flow.client.post(
+            "/revoke",
+            data={"token": tokens["access_token"], "client_id": client_id, "client_secret": ""},
+        )
 
     run_flow(scenario, db=str(db))
     connection = sqlite3.connect(db)
     try:
-        tables = [row[0] for row in connection.execute("SELECT name FROM sqlite_master")]
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        (revoked,) = connection.execute("SELECT id FROM revoked_authorizations").fetchall()
     finally:
         connection.close()
-    assert tables == ["clients", "sqlite_autoindex_clients_1"] or tables == ["clients"]
+    assert tables == {"clients", "revoked_authorizations"}
+    assert len(revoked[0]) == 32  # A random id, nothing about the user.
     raw = db.read_bytes()
     assert b"ya-access" not in raw
     assert b"ya-refresh" not in raw
@@ -507,6 +517,7 @@ def _as_user(login, email, token):
         client_id="c",
         scopes=["mail.read"],
         claims={
+            "authorization_id": f"auth-of-{login}",
             "yandex_access_token": token,
             "yandex_login": login,
             "yandex_email": email,
