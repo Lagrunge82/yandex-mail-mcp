@@ -227,10 +227,12 @@ def test_revocation_survives_a_restart(tmp_path):
     asyncio.run(before.revoke_authorization("a" * 32, "ivan"))
     before.clients.close()
     before.revoked.close()
+    before.generations.close()
     after = provider()
     assert asyncio.run(after.load_access_token(issued.access_token)) is None
     after.clients.close()
     after.revoked.close()
+    after.generations.close()
     # The record goes once the last token it could stop has expired anyway.
     clock.now += 31 * 24 * 3600
     later = RevokedAuthorizations(db, clock)
@@ -264,6 +266,7 @@ def test_tokens_issued_without_an_authorization_id_are_refused():
     assert asyncio.run(provider.load_refresh_token(client, issued.refresh_token)) is None
     provider.clients.close()
     provider.revoked.close()
+    provider.generations.close()
 
 
 # --- Changes waiting for confirmation when the connection is signed out ----------------
@@ -299,6 +302,7 @@ def write_provider(monkeypatch):
     yield SimpleNamespace(provider=provider, pending=pending, imap=imap)
     provider.clients.close()
     provider.revoked.close()
+    provider.generations.close()
 
 
 class SignedOutWhileAsked:

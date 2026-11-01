@@ -50,6 +50,7 @@ from .auth_server import (
     START_PATH,
     ClientStore,
     RateLimit,
+    RefreshGenerations,
     RevokedAuthorizations,
     YandexAuthProvider,
 )
@@ -141,6 +142,7 @@ def _new_server(
             if provider is not None:
                 provider.clients.close()
                 provider.revoked.close()
+                provider.generations.close()
 
     server = MCPServer(
         "Yandex Mail",
@@ -371,6 +373,7 @@ def build_oauth_app(
         allowed_users=allowed,
         pending=_confirmations,
         revoked=RevokedAuthorizations(db_path),
+        generations=RefreshGenerations(db_path),
     )
     provider.on_revoke = _close_user_mailboxes
     scopes = provider.offered_scopes

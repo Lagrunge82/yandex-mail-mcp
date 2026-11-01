@@ -225,6 +225,7 @@ def provider_at():
     for provider in providers:
         provider.clients.close()
         provider.revoked.close()
+        provider.generations.close()
 
 
 def posted(headers):

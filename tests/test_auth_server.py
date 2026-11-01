@@ -470,16 +470,29 @@ def test_expired_access_token_is_rejected():
     assert asyncio.run(provider.load_access_token(issued.access_token)) is None
     provider.clients.close()
     provider.revoked.close()
+    provider.generations.close()
 
 
-def test_only_clients_and_revoked_ids_are_on_disk(tmp_path):
+def test_only_clients_revoked_ids_and_refresh_generations_are_on_disk(tmp_path):
     db = tmp_path / "auth.db"
 
     async def scenario(flow):
         client_id, tokens = await flow.sign_in()
+        refreshed = await flow.client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+                "client_id": client_id,
+            },
+        )
         await flow.client.post(
             "/revoke",
-            data={"token": tokens["access_token"], "client_id": client_id, "client_secret": ""},
+            data={
+                "token": refreshed.json()["access_token"],
+                "client_id": client_id,
+                "client_secret": "",
+            },
         )
 
     run_flow(scenario, db=str(db))
@@ -490,10 +503,15 @@ def test_only_clients_and_revoked_ids_are_on_disk(tmp_path):
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         (revoked,) = connection.execute("SELECT id FROM revoked_authorizations").fetchall()
+        (generation,) = connection.execute(
+            "SELECT id, generation FROM refresh_generations"
+        ).fetchall()
     finally:
         connection.close()
-    assert tables == {"clients", "revoked_authorizations"}
-    assert len(revoked[0]) == 32  # A random id, nothing about the user.
+    assert tables == {"clients", "revoked_authorizations", "refresh_generations"}
+    # Random ids and a counter, nothing about the user.
+    assert len(revoked[0]) == 32
+    assert generation == (revoked[0], 1)
     raw = db.read_bytes()
     assert b"ya-access" not in raw
     assert b"ya-refresh" not in raw
@@ -601,8 +619,10 @@ def test_oauth_server_starts_and_allows_the_public_host(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "ClientStore", Store)
     monkeypatch.setattr(server.uvicorn, "run", lambda *args, **kwargs: None)
     server.main([])
-    # uvicorn did not run the lifespan that closes the store.
+    # uvicorn did not run the lifespan that closes the stores.
     stores[0].close()
+    server._auth_provider.revoked.close()
+    server._auth_provider.generations.close()
     assert captured["public_url"] == "https://mail.example.com"
     assert "mail.example.com" in captured["security"].allowed_hosts
     assert "https://mail.example.com" in captured["security"].allowed_origins
