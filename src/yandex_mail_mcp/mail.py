@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import imaplib
 import logging
 import queue
@@ -493,11 +494,12 @@ class ConnectionPool:
         self._closed = False
 
     @contextmanager
-    def connection(self) -> Iterator[IMAPClient]:
+    def connection(self, factory: Callable[[], IMAPClient] | None = None) -> Iterator[IMAPClient]:
+        """A logged-in connection: an idle one, or a new one from factory (or the pool's)."""
         if not self._slots.acquire(timeout=self._wait_timeout):
             raise MailError("All IMAP connections are busy; please retry")
         try:
-            imap = self._checkout()
+            imap = self._checkout(factory or self._factory)
             try:
                 yield imap
             except MailError:
@@ -511,12 +513,12 @@ class ConnectionPool:
         finally:
             self._slots.release()
 
-    def _checkout(self) -> IMAPClient:
+    def _checkout(self, factory: Callable[[], IMAPClient]) -> IMAPClient:
         while True:
             try:
                 imap, last_used = self._idle.get_nowait()
             except queue.Empty:
-                return self._factory()
+                return factory()
             if self._clock() - last_used > self._idle_timeout:
                 _close(imap)
                 continue
@@ -715,9 +717,18 @@ class Mailbox:
             self._credentials = default_credentials(self.config)
         return self._credentials
 
-    def use_credentials(self, credentials: Credentials) -> None:
-        """Log in new connections with these credentials from now on."""
-        self._credentials = credentials
+    def with_credentials(self, credentials: Credentials) -> Mailbox:
+        """This mailbox for one request: the same connection pool, its own credentials.
+
+        The write check and the logins of new connections use these credentials for
+        as long as the returned Mailbox lives, whatever later requests bring, so a
+        change waiting for confirmation is checked against the request that asked for
+        it. Idle connections are shared: the caller keeps one pool per authorization,
+        so they were logged in with tokens of the same grant.
+        """
+        view = copy.copy(self)
+        view._credentials = credentials
+        return view
 
     def write_error(self) -> str | None:
         """Why this mailbox may not change mail, or None when it may."""
@@ -727,7 +738,9 @@ class Mailbox:
 
     @contextmanager
     def connect(self) -> Iterator[IMAPClient]:
-        with self.pool.connection() as imap:
+        # This Mailbox's own login, not the one the pool was created with: a request's
+        # view logs in new connections with the request's credentials.
+        with self.pool.connection(self._open) as imap:
             yield imap
 
     def close(self) -> None:

@@ -460,15 +460,15 @@ def _mailbox() -> Mailbox:
                 raise ReauthenticationRequired(
                     f"This connection was signed out. To continue, {HTTP_RELOGIN_HINT}."
                 )
-            mailbox = _mailboxes.get(key)
-            if mailbox is None:
-                mailbox = _mailboxes[key] = Mailbox(settings, credentials)
-            else:
-                # A refresh of the same authorization brings a new Yandex token: new
-                # connections use it, open ones stay logged in.
-                mailbox.use_credentials(credentials)
+            shared = _mailboxes.get(key)
+            if shared is None:
+                shared = _mailboxes[key] = Mailbox(settings, credentials)
             _mailbox_used[key] = time.monotonic()
-        return mailbox
+        # The shared Mailbox is never changed: each request gets its own view with its
+        # own credentials, kept by everything it starts, a change waiting for
+        # confirmation included. Another request of the same authorization, say with a
+        # refreshed token, cannot alter what this one is checked against.
+        return shared.with_credentials(credentials)
     settings = _settings()
     with _mailboxes_lock:
         mailbox = _mailboxes.get(settings)

@@ -263,6 +263,7 @@ def test_tokens_issued_without_an_authorization_id_are_refused():
     client = SimpleNamespace(client_id="client")
     assert asyncio.run(provider.load_refresh_token(client, issued.refresh_token)) is None
     provider.clients.close()
+    provider.revoked.close()
 
 
 # --- Changes waiting for confirmation when the connection is signed out ----------------
@@ -297,6 +298,7 @@ def write_provider(monkeypatch):
     monkeypatch.setattr(server, "_confirmations", pending)
     yield SimpleNamespace(provider=provider, pending=pending, imap=imap)
     provider.clients.close()
+    provider.revoked.close()
 
 
 class SignedOutWhileAsked:
@@ -434,7 +436,7 @@ def test_idle_timeout_of_zero_keeps_busy_pools_of_other_sign_ins(imap, monkeypat
         server._mailbox()
     server._sweep_idle_mailboxes()
     with signed_in("mail:imap_ro", authorization="first"):
-        assert server._mailbox() is first
+        assert server._mailbox().pool is first.pool
     now[0] += server.MIN_POOL_IDLE + 1
     server._sweep_idle_mailboxes()
     assert server._mailboxes == {}
