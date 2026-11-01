@@ -224,7 +224,7 @@ def provider_at():
     yield build
     for provider in providers:
         provider.clients.close()
-        provider.revoked.close()
+        provider.authorizations.close()
 
 
 def posted(headers):

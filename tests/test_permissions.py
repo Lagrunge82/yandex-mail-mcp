@@ -183,7 +183,7 @@ def test_logout_revokes_the_token_of_the_request(monkeypatch, user_mailboxes):
     assert provider.authorization_revoked("auth-1")
     assert server._mailboxes == {}
     provider.clients.close()
-    provider.revoked.close()
+    provider.authorizations.close()
 
 
 def test_logout_without_a_signed_in_user_points_to_the_command(monkeypatch):

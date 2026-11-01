@@ -48,9 +48,9 @@ from .auth_server import (
     SCOPE_READ,
     SCOPE_WRITE,
     START_PATH,
+    AuthorizationStore,
     ClientStore,
     RateLimit,
-    RevokedAuthorizations,
     YandexAuthProvider,
 )
 from .config import ConfigurationError, Settings, env_int, env_port
@@ -140,7 +140,7 @@ def _new_server(
         finally:
             if provider is not None:
                 provider.clients.close()
-                provider.revoked.close()
+                provider.authorizations.close()
 
     server = MCPServer(
         "Yandex Mail",
@@ -370,7 +370,7 @@ def build_oauth_app(
         allow_write=settings.allow_write,
         allowed_users=allowed,
         pending=_confirmations,
-        revoked=RevokedAuthorizations(db_path),
+        authorizations=AuthorizationStore(db_path),
     )
     provider.on_revoke = _close_user_mailboxes
     scopes = provider.offered_scopes
