@@ -37,7 +37,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .confirmations import CONFIRM_TTL, ConfirmationFailed, PendingAction, PendingActions
+from .confirmations import ConfirmationFailed, PendingAction, PendingActions
 from .crypto import TokenCipher
 from .yandex_oauth import (
     SCOPE_LOGIN,
@@ -251,6 +251,22 @@ def _document(title: str, body: str, status: int = 200) -> HTMLResponse:
     return HTMLResponse(page, status_code=status, headers=PAGE_HEADERS)
 
 
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """The scheme, lowercase host and port of an http(s) URL; None if it is not one.
+
+    The port defaults by scheme, so https://host and https://host:443 are one origin.
+    A malformed URL is no origin at all, never an error.
+    """
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        return None
+    return parts.scheme, parts.hostname.lower(), port or (443 if parts.scheme == "https" else 80)
+
+
 def _page(message: str, status: int = 400) -> HTMLResponse:
     return _document("Yandex Mail MCP", f"<p>{html.escape(message)}</p>", status)
 
@@ -413,11 +429,26 @@ class YandexAuthProvider(
             samesite="lax",
         )
 
-    def _set_browser_cookie(self, response: Response, user: YandexUser) -> None:
-        """Remember who signed in through this browser, for confirmation pages."""
+    def _set_browser_cookie(self, request: Request, response: Response, user: YandexUser) -> None:
+        """Remember who signed in through this browser, for confirmation pages.
+
+        The cookie carries a random id of the browser, which confirmation forms are
+        bound to. A new sign-in of the same user in the same browser keeps the id, so
+        a confirmation page opened before it still works; another user gets a new one.
+        """
+        session = self._browser_session(request)
+        browser = (
+            session[1]
+            if session is not None and session[0].login.casefold() == user.login.casefold()
+            else secrets.token_hex(16)
+        )
         response.set_cookie(
             BROWSER_COOKIE,
-            self.cipher.seal("browser", {"login": user.login, "email": user.email}, BROWSER_TTL),
+            self.cipher.seal(
+                "browser",
+                {"login": user.login, "email": user.email, "browser": browser},
+                BROWSER_TTL,
+            ),
             max_age=BROWSER_TTL,
             path="/",
             secure=self.public_url.startswith("https://"),
@@ -425,20 +456,17 @@ class YandexAuthProvider(
             samesite="lax",
         )
 
-    def browser_user(self, request: Request) -> YandexUser | None:
-        """The allowed Yandex user who signed in through this browser, if any."""
-        session = self._browser_session(request)
-        return session[0] if session is not None else None
-
     def _browser_session(self, request: Request) -> tuple[YandexUser, str] | None:
-        """The allowed user of this browser and the id of its sign-in cookie."""
+        """The allowed user who signed in through this browser, and the browser's id."""
         payload = self.cipher.open(request.cookies.get(BROWSER_COOKIE, ""), "browser")
         if payload is None:
             return None
         user = YandexUser(login=str(payload["login"]), email=str(payload["email"]))
         if not (self.allowed(user.login) or self.allowed(user.email)):
             return None
-        return user, str(payload["jti"])
+        # Cookies set before browsers had an id: the cookie's own id stands in, and the
+        # next sign-in in this browser keeps it.
+        return user, str(payload.get("browser") or payload["jti"])
 
     def _same_origin(self, request: Request) -> bool:
         """Whether a form was posted from a page of this server.
@@ -447,18 +475,20 @@ class YandexAuthProvider(
         drops it. Without either, the request is refused. A sibling subdomain of the
         same site carries the user's SameSite=Lax cookie, but not this origin.
         """
-        expected = urlsplit(self.public_url)
         source = request.headers.get("origin") or request.headers.get("referer") or ""
-        actual = urlsplit(source)
-        return (actual.scheme, actual.netloc.lower()) == (
-            expected.scheme,
-            expected.netloc.lower(),
-        )
+        actual = _origin(source)
+        return actual is not None and actual == _origin(self.public_url)
 
     def _csrf_token(self, pending: PendingAction, user: YandexUser, browser: str) -> str:
-        """A token for the confirmation form: this action, this user, this browser."""
+        """A token for the confirmation form: this action, this user, this browser.
+
+        It expires with the action.
+        """
+        assert self.pending is not None
         return self.cipher.seal(
-            "csrf", {"action": pending.id, "login": user.login, "browser": browser}, CONFIRM_TTL
+            "csrf",
+            {"action": pending.id, "login": user.login, "browser": browser},
+            max(1, self.pending.seconds_left(pending)),
         )
 
     def _csrf_valid(
@@ -563,7 +593,7 @@ class YandexAuthProvider(
             CODE_TTL,
         )
         response = self._client_redirect(payload, code=code_blob)
-        self._set_browser_cookie(response, user)
+        self._set_browser_cookie(request, response, user)
         return response
 
     # Confirmation of changes in the browser
@@ -602,7 +632,7 @@ class YandexAuthProvider(
             headers={"Cache-Control": "no-store"},
         )
         response.delete_cookie(NONCE_COOKIE, path=CALLBACK_PATH)
-        self._set_browser_cookie(response, user)
+        self._set_browser_cookie(request, response, user)
         return response
 
     async def confirm(self, request: Request) -> Response:
@@ -643,7 +673,7 @@ class YandexAuthProvider(
         if not self._csrf_valid(str(form.get("csrf", "")), pending, user, browser):
             LOG.warning("Confirmation %s refused: invalid form token", pending.name)
             return _page(
-                "This confirmation form has expired or was opened in another browser. "
+                "This confirmation form is out of date or was opened in another browser. "
                 "Nothing was changed; reload the link and decide again.",
                 403,
             )

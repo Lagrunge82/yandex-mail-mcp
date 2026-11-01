@@ -7,6 +7,7 @@ not enough to decide on the user's behalf.
 """
 
 import re
+import time
 
 import httpx2 as httpx
 import pytest
@@ -73,6 +74,7 @@ def test_decision_from_the_page_with_its_token_is_carried_out(monkeypatch):
         "https://127.0.0.1:8000",  # Another scheme.
         "http://127.0.0.1:9000",  # Another port.
         "null",  # A sandboxed frame or a redirect chain.
+        "http://[evil",  # Malformed: refused, not a server error.
     ],
 )
 def test_decision_posted_from_another_origin_changes_nothing(monkeypatch, origin):
@@ -161,6 +163,35 @@ def test_token_of_another_browser_of_the_same_user_changes_nothing(monkeypatch):
     assert imap.changes == [("move", [3], "github")]
 
 
+def test_page_opened_before_a_new_sign_in_in_the_same_browser_still_works(monkeypatch):
+    async def scenario(flow, park):
+        url = await park()
+        page = await flow.client.get(url)
+        # The same browser connects another MCP client, which sets a new cookie.
+        await flow.sign_in()
+        return await flow.client.post(
+            url,
+            data={"decision": "approve", "csrf": token_of(page)},
+            headers={"Origin": PUBLIC},
+        )
+
+    response, imap = run(scenario, monkeypatch)
+    assert "Done." in response.text
+    assert imap.changes == [("move", [3], "github")]
+
+
+def test_form_token_expires_with_the_change(monkeypatch):
+    async def scenario(flow, park):
+        url = await park()
+        # Five of the change's ten minutes pass before the page is opened.
+        monkeypatch.setattr(server._confirmations, "_clock", lambda: time.time() + 300)
+        token = token_of(await flow.client.get(url))
+        return flow.provider.cipher.open(token, "csrf")["exp"] - time.time()
+
+    token_lifetime, _ = run(scenario, monkeypatch)
+    assert 290 <= token_lifetime <= 301, "the token lives as long as the change has left"
+
+
 def test_pages_cannot_be_framed_by_another_site(monkeypatch):
     async def scenario(flow, park):
         return await flow.client.get(await park())
@@ -171,36 +202,72 @@ def test_pages_cannot_be_framed_by_another_site(monkeypatch):
     assert page.headers["cache-control"] == "no-store"
 
 
-@pytest.mark.parametrize(
-    ("headers", "same"),
-    [
-        ({"origin": "https://mail.example.com"}, True),
-        ({"origin": "https://MAIL.example.com"}, True),
-        ({"referer": "https://mail.example.com/confirm/x"}, True),
-        ({"origin": "https://evil.example.com"}, False),
-        ({"origin": "https://mail.example.com.evil.net"}, False),
-        ({"origin": "http://mail.example.com"}, False),
-        ({"origin": "null", "referer": "https://mail.example.com/confirm/x"}, False),
-        ({}, False),
-    ],
-)
-def test_same_origin_matches_only_the_public_url(headers, same):
-    cipher = TokenCipher(list(_raw_keys(generate_key())), Clock())
-    provider = YandexAuthProvider(
-        cipher=cipher,
-        clients=ClientStore(":memory:", cipher),
-        oauth=FakeYandex(),
-        public_url="https://mail.example.com/",
-        allow_write=True,
-        allowed_users=frozenset({"ivan"}),
-    )
-    request = Request(
+@pytest.fixture
+def provider_at():
+    """Providers at a given public URL, with their stores closed whatever the test does."""
+    providers = []
+
+    def build(public_url):
+        cipher = TokenCipher(list(_raw_keys(generate_key())), Clock())
+        providers.append(
+            YandexAuthProvider(
+                cipher=cipher,
+                clients=ClientStore(":memory:", cipher),
+                oauth=FakeYandex(),
+                public_url=public_url,
+                allow_write=True,
+                allowed_users=frozenset({"ivan"}),
+            )
+        )
+        return providers[-1]
+
+    yield build
+    for provider in providers:
+        provider.clients.close()
+        provider.revoked.close()
+
+
+def posted(headers):
+    return Request(
         {
             "type": "http",
             "method": "POST",
             "headers": [(name.encode(), value.encode()) for name, value in headers.items()],
         }
     )
-    assert provider._same_origin(request) is same
-    provider.clients.close()
-    provider.revoked.close()
+
+
+@pytest.mark.parametrize(
+    ("headers", "same"),
+    [
+        ({"origin": "https://mail.example.com"}, True),
+        ({"origin": "https://MAIL.example.com"}, True),
+        ({"origin": "https://mail.example.com:443"}, True),
+        ({"referer": "https://mail.example.com/confirm/x"}, True),
+        ({"origin": "https://evil.example.com"}, False),
+        ({"origin": "https://mail.example.com.evil.net"}, False),
+        ({"origin": "http://mail.example.com"}, False),
+        ({"origin": "https://mail.example.com:8443"}, False),
+        ({"origin": "null", "referer": "https://mail.example.com/confirm/x"}, False),
+        ({"origin": "http://[evil"}, False),
+        ({"origin": "https://mail.example.com:99999"}, False),
+        ({"origin": "javascript:alert(1)"}, False),
+        ({}, False),
+    ],
+)
+def test_same_origin_matches_only_the_public_url(provider_at, headers, same):
+    provider = provider_at("https://mail.example.com/")
+    assert provider._same_origin(posted(headers)) is same
+
+
+@pytest.mark.parametrize(
+    ("public_url", "origin"),
+    [
+        ("https://mail.example.com:443", "https://mail.example.com"),
+        ("https://mail.example.com", "https://mail.example.com:443"),
+        ("http://mail.example.com:80", "http://mail.example.com"),
+    ],
+)
+def test_default_port_written_out_or_not_is_the_same_origin(provider_at, public_url, origin):
+    provider = provider_at(public_url)
+    assert provider._same_origin(posted({"origin": origin}))
