@@ -1,0 +1,345 @@
+"""Read-only operations survive one dropped IMAP session; changes are never repeated."""
+
+import imaplib
+import logging
+import ssl
+import threading
+import time
+from typing import ClassVar
+
+import pytest
+
+from yandex_mail_mcp import mail
+from yandex_mail_mcp.config import Settings
+from yandex_mail_mcp.mail import ConnectionInterrupted, Mailbox
+
+HEADER = b"From: Alice <alice@example.com>\r\nSubject: Secret subject\r\n\r\n"
+TEXT_PART = (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"7BIT", 5, 1, None, None)
+RAW = HEADER + b"hello"
+
+
+class FakeIMAP:
+    """A session whose commands fail as the test scripts, by connection number."""
+
+    instances: ClassVar[list["FakeIMAP"]] = []
+    # Connection number -> (command, error) raised by that command.
+    failures: ClassVar[dict[int, tuple[str, BaseException]]] = {}
+
+    def __init__(self, host="imap.example", port=993, ssl=True, timeout=30):
+        self.number = len(FakeIMAP.instances)
+        self.calls = []
+        self.logins = 0
+        self.closed = False
+        self._imap = type("State", (), {"state": "NONAUTH"})()
+        FakeIMAP.instances.append(self)
+
+    def oauth2_login(self, user, token):
+        self.logins += 1
+        self._imap.state = "AUTH"
+
+    def logout(self):
+        self.closed = True
+
+    def _command(self, name):
+        self.calls.append(name)
+        command, error = FakeIMAP.failures.get(self.number, (None, None))
+        if command == name:
+            raise error
+
+    def noop(self):
+        self._command("noop")
+
+    def has_capability(self, name):
+        return name == "UNSELECT"
+
+    def list_folders(self):
+        self._command("list")
+        return [((b"\\HasNoChildren",), b"|", "INBOX")]
+
+    def select_folder(self, name, readonly=False):
+        self._command("select")
+        self._imap.state = "SELECTED"
+
+    def unselect_folder(self):
+        self._command("unselect")
+
+    def search(self, criteria, charset=None):
+        self._command("search")
+        return [7]
+
+    def fetch(self, uids, fields):
+        self._command("fetch")
+        if fields == ["BODY.PEEK[HEADER]", "BODYSTRUCTURE"]:
+            return {7: {b"BODY[HEADER]": HEADER, b"BODYSTRUCTURE": TEXT_PART}}
+        if fields == ["RFC822.SIZE"]:
+            return {7: {b"RFC822.SIZE": len(RAW)}}
+        if fields == ["BODY.PEEK[]"]:
+            return {7: {b"BODY[]": RAW}}
+        return {7: {b"BODY[1]<0>": b"hello"}}
+
+    def move(self, uids, folder):
+        self._command("move")
+
+    def add_flags(self, uids, flags):
+        self._command("add_flags")
+
+
+@pytest.fixture
+def fake_imap(monkeypatch):
+    FakeIMAP.instances = []
+    FakeIMAP.failures = {}
+    monkeypatch.setattr(mail, "IMAPClient", FakeIMAP)
+    return FakeIMAP
+
+
+def mailbox(**settings):
+    return Mailbox(Settings(email="test@yandex.com", oauth_token="x", **settings))
+
+
+READS = {
+    "recent": lambda box: box.recent(limit=5),
+    "search": lambda box: box.search(sender="example.com"),
+    "message": lambda box: [box.message(7)],
+    "folders": lambda box: box.folders(),
+}
+
+
+@pytest.mark.parametrize(
+    ("read", "command"),
+    [
+        ("recent", "fetch"),
+        ("recent", "search"),
+        ("search", "search"),
+        ("search", "fetch"),
+        ("message", "fetch"),
+        ("folders", "list"),
+    ],
+)
+def test_read_is_retried_once_on_a_new_connection(fake_imap, read, command):
+    fake_imap.failures = {0: (command, imaplib.IMAP4.abort("socket error: EOF"))}
+    box = mailbox()
+    assert READS[read](box)
+    first, second = fake_imap.instances
+    assert first.closed
+    assert second.logins == 1
+    assert not second.closed
+    # The retry repeats the whole operation, SELECT included.
+    if read != "folders":
+        assert second.calls[0] == "select"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(104, "Connection reset by peer"),
+        BrokenPipeError(32, "Broken pipe"),
+        ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+    ],
+)
+def test_socket_errors_are_retried_like_abort(fake_imap, error):
+    fake_imap.failures = {0: ("fetch", error)}
+    assert mailbox().recent(limit=5)[0]["uid"] == 7
+    assert len(fake_imap.instances) == 2
+    assert fake_imap.instances[0].closed
+
+
+def test_second_drop_reaches_the_caller_without_more_retries(fake_imap):
+    error = imaplib.IMAP4.abort("command: FETCH => socket error: EOF")
+    fake_imap.failures = {0: ("fetch", error), 1: ("fetch", error), 2: ("fetch", error)}
+    with pytest.raises(ConnectionInterrupted, match="dropped twice") as raised:
+        mailbox().recent(limit=5)
+    assert isinstance(raised.value, imaplib.IMAP4.abort)
+    assert raised.value.__cause__ is error
+    assert len(fake_imap.instances) == 2
+    assert [imap.logins for imap in fake_imap.instances] == [1, 1]
+    assert all(imap.closed for imap in fake_imap.instances)
+
+
+def test_timeout_is_not_retried(fake_imap):
+    fake_imap.failures = {0: ("fetch", TimeoutError("timed out"))}
+    with pytest.raises(TimeoutError):
+        mailbox().recent(limit=5)
+    assert len(fake_imap.instances) == 1
+
+
+def test_imap_error_is_not_retried(fake_imap):
+    fake_imap.failures = {0: ("select", imaplib.IMAP4.error("SELECT failed: no such folder"))}
+    with pytest.raises(imaplib.IMAP4.error, match="no such folder"):
+        mailbox().recent(limit=5)
+    assert len(fake_imap.instances) == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "command"),
+    [
+        (lambda box: box.move(7, "Archive", uidvalidity=None), "move"),
+        (lambda box: box.set_flag(7, "\\Flagged", True, uidvalidity=None), "add_flags"),
+        (lambda box: box.move_to_promotions(7, confirm=True, uidvalidity=None), "move"),
+    ],
+)
+def test_change_is_never_repeated(fake_imap, monkeypatch, change, command):
+    # The session may drop after the server made the change.
+    monkeypatch.setattr(Mailbox, "_destination", staticmethod(lambda imap, folder, *_: folder))
+    monkeypatch.setattr(
+        Mailbox, "validate_promotions_folder", lambda self, imap: ("AI-Promotions", True)
+    )
+    fake_imap.failures = {0: (command, imaplib.IMAP4.abort("socket error: EOF"))}
+    with pytest.raises(imaplib.IMAP4.abort) as raised:
+        change(mailbox(allow_write=True))
+    assert not isinstance(raised.value, ConnectionInterrupted)
+    assert len(fake_imap.instances) == 1
+    assert fake_imap.instances[0].calls.count(command) == 1
+
+
+def test_drop_closes_the_idle_connections_and_retry_opens_a_new_one(fake_imap):
+    box = mailbox(imap_pool_size=2)
+    with box.connect() as first, box.connect() as second:
+        pass
+    assert {first.number, second.number} == {0, 1}
+    # The pool is last in, first out: first comes out and fails; second is closed
+    # without being tried.
+    fake_imap.failures = {first.number: ("fetch", imaplib.IMAP4.abort("socket error: EOF"))}
+    assert box.recent(limit=5)
+    assert first.closed and second.closed
+    assert "fetch" in first.calls
+    assert second.calls == []
+    assert len(fake_imap.instances) == 3
+    assert not fake_imap.instances[2].closed
+
+
+def test_retry_does_not_reuse_an_idle_connection(fake_imap):
+    box = mailbox(imap_pool_size=2)
+    with box.connect():
+        pass
+    fake_imap.failures = {0: ("fetch", imaplib.IMAP4.abort("socket error: EOF"))}
+    # Another request returns a connection to the pool between the two attempts.
+    calls = []
+    original = box.connect
+
+    def connect(label="imap", *, fresh=False):
+        calls.append(fresh)
+        if fresh:
+            with original(label):
+                pass
+        return original(label, fresh=fresh)
+
+    box.connect = connect
+    assert box.recent(limit=5)
+    assert calls == [False, True]
+    failed, returned, fresh = fake_imap.instances
+    assert failed.closed
+    assert "fetch" not in returned.calls
+    assert not returned.closed
+    assert fresh.logins == 1
+    assert "fetch" in fresh.calls
+
+
+def test_dropped_session_is_logged_without_mail_content(fake_imap, caplog):
+    box = mailbox()
+    box.folders()
+    fake_imap.failures = {
+        0: ("fetch", imaplib.IMAP4.abort("command: FETCH => socket error: EOF")),
+    }
+    with caplog.at_level(logging.INFO, logger="yandex_mail_mcp.mail"):
+        box.recent(limit=5)
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    text = warnings[0].getMessage()
+    assert "during recent" in text
+    assert "abort: command: FETCH => socket error: EOF" in text
+    assert "reused connection" in text
+    assert "2 operation(s)" in text
+    assert "state SELECTED" in text
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "Retrying recent" in logged
+    assert "alice@example.com" not in logged
+    assert "Secret subject" not in logged
+    assert "x" not in logged.split()  # The token.
+
+
+def test_noop_replacement_is_logged(fake_imap, caplog):
+    box = mailbox()
+    box.folders()
+    fake_imap.failures = {0: ("noop", imaplib.IMAP4.abort("Autologout; idle for too long"))}
+    with caplog.at_level(logging.INFO, logger="yandex_mail_mcp.mail"):
+        box.folders()
+    assert any(
+        "failed NOOP: abort: Autologout; idle for too long" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_unexpected_response_is_not_logged():
+    error = imaplib.IMAP4.abort("unexpected response: b'Subject: Secret subject'")
+    assert mail._failure_reason(error) == "unexpected response"
+    assert mail._failure_reason(ConnectionResetError(104, "Connection reset by peer")) == (
+        "Connection reset by peer"
+    )
+    assert len(mail._failure_reason(imaplib.IMAP4.abort("x" * 500))) == 200
+
+
+class ExclusiveIMAP(FakeIMAP):
+    """Fails the test if two threads ever run commands on one session at once."""
+
+    lock = threading.Lock()
+    open_now = 0
+    open_max = 0
+    overlaps: ClassVar[list[int]] = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.busy = False
+
+    def oauth2_login(self, user, token):
+        super().oauth2_login(user, token)
+        with ExclusiveIMAP.lock:
+            ExclusiveIMAP.open_now += 1
+            ExclusiveIMAP.open_max = max(ExclusiveIMAP.open_max, ExclusiveIMAP.open_now)
+
+    def logout(self):
+        super().logout()
+        with ExclusiveIMAP.lock:
+            ExclusiveIMAP.open_now -= 1
+
+    def _command(self, name):
+        if self.busy:
+            ExclusiveIMAP.overlaps.append(self.number)
+        self.busy = True
+        try:
+            time.sleep(0.002)
+            super()._command(name)
+        finally:
+            self.busy = False
+
+
+def test_parallel_reads_never_share_a_session(monkeypatch):
+    FakeIMAP.instances = []
+    # Some sessions drop, so retries run alongside the other requests.
+    FakeIMAP.failures = {1: ("fetch", imaplib.IMAP4.abort("socket error: EOF"))}
+    ExclusiveIMAP.open_now = ExclusiveIMAP.open_max = 0
+    ExclusiveIMAP.overlaps = []
+    monkeypatch.setattr(mail, "IMAPClient", ExclusiveIMAP)
+    box = mailbox(imap_pool_size=2)
+    results, errors = [], []
+
+    def run(index):
+        try:
+            if index % 2:
+                results.append(box.recent(limit=5))
+            else:
+                results.append(box.search(sender="example.com"))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    box.close()
+    assert errors == []
+    assert len(results) == 20
+    assert all(result[0]["uid"] == 7 for result in results)
+    assert ExclusiveIMAP.overlaps == []
+    assert ExclusiveIMAP.open_max <= 2
+    assert ExclusiveIMAP.open_now == 0

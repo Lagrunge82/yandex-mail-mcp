@@ -65,7 +65,7 @@ def box_with(imap, **settings):
     box = Mailbox(Settings(email="me@yandex.ru", oauth_token="x", **settings))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield imap
 
     box.connect = connect
@@ -243,7 +243,7 @@ def test_draft_is_from_the_signed_in_user_not_the_server_address():
     box = Mailbox(Settings(), OAuthCredentials("anna@company.ru", StaticTokenSource("t")))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield DraftIMAP()
 
     box.connect = connect

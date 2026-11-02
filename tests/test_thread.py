@@ -114,7 +114,7 @@ def mailbox(imap):
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield imap
 
     box.connect = connect

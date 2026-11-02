@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Read-only tools failed with "IMAP connection was interrupted; please retry" when Yandex dropped an IMAP session during the call, although the same call worked at once when repeated. `list_folders`, `list_recent_emails`, `search_emails`, `get_email` and `get_thread` now run the whole call once more, `SELECT` included, on a new connection when the session drops (`BYE`, end of stream, a reset or broken socket, a TLS EOF). A second drop in a row fails with "IMAP connection was interrupted twice; the mail server may be closing sessions, retry later". Changes are never repeated, since the session may drop after the server made the change, and a timeout is not retried either.
+- After a dropped session the pool closes its idle connections too, instead of handing them to the next calls, and the retry always opens a new connection.
+- A dropped session is now logged: a warning names the operation, the error with the server's reason, whether the connection was new or reused, its age, the number of calls it served and the IMAP state. A connection replaced after a failed `NOOP` is logged at INFO. Neither carries message content or tokens; a server response the client did not expect is logged without its text.
+
+### Added
+
+- `scripts/imap_stress.py` runs read-only calls against the configured mailbox, one after another and then all at once, and reports failures, response times, dropped sessions and retries.
+
 ## 0.8.0
 
 ### Security

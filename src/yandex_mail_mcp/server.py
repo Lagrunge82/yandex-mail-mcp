@@ -60,6 +60,8 @@ from .crypto import TokenCipher
 from .mail import (
     MAX_BATCH_INPUT,
     MAX_BATCH_MOVE,
+    RESET_ERRORS,
+    ConnectionInterrupted,
     Draft,
     Mailbox,
     MailError,
@@ -195,9 +197,6 @@ NETWORK_ERRNOS = {
 }
 
 
-RESET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError)
-
-
 def _os_reason(exc: OSError) -> str:
     """The OS or TLS error text, which carries no secrets."""
     return exc.strerror or " ".join(map(str, exc.args)) or type(exc).__name__
@@ -246,6 +245,12 @@ def _translate(exc: Exception) -> ToolError | None:
     if isinstance(exc, LoginError):
         return ToolError(
             "IMAP authentication failed; check your credentials and whether IMAP is enabled"
+        )
+    if isinstance(exc, ConnectionInterrupted):
+        # A read already retried on a new connection.
+        return ToolError(
+            "IMAP connection was interrupted twice; the mail server may be closing "
+            "sessions, retry later"
         )
     if isinstance(exc, imaplib.IMAP4.abort):
         return ToolError("IMAP connection was interrupted; please retry")

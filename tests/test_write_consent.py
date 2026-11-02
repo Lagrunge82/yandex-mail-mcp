@@ -75,7 +75,7 @@ def github_folders():
 @contextmanager
 def user_mailbox(monkeypatch, imap):
     @contextmanager
-    def connect(self):
+    def connect(self, *_args, **_kwargs):
         yield imap
 
     monkeypatch.setattr(Mailbox, "connect", connect)

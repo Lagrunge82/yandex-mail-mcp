@@ -98,7 +98,7 @@ def imap(monkeypatch):
     imap = FolderIMAP()
 
     @contextmanager
-    def connect(self):
+    def connect(self, *_args, **_kwargs):
         yield imap
 
     monkeypatch.setattr(Mailbox, "connect", connect)
@@ -218,7 +218,7 @@ def test_uidvalidity_missing_at_the_change_is_refused():
         Settings(allow_write=True),
         OAuthCredentials("ivan@yandex.ru", StaticTokenSource("ya-token", FULL)),
     )
-    box.connect = contextmanager(lambda: (yield imap))
+    box.connect = contextmanager(lambda *_args, **_kwargs: (yield imap))
     _, target = box.preview_flag(3)
     assert target.uidvalidity == 100
     imap.report_uidvalidity = False

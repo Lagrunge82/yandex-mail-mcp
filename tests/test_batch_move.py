@@ -112,7 +112,7 @@ def box_with(imap, **settings):
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", **settings))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield imap
 
     box.connect = connect
@@ -320,7 +320,7 @@ def test_batch_from_a_client_without_elicitation_waits_for_the_browser(monkeypat
     imap = BatchIMAP()
 
     @contextmanager
-    def connect(self):
+    def connect(self, *_args, **_kwargs):
         yield imap
 
     monkeypatch.setattr(Mailbox, "connect", connect)
