@@ -129,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
     logger = logging.getLogger("yandex_mail_mcp.mail")
     logger.addHandler(log)
     logger.setLevel(logging.INFO)
+    # Printed with the report; logging's last-resort handler would print them twice.
+    logger.propagate = False
     box = Mailbox(settings)
     try:
         results = run(args, box, log)

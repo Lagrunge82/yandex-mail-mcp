@@ -508,6 +508,22 @@ def _close(imap: IMAPClient) -> None:
             LOG.info("Could not close the IMAP connection cleanly: %s", exc)
 
 
+def _shutdown(imap: IMAPClient) -> None:
+    """Close the socket without LOGOUT: for a session the server has probably dropped.
+
+    LOGOUT on a session dropped without a reset waits for the socket timeout.
+    """
+    try:
+        imap.shutdown()
+    except Exception as exc:
+        LOG.info("Could not close the IMAP connection cleanly: %s", exc)
+
+
+def os_reason(exc: OSError) -> str:
+    """The OS or TLS error text, which carries no secrets."""
+    return exc.strerror or " ".join(map(str, exc.args)) or type(exc).__name__
+
+
 def _selected(imap: IMAPClient) -> bool:
     # IMAPClient keeps no public record of the selected folder; imaplib's state does.
     return getattr(getattr(imap, "_imap", None), "state", None) == "SELECTED"
@@ -520,6 +536,10 @@ RESET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, s
 INTERRUPTED = (imaplib.IMAP4.abort, *RESET_ERRORS)
 
 
+# imaplib's and IMAPClient's abort texts that go on with the raw server line.
+_RAW_LINE = re.compile(r"(unexpected (?:tagged )?response|unterminated line).*", re.DOTALL)
+
+
 class ConnectionInterrupted(imaplib.IMAP4.abort):
     """A read failed twice in a row because the IMAP session was dropped."""
 
@@ -528,15 +548,13 @@ def _failure_reason(exc: BaseException) -> str:
     """Why a session was dropped, without what the server sent about mail.
 
     IMAP4.abort carries the server's BYE text or the socket error, and the command it
-    happened in; an unexpected response carries the line itself, which may be part of
-    a message, so it is left out.
+    happened in. An unexpected response or an unterminated line carries the line
+    itself, which may be part of a message, so the line is left out.
     """
     if isinstance(exc, OSError) and not isinstance(exc, imaplib.IMAP4.error):
-        text = exc.strerror or " ".join(map(str, exc.args))
+        text = os_reason(exc)
     else:
-        text = str(exc)
-    if "unexpected response" in text:
-        text = text[: text.index("unexpected response")] + "unexpected response"
+        text = _RAW_LINE.sub(r"\1", str(exc))
     text = " ".join(text.split())
     return text if len(text) <= 200 else text[:199] + "…"
 
@@ -560,6 +578,9 @@ class ConnectionPool:
     with no folder selected, and is closed instead if the caller raised. When a
     session is dropped, the idle connections are closed too: the server has
     probably dropped them for the same reason.
+
+    The open connections, idle ones included, never outnumber ``size``: a new
+    connection is opened only when no idle one is left.
     """
 
     def __init__(
@@ -588,8 +609,10 @@ class ConnectionPool:
         """A logged-in connection: an idle one, or a new one from factory.
 
         The pool has no login of its own: the caller's factory logs in new connections,
-        so every caller must be entitled to reuse the others' idle ones. fresh skips the
-        idle connections. label names the operation in the log when the session drops.
+        so every caller must be entitled to reuse the others' idle ones. fresh closes the
+        idle connections instead of trying them, so a new one is opened unless another
+        call returns one in the meantime. label names the operation in the log when the
+        session drops.
         """
         if not self._slots.acquire(timeout=self._wait_timeout):
             raise MailError("All IMAP connections are busy; please retry")
@@ -602,9 +625,11 @@ class ConnectionPool:
                 # Raised by this package between complete commands: the session is fine.
                 self._checkin(entry)
                 raise
-            except BaseException as exc:
-                if isinstance(exc, INTERRUPTED):
-                    self._dropped(entry, label, exc)
+            except INTERRUPTED as exc:
+                self._dropped(entry, label, exc)
+                _shutdown(entry.imap)
+                raise
+            except BaseException:
                 _close(entry.imap)
                 raise
             self._checkin(entry)
@@ -624,22 +649,25 @@ class ConnectionPool:
             entry.uses,
             state,
         )
-        closed = self._discard_idle()
+        closed = self._discard_idle(_shutdown)
         if closed:
             LOG.info("Closed %d idle IMAP connection(s) after the session dropped", closed)
 
-    def _discard_idle(self) -> int:
+    def _discard_idle(self, close: Callable[[IMAPClient], None] = _close) -> int:
         closed = 0
         while True:
             try:
                 entry = self._idle.get_nowait()
             except queue.Empty:
                 return closed
-            _close(entry.imap)
+            close(entry.imap)
             closed += 1
 
     def _checkout(self, factory: Callable[[], IMAPClient], fresh: bool) -> _Pooled:
-        while not fresh:
+        if fresh:
+            # Idle connections count against the size too: close them, untried.
+            self._discard_idle(_shutdown)
+        while True:
             try:
                 entry = self._idle.get_nowait()
             except queue.Empty:
@@ -894,16 +922,25 @@ class Mailbox:
         Only for operations that change nothing on the server: the whole operation runs
         again, SELECT included. A change is never repeated, since the session may drop
         after the server made it. A second drop in a row raises ConnectionInterrupted.
+        A failure to connect or log in is not a dropped session and is not retried.
         """
+        started = False
         try:
             with self.connect(label) as imap:
+                started = True
                 return operation(imap)
         except INTERRUPTED as exc:
+            if not started:
+                raise
             LOG.info("Retrying %s on a new IMAP connection after %s", label, type(exc).__name__)
+        started = False
         try:
             with self.connect(label, fresh=True) as imap:
+                started = True
                 return operation(imap)
         except INTERRUPTED as exc:
+            if not started:
+                raise
             raise ConnectionInterrupted(
                 f"{label}: IMAP session dropped twice in a row ({_failure_reason(exc)})"
             ) from exc

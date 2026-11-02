@@ -5,6 +5,7 @@ import logging
 import ssl
 import threading
 import time
+from contextlib import contextmanager
 from typing import ClassVar
 
 import pytest
@@ -30,14 +31,22 @@ class FakeIMAP:
         self.calls = []
         self.logins = 0
         self.closed = False
+        self.logged_out = False
         self._imap = type("State", (), {"state": "NONAUTH"})()
         FakeIMAP.instances.append(self)
 
     def oauth2_login(self, user, token):
+        command, error = FakeIMAP.failures.get(self.number, (None, None))
+        if command == "login":
+            raise error
         self.logins += 1
         self._imap.state = "AUTH"
 
     def logout(self):
+        self.logged_out = True
+        self.closed = True
+
+    def shutdown(self):
         self.closed = True
 
     def _command(self, name):
@@ -120,7 +129,8 @@ def test_read_is_retried_once_on_a_new_connection(fake_imap, read, command):
     box = mailbox()
     assert READS[read](box)
     first, second = fake_imap.instances
-    assert first.closed
+    # Closed without LOGOUT, which would wait on a dead session.
+    assert first.closed and not first.logged_out
     assert second.logins == 1
     assert not second.closed
     # The retry repeats the whole operation, SELECT included.
@@ -203,6 +213,7 @@ def test_drop_closes_the_idle_connections_and_retry_opens_a_new_one(fake_imap):
     assert first.closed and second.closed
     assert "fetch" in first.calls
     assert second.calls == []
+    assert not second.logged_out
     assert len(fake_imap.instances) == 3
     assert not fake_imap.instances[2].closed
 
@@ -228,10 +239,59 @@ def test_retry_does_not_reuse_an_idle_connection(fake_imap):
     assert calls == [False, True]
     failed, returned, fresh = fake_imap.instances
     assert failed.closed
-    assert "fetch" not in returned.calls
-    assert not returned.closed
+    # Closed untried: kept, it would be one connection more than the pool's size.
+    assert returned.calls == []
+    assert returned.closed
     assert fresh.logins == 1
     assert "fetch" in fresh.calls
+
+
+def test_retry_keeps_the_pool_size(fake_imap):
+    box = mailbox(imap_pool_size=1)
+    fake_imap.failures = {0: ("fetch", imaplib.IMAP4.abort("socket error: EOF"))}
+    original = box.connect
+    open_at_retry = []
+
+    def connect(label="imap", *, fresh=False):
+        if not fresh:
+            return original(label)
+        # Another request runs between the two attempts and leaves its connection idle.
+        box.folders()
+
+        @contextmanager
+        def retry():
+            with original(label, fresh=True) as imap:
+                open_at_retry.append(sum(not i.closed for i in fake_imap.instances))
+                yield imap
+
+        return retry()
+
+    box.connect = connect
+    assert box.recent(limit=5)
+    assert open_at_retry == [1]
+
+
+@pytest.mark.parametrize(
+    "error", [ConnectionResetError(104, "Connection reset by peer"), imaplib.IMAP4.abort("EOF")]
+)
+def test_failed_login_is_not_retried(fake_imap, error):
+    fake_imap.failures = {0: ("login", error)}
+    with pytest.raises(type(error)) as raised:
+        mailbox().recent(limit=5)
+    assert not isinstance(raised.value, ConnectionInterrupted)
+    assert len(fake_imap.instances) == 1
+
+
+def test_failed_login_on_the_retry_is_reported_as_itself(fake_imap):
+    error = ConnectionResetError(104, "Connection reset by peer")
+    fake_imap.failures = {
+        0: ("fetch", imaplib.IMAP4.abort("socket error: EOF")),
+        1: ("login", error),
+    }
+    with pytest.raises(ConnectionResetError) as raised:
+        mailbox().recent(limit=5)
+    assert raised.value is error
+    assert len(fake_imap.instances) == 2
 
 
 def test_dropped_session_is_logged_without_mail_content(fake_imap, caplog):
@@ -269,9 +329,27 @@ def test_noop_replacement_is_logged(fake_imap, caplog):
     )
 
 
-def test_unexpected_response_is_not_logged():
-    error = imaplib.IMAP4.abort("unexpected response: b'Subject: Secret subject'")
-    assert mail._failure_reason(error) == "unexpected response"
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("unexpected response: b'Subject: Secret subject'", "unexpected response"),
+        (
+            "command: FETCH => unexpected tagged response: b'A1 Secret subject'",
+            "command: FETCH => unexpected tagged response",
+        ),
+        ("socket error: unterminated line: b'Secret subject'", "socket error: unterminated line"),
+        (
+            "unexpected response while waiting for continuation response: (b'NO', [b'Secret'])",
+            "unexpected response",
+        ),
+        ("Autologout; idle for too long", "Autologout; idle for too long"),
+    ],
+)
+def test_server_lines_are_not_logged(text, reason):
+    assert mail._failure_reason(imaplib.IMAP4.abort(text)) == reason
+
+
+def test_failure_reason_of_socket_errors_and_long_texts():
     assert mail._failure_reason(ConnectionResetError(104, "Connection reset by peer")) == (
         "Connection reset by peer"
     )
@@ -296,10 +374,17 @@ class ExclusiveIMAP(FakeIMAP):
             ExclusiveIMAP.open_now += 1
             ExclusiveIMAP.open_max = max(ExclusiveIMAP.open_max, ExclusiveIMAP.open_now)
 
-    def logout(self):
-        super().logout()
+    def _close(self):
         with ExclusiveIMAP.lock:
-            ExclusiveIMAP.open_now -= 1
+            if not self.closed:
+                ExclusiveIMAP.open_now -= 1
+            self.closed = True
+
+    def logout(self):
+        self._close()
+
+    def shutdown(self):
+        self._close()
 
     def _command(self, name):
         if self.busy:
