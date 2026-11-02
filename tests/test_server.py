@@ -16,7 +16,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 from yandex_mail_mcp import server
 from yandex_mail_mcp.config import Settings
 from yandex_mail_mcp.credentials import ReauthenticationRequired
-from yandex_mail_mcp.mail import Mailbox, MailPermissionError, MailValueError, Target
+from yandex_mail_mcp.mail import (
+    ConnectionInterrupted,
+    Mailbox,
+    MailPermissionError,
+    MailValueError,
+    Target,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -102,6 +108,34 @@ def test_dropped_session_is_reported_as_reset(monkeypatch, error):
     with pytest.raises(ToolError, match=r"IMAP connection was reset; please retry$") as raised:
         asyncio.run(server.mcp.call_tool("list_folders", {}))
     assert "YANDEX_IMAP" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("error", "message"),
+    [
+        (
+            ConnectionInterrupted("recent: IMAP session dropped twice in a row (EOF)"),
+            r"IMAP connection was interrupted twice; the mail server may be closing "
+            r"sessions, retry later$",
+        ),
+        (
+            imaplib.IMAP4.abort("socket error: EOF"),
+            r"IMAP connection was interrupted; please retry$",
+        ),
+    ],
+)
+def test_dropped_read_after_retry_is_reported(monkeypatch, caplog, error, message):
+    class Box:
+        def recent(self, **kwargs):
+            raise error
+
+    monkeypatch.setattr(server, "_mailbox", lambda: Box())
+    with (
+        caplog.at_level(logging.INFO, logger="yandex_mail_mcp.audit"),
+        pytest.raises(ToolError, match=message),
+    ):
+        asyncio.run(server.mcp.call_tool("list_recent_emails", {"limit": 5}))
+    assert f'"result": "{type(error).__name__}"' in caplog.records[-1].getMessage()
 
 
 def test_timeout_reaches_client(monkeypatch):
@@ -355,7 +389,7 @@ def test_unsafe_promotions_folder_is_rejected_before_elicitation(monkeypatch):
             return [((b"\\HasNoChildren",), b"|", "INBOX")]
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box = Mailbox(

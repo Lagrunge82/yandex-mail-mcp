@@ -175,7 +175,7 @@ def test_system_folder_flag_is_rejected():
             return [((b"\\Trash",), b"/", "Archive")]
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -214,7 +214,7 @@ def test_promotions_folder_with_whitespace_uses_existing_folder():
             calls.append(("move", folder))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -245,7 +245,7 @@ def test_nested_promotions_folder_is_rejected(name, delimiter):
             return [((b"\\HasNoChildren",), delimiter, "INBOX"), ((), None, "Shared")]
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -315,7 +315,7 @@ def test_get_email_rejects_large_message_before_body_fetch():
             return {1: {b"RFC822.SIZE": 21 * 1024 * 1024}}
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -337,7 +337,7 @@ def test_search_uses_server_results_without_300_message_cap(monkeypatch):
             return [1, 500]
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -393,7 +393,7 @@ def test_search_does_not_fallback_on_aborted_connection():
             raise imaplib.IMAP4.abort("disconnected")
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -413,7 +413,7 @@ def test_headers_does_not_fetch_full_message():
             return {1: {b"BODY[HEADER]": b"Subject: Large\r\nFrom: a@example.com\r\n\r\n"}}
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -445,7 +445,7 @@ def test_preview_validates_folder_and_reads_headers_in_one_connection():
             return {3: {b"BODY[HEADER]": b"Subject: Sale\r\nFrom: shop@example.com\r\n\r\n"}}
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         connections.append(1)
         yield IMAP()
 
@@ -467,7 +467,7 @@ def test_preview_rejects_server_without_move():
             return False
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     box.connect = connect
@@ -510,7 +510,7 @@ def writable_box(imap):
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="x", allow_write=True))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield imap
 
     box.connect = connect
@@ -593,7 +593,7 @@ def test_search_falls_back_to_previews_when_server_search_fails():
             return list(range(1, 401))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield IMAP()
 
     def fetch(imap, uids, max_body_chars):
@@ -685,7 +685,7 @@ def search_box(imap, monkeypatch, fetched=None):
     box = Mailbox(Settings(email="test@yandex.com", oauth_token="x"))
 
     @contextmanager
-    def connect():
+    def connect(*_args, **_kwargs):
         yield imap
 
     def fetch(imap, uids, max_body_chars=4000):

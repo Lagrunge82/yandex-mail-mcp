@@ -76,7 +76,7 @@ def user_mailboxes(monkeypatch):
     imap = WriteIMAP()
 
     @contextmanager
-    def connect(self):
+    def connect(self, *_args, **_kwargs):
         yield imap
 
     monkeypatch.setattr(Mailbox, "connect", connect)

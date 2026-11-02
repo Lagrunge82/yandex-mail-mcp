@@ -30,6 +30,9 @@ class FakeIMAP:
     def logout(self):
         self.closed = True
 
+    def shutdown(self):
+        self.closed = True
+
     def noop(self):
         self.calls.append("noop")
         if self.noop_error:

@@ -13,6 +13,7 @@ import logging
 import queue
 import quopri
 import re
+import ssl
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -34,7 +35,7 @@ from email.utils import (
     unquote,
 )
 from html.parser import HTMLParser
-from typing import Any
+from typing import Any, TypeVar
 
 from imapclient import IMAPClient
 from typing_extensions import TypedDict
@@ -50,6 +51,7 @@ from .credentials import (
 from .yandex_oauth import YandexOAuth
 
 LOG = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 class AttachmentInfo(TypedDict):
@@ -506,9 +508,65 @@ def _close(imap: IMAPClient) -> None:
             LOG.info("Could not close the IMAP connection cleanly: %s", exc)
 
 
+def _shutdown(imap: IMAPClient) -> None:
+    """Close the socket without LOGOUT: for a session the server has probably dropped.
+
+    LOGOUT on a session dropped without a reset waits for the socket timeout.
+    """
+    try:
+        imap.shutdown()
+    except Exception as exc:
+        LOG.info("Could not close the IMAP connection cleanly: %s", exc)
+
+
+def os_reason(exc: OSError) -> str:
+    """The OS or TLS error text, which carries no secrets."""
+    return exc.strerror or " ".join(map(str, exc.args)) or type(exc).__name__
+
+
 def _selected(imap: IMAPClient) -> bool:
     # IMAPClient keeps no public record of the selected folder; imaplib's state does.
     return getattr(getattr(imap, "_imap", None), "state", None) == "SELECTED"
+
+
+# A dropped session that imaplib does not wrap in IMAP4.abort: errors reading the socket.
+RESET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError)
+# Errors after which the IMAP session is gone. A timeout is not one of them: a slow
+# FETCH would only time out again, and doubles the wait.
+INTERRUPTED = (imaplib.IMAP4.abort, *RESET_ERRORS)
+
+
+# imaplib's and IMAPClient's abort texts that go on with the raw server line.
+_RAW_LINE = re.compile(r"(unexpected (?:tagged )?response|unterminated line).*", re.DOTALL)
+
+
+class ConnectionInterrupted(imaplib.IMAP4.abort):
+    """A read failed twice in a row because the IMAP session was dropped."""
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """Why a session was dropped, without what the server sent about mail.
+
+    IMAP4.abort carries the server's BYE text or the socket error, and the command it
+    happened in. An unexpected response or an unterminated line carries the line
+    itself, which may be part of a message, so the line is left out.
+    """
+    if isinstance(exc, OSError) and not isinstance(exc, imaplib.IMAP4.error):
+        text = os_reason(exc)
+    else:
+        text = _RAW_LINE.sub(r"\1", str(exc))
+    text = " ".join(text.split())
+    return text if len(text) <= 200 else text[:199] + "…"
+
+
+@dataclass
+class _Pooled:
+    """A pooled connection and what the diagnostics report about it."""
+
+    imap: IMAPClient
+    opened: float
+    last_used: float
+    uses: int = 0
 
 
 class ConnectionPool:
@@ -517,7 +575,12 @@ class ConnectionPool:
     At most ``size`` connections are open at once, since Yandex limits concurrent
     IMAP sessions per account. A connection that has been idle longer than
     ``idle_timeout`` seconds or fails NOOP is replaced. A connection is returned
-    with no folder selected, and is closed instead if the caller raised.
+    with no folder selected, and is closed instead if the caller raised. When a
+    session is dropped, the idle connections are closed too: the server has
+    probably dropped them for the same reason.
+
+    The open connections, idle ones included, never outnumber ``size``: a new
+    connection is opened only when no idle one is left.
     """
 
     def __init__(
@@ -528,7 +591,7 @@ class ConnectionPool:
         wait_timeout: float = 60,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._idle: queue.LifoQueue[tuple[IMAPClient, float]] = queue.LifoQueue()
+        self._idle: queue.LifoQueue[_Pooled] = queue.LifoQueue()
         self._slots = threading.BoundedSemaphore(size)
         self._idle_timeout = idle_timeout
         self._wait_timeout = wait_timeout
@@ -536,52 +599,108 @@ class ConnectionPool:
         self._closed = False
 
     @contextmanager
-    def connection(self, factory: Callable[[], IMAPClient]) -> Iterator[IMAPClient]:
+    def connection(
+        self,
+        factory: Callable[[], IMAPClient],
+        label: str = "imap",
+        *,
+        fresh: bool = False,
+    ) -> Iterator[IMAPClient]:
         """A logged-in connection: an idle one, or a new one from factory.
 
         The pool has no login of its own: the caller's factory logs in new connections,
-        so every caller must be entitled to reuse the others' idle ones.
+        so every caller must be entitled to reuse the others' idle ones. fresh closes the
+        idle connections instead of trying them, so a new one is opened unless another
+        call returns one in the meantime. label names the operation in the log when the
+        session drops.
         """
         if not self._slots.acquire(timeout=self._wait_timeout):
             raise MailError("All IMAP connections are busy; please retry")
         try:
-            imap = self._checkout(factory)
+            entry = self._checkout(factory, fresh)
+            entry.uses += 1
             try:
-                yield imap
+                yield entry.imap
             except MailError:
                 # Raised by this package between complete commands: the session is fine.
-                self._checkin(imap)
+                self._checkin(entry)
+                raise
+            except INTERRUPTED as exc:
+                self._dropped(entry, label, exc)
+                _shutdown(entry.imap)
                 raise
             except BaseException:
-                _close(imap)
+                _close(entry.imap)
                 raise
-            self._checkin(imap)
+            self._checkin(entry)
         finally:
             self._slots.release()
 
-    def _checkout(self, factory: Callable[[], IMAPClient]) -> IMAPClient:
+    def _dropped(self, entry: _Pooled, label: str, exc: BaseException) -> None:
+        state = getattr(getattr(entry.imap, "_imap", None), "state", None)
+        LOG.warning(
+            "IMAP session dropped during %s: %s: %s (%s connection, %.0f s old, "
+            "%d operation(s), state %s)",
+            label,
+            type(exc).__name__,
+            _failure_reason(exc),
+            "reused" if entry.uses > 1 else "new",
+            self._clock() - entry.opened,
+            entry.uses,
+            state,
+        )
+        closed = self._discard_idle(_shutdown)
+        if closed:
+            LOG.info("Closed %d idle IMAP connection(s) after the session dropped", closed)
+
+    def _discard_idle(self, close: Callable[[IMAPClient], None] = _close) -> int:
+        closed = 0
         while True:
             try:
-                imap, last_used = self._idle.get_nowait()
+                entry = self._idle.get_nowait()
             except queue.Empty:
-                return factory()
-            if self._clock() - last_used > self._idle_timeout:
-                _close(imap)
+                return closed
+            close(entry.imap)
+            closed += 1
+
+    def _checkout(self, factory: Callable[[], IMAPClient], fresh: bool) -> _Pooled:
+        if fresh:
+            # Idle connections count against the size too: close them, untried.
+            self._discard_idle(_shutdown)
+        while True:
+            try:
+                entry = self._idle.get_nowait()
+            except queue.Empty:
+                break
+            if self._clock() - entry.last_used > self._idle_timeout:
+                _close(entry.imap)
                 continue
             try:
-                imap.noop()
-            except (imaplib.IMAP4.error, OSError):
+                entry.imap.noop()
+            except (imaplib.IMAP4.error, OSError) as exc:
                 # IMAP4.abort is an IMAP4.error.
-                _close(imap)
+                LOG.info(
+                    "Replacing an idle IMAP connection that failed NOOP: %s: %s "
+                    "(%.0f s old, idle %.0f s, %d operation(s))",
+                    type(exc).__name__,
+                    _failure_reason(exc),
+                    self._clock() - entry.opened,
+                    self._clock() - entry.last_used,
+                    entry.uses,
+                )
+                _close(entry.imap)
                 continue
-            return imap
+            return entry
+        now = self._clock()
+        return _Pooled(factory(), opened=now, last_used=now)
 
-    def _checkin(self, imap: IMAPClient) -> None:
+    def _checkin(self, entry: _Pooled) -> None:
         """Return a connection to the pool, or close it; never raise.
 
         The caller's command has already completed, so a failure here must not
         replace its result.
         """
+        imap = entry.imap
         if self._closed:
             _close(imap)
             return
@@ -598,16 +717,12 @@ class ConnectionPool:
             LOG.info("Closing an IMAP connection that could not be reset: %s", exc)
             _close(imap)
             return
-        self._idle.put((imap, self._clock()))
+        entry.last_used = self._clock()
+        self._idle.put(entry)
 
     def close(self) -> None:
         self._closed = True
-        while True:
-            try:
-                imap, _ = self._idle.get_nowait()
-            except queue.Empty:
-                return
-            _close(imap)
+        self._discard_idle()
 
 
 MAX_DRAFT_BODY = 100 * 1024
@@ -795,11 +910,40 @@ class Mailbox:
         return self.credentials.read_only_reason()
 
     @contextmanager
-    def connect(self) -> Iterator[IMAPClient]:
+    def connect(self, label: str = "imap", *, fresh: bool = False) -> Iterator[IMAPClient]:
         # This Mailbox's own login, not the one the pool was created with: a request's
         # view logs in new connections with the request's credentials.
-        with self.pool.connection(self._open) as imap:
+        with self.pool.connection(self._open, label, fresh=fresh) as imap:
             yield imap
+
+    def _read(self, label: str, operation: Callable[[IMAPClient], _T]) -> _T:
+        """Run a read-only operation, once more on a new connection if the session drops.
+
+        Only for operations that change nothing on the server: the whole operation runs
+        again, SELECT included. A change is never repeated, since the session may drop
+        after the server made it. A second drop in a row raises ConnectionInterrupted.
+        A failure to connect or log in is not a dropped session and is not retried.
+        """
+        started = False
+        try:
+            with self.connect(label) as imap:
+                started = True
+                return operation(imap)
+        except INTERRUPTED as exc:
+            if not started:
+                raise
+            LOG.info("Retrying %s on a new IMAP connection after %s", label, type(exc).__name__)
+        started = False
+        try:
+            with self.connect(label, fresh=True) as imap:
+                started = True
+                return operation(imap)
+        except INTERRUPTED as exc:
+            if not started:
+                raise
+            raise ConnectionInterrupted(
+                f"{label}: IMAP session dropped twice in a row ({_failure_reason(exc)})"
+            ) from exc
 
     def close(self) -> None:
         """Close the pool this Mailbox created; a Mailbox over a shared pool closes nothing."""
@@ -871,8 +1015,7 @@ class Mailbox:
         return [summaries[uid] for uid in uids if uid in summaries]
 
     def folders(self) -> list[str]:
-        with self.connect() as imap:
-            return [str(name) for _, _, name in imap.list_folders()]
+        return self._read("folders", lambda imap: [str(name) for _, _, name in imap.list_folders()])
 
     def recent(
         self,
@@ -885,10 +1028,13 @@ class Mailbox:
         scope = _uid_scope(before_uid)
         if scope is None:
             return []
-        with self.connect() as imap:
+
+        def operation(imap: IMAPClient) -> list[MailSummary]:
             imap.select_folder(folder, readonly=True)
             uids = imap.search((["UNSEEN"] if unread_only else []) + scope or ["ALL"])
             return self._fetch(imap, sorted(uids)[-limit:][::-1])
+
+        return self._read("recent", operation)
 
     def search(
         self,
@@ -926,7 +1072,8 @@ class Mailbox:
         scope = _uid_scope(before_uid)
         if scope is None:
             return []
-        with self.connect() as imap:
+
+        def operation(imap: IMAPClient) -> list[MailSummary]:
             imap.select_folder(folder, readonly=True)
             try:
                 uids = sorted(imap.search(criteria + scope or ["ALL"], charset="UTF-8"))[::-1]
@@ -939,6 +1086,8 @@ class Mailbox:
             if has_attachments is None:
                 return self._fetch(imap, uids[:limit], max_body_chars=2000)
             return self._filter_attachments(imap, uids, has_attachments, limit)
+
+        return self._read("search", operation)
 
     def _search_previews(
         self, imap: IMAPClient, query: str, limit: int, scope: list[str]
@@ -981,7 +1130,8 @@ class Mailbox:
 
     def message(self, uid: int, folder: str = "INBOX") -> MailSummary:
         valid_uid(uid)
-        with self.connect() as imap:
+
+        def operation(imap: IMAPClient) -> MailSummary:
             imap.select_folder(folder, readonly=True)
             item = imap.fetch([uid], ["RFC822.SIZE"]).get(uid, {})
             if not item:
@@ -996,6 +1146,8 @@ class Mailbox:
                 raise MailLookupError(f"Message UID {uid} not found in {folder}")
             return parse_message(raw, uid, max_body_chars=10000)
 
+        return self._read("message", operation)
+
     def thread(self, uid: int, folder: str = "INBOX", limit: int = 50) -> list[ThreadMessage]:
         """Collect the conversation of a message by Message-ID, In-Reply-To and References.
 
@@ -1005,7 +1157,8 @@ class Mailbox:
         """
         valid_uid(uid)
         limit = max(1, min(limit, 100))
-        with self.connect() as imap:
+
+        def operation(imap: IMAPClient) -> dict[tuple[str, int], ThreadMessage]:
             origin, _ = self._headers(imap, uid, folder)
             folders = [folder]
             for flags, _, name in imap.list_folders():
@@ -1063,6 +1216,9 @@ class Mailbox:
                     ):
                         found[(name, message["uid"])] = {**message, "folder": name}
                         known |= _thread_ids(message)
+            return found
+
+        found = self._read("thread", operation)
         unique: dict[str, ThreadMessage] = {}
         for key, message in found.items():
             # The same message can be in two folders, such as mail sent to oneself.
@@ -1099,7 +1255,7 @@ class Mailbox:
 
     def headers(self, uid: int, folder: str = "INBOX") -> MailSummary:
         valid_uid(uid)
-        with self.connect() as imap:
+        with self.connect("headers") as imap:
             return self._headers(imap, uid, folder)[0]
 
     @staticmethod
@@ -1121,7 +1277,7 @@ class Mailbox:
         """
         valid_uid(uid)
         self._promotions_folder_name()
-        with self.connect() as imap:
+        with self.connect("preview_promotions_move") as imap:
             folder, _ = self.validate_promotions_folder(imap)
             headers, uidvalidity = self._headers(imap, uid, "INBOX")
             return headers, Target(folder, uidvalidity)
@@ -1294,7 +1450,7 @@ class Mailbox:
     ) -> tuple[list[MailSummary], Target]:
         """Validate a batch move and read every message's headers for the confirmation."""
         uids = batch_uids(uids)
-        with self.connect() as imap:
+        with self.connect("preview_moves") as imap:
             destination = self._destination(imap, folder)
             if destination.casefold() == source_folder.strip().casefold():
                 raise MailValueError("The messages are already in that folder")
@@ -1326,7 +1482,7 @@ class Mailbox:
         uids = batch_uids(uids)
         self._require_write()
         error: str | None = None
-        with self.connect() as imap:
+        with self.connect("move_many") as imap:
             destination = self._destination(imap, folder)
             if destination.casefold() == source_folder.strip().casefold():
                 raise MailValueError("The messages are already in that folder")
@@ -1412,7 +1568,7 @@ class Mailbox:
         the destination as the server spells it and the source folder's UIDVALIDITY.
         """
         valid_uid(uid)
-        with self.connect() as imap:
+        with self.connect("preview_move") as imap:
             destination = (
                 self._archive_destination(imap)
                 if folder is None
@@ -1438,7 +1594,7 @@ class Mailbox:
         """
         valid_uid(uid)
         self._require_write()
-        with self.connect() as imap:
+        with self.connect("move") as imap:
             destination = (
                 self._archive_destination(imap)
                 if folder is None
@@ -1458,7 +1614,7 @@ class Mailbox:
     def preview_flag(self, uid: int, folder: str = "INBOX") -> tuple[MailSummary, Target]:
         """The message headers, and the target: its folder and that folder's UIDVALIDITY."""
         valid_uid(uid)
-        with self.connect() as imap:
+        with self.connect("preview_flag") as imap:
             headers, uidvalidity = self._headers(imap, uid, folder)
             return headers, Target(folder, uidvalidity)
 
@@ -1480,7 +1636,7 @@ class Mailbox:
         if flag not in {"\\Seen", "\\Flagged"}:
             raise MailValueError("Only the \\Seen and \\Flagged flags can be changed")
         self._require_write()
-        with self.connect() as imap:
+        with self.connect("set_flag") as imap:
             self._select_message(imap, uid, folder, uidvalidity)
             if value:
                 imap.add_flags([uid], [flag])
@@ -1523,7 +1679,7 @@ class Mailbox:
             raise MailValueError("subject must be a single line")
         original: MailSummary | None = None
         reply: Message | None = None
-        with self.connect() as imap:
+        with self.connect("prepare_draft") as imap:
             folder = self._drafts_folder(imap)
             if in_reply_to_uid is not None:
                 valid_uid(in_reply_to_uid, "in_reply_to_uid")
@@ -1566,7 +1722,7 @@ class Mailbox:
     def save_draft(self, draft: Draft) -> dict[str, Any]:
         """APPEND a prepared draft with the \\Draft flag; nothing is sent."""
         self._require_write()
-        with self.connect() as imap:
+        with self.connect("save_draft") as imap:
             response = imap.append(
                 draft.folder,
                 draft.message.as_bytes(),
@@ -1590,7 +1746,7 @@ class Mailbox:
         if confirm is not True:
             raise MailPermissionError("Explicit confirm=true is required to move a message")
         self._promotions_folder_name()
-        with self.connect() as imap:
+        with self.connect("move_to_promotions") as imap:
             folder, exists = self.validate_promotions_folder(imap)
             # The message first: a refused change must not leave a new folder behind.
             self._select_message(imap, uid, "INBOX", uidvalidity)

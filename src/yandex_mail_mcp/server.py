@@ -60,11 +60,14 @@ from .crypto import TokenCipher
 from .mail import (
     MAX_BATCH_INPUT,
     MAX_BATCH_MOVE,
+    RESET_ERRORS,
+    ConnectionInterrupted,
     Draft,
     Mailbox,
     MailError,
     MailSummary,
     ThreadMessage,
+    os_reason,
 )
 from .yandex_oauth import YandexOAuth, YandexOAuthError, can_write
 
@@ -195,14 +198,6 @@ NETWORK_ERRNOS = {
 }
 
 
-RESET_ERRORS = (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, ssl.SSLEOFError)
-
-
-def _os_reason(exc: OSError) -> str:
-    """The OS or TLS error text, which carries no secrets."""
-    return exc.strerror or " ".join(map(str, exc.args)) or type(exc).__name__
-
-
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -247,6 +242,12 @@ def _translate(exc: Exception) -> ToolError | None:
         return ToolError(
             "IMAP authentication failed; check your credentials and whether IMAP is enabled"
         )
+    if isinstance(exc, ConnectionInterrupted):
+        # A read already retried on a new connection.
+        return ToolError(
+            "IMAP connection was interrupted twice; the mail server may be closing "
+            "sessions, retry later"
+        )
     if isinstance(exc, imaplib.IMAP4.abort):
         return ToolError("IMAP connection was interrupted; please retry")
     if isinstance(exc, imaplib.IMAP4.error):
@@ -261,14 +262,14 @@ def _translate(exc: Exception) -> ToolError | None:
         return ToolError("IMAP connection was reset; please retry")
     if isinstance(exc, ssl.SSLError):
         return ToolError(
-            f"TLS error with {_imap_address()} ({_os_reason(exc)}); "
+            f"TLS error with {_imap_address()} ({os_reason(exc)}); "
             "check YANDEX_IMAP_HOST and the certificate chain"
         )
     if isinstance(exc, (ConnectionError, socket.gaierror, socket.herror)) or (
         isinstance(exc, OSError) and exc.errno in NETWORK_ERRNOS
     ):
         return ToolError(
-            f"Connection to {_imap_address()} failed ({_os_reason(exc)}); "
+            f"Connection to {_imap_address()} failed ({os_reason(exc)}); "
             "check YANDEX_IMAP_HOST, YANDEX_IMAP_PORT and network access, then retry"
         )
     return None
