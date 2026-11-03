@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A tool could still fail with "IMAP connection was interrupted; please retry" after a pause of about four minutes. Yandex had dropped the idle sessions, the pool replaced them after a failed `NOOP`, and the login of a replacement was dropped too; 0.8.1 did not retry a login and logged nothing about it. A new connection whose login is dropped (`BYE`, end of stream, a reset or broken socket, a TLS EOF) now logs in once more after a second, for every tool, changes included, since nothing but the login was sent. Each dropped login is logged as a warning with the operation and the server's reason. A second one fails with "IMAP login was dropped twice (reason); the mail server may be limiting sessions, retry later". A login refused for its credentials, or a timeout, is still not retried.
+- `scripts/imap_stress.py` counts dropped logins apart from sessions dropped during a call.
+
 ## 0.8.1
 
 ### Fixed

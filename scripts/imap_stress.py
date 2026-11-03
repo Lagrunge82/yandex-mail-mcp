@@ -139,8 +139,11 @@ def main(argv: list[str] | None = None) -> int:
 
     for result in results:
         records = result.pop("log")
-        result["dropped_sessions"] = sum(r.levelno >= logging.WARNING for r in records)
+        result["dropped_sessions"] = sum(
+            r.getMessage().startswith("IMAP session dropped") for r in records
+        )
         result["retries"] = sum(r.getMessage().startswith("Retrying") for r in records)
+        result["dropped_logins"] = sum(r.getMessage().startswith("IMAP login for") for r in records)
         result["noop_replacements"] = sum("failed NOOP" in r.getMessage() for r in records)
         result["log"] = [
             f"{r.levelname} {r.getMessage()}" for r in records if r.levelno >= logging.INFO
@@ -157,7 +160,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"  median {result['median_s']} s, p95 {result['p95_s']} s, "
                 f"max {result['max_s']} s, wall {result['wall_s']} s\n"
                 f"  dropped sessions {result['dropped_sessions']}, "
-                f"retries {result['retries']}, NOOP replacements {result['noop_replacements']}"
+                f"retries {result['retries']}, dropped logins {result['dropped_logins']}, "
+                f"NOOP replacements {result['noop_replacements']}"
             )
             for line in result["log"]:
                 print(f"  {line}")

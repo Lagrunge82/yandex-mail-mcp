@@ -6,13 +6,14 @@ import ssl
 import threading
 import time
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
 
 from yandex_mail_mcp import mail
 from yandex_mail_mcp.config import Settings
-from yandex_mail_mcp.mail import ConnectionInterrupted, Mailbox
+from yandex_mail_mcp.mail import ConnectionInterrupted, LoginInterrupted, Mailbox
 
 HEADER = b"From: Alice <alice@example.com>\r\nSubject: Secret subject\r\n\r\n"
 TEXT_PART = (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"7BIT", 5, 1, None, None)
@@ -98,6 +99,7 @@ def fake_imap(monkeypatch):
     FakeIMAP.instances = []
     FakeIMAP.failures = {}
     monkeypatch.setattr(mail, "IMAPClient", FakeIMAP)
+    monkeypatch.setattr(mail, "LOGIN_RETRY_DELAY", 0)
     return FakeIMAP
 
 
@@ -271,27 +273,99 @@ def test_retry_keeps_the_pool_size(fake_imap):
     assert open_at_retry == [1]
 
 
+def test_idle_connections_dropped_by_the_server_then_a_dropped_login(
+    fake_imap, monkeypatch, caplog
+):
+    """The failure seen on Yandex: both idle sessions fail NOOP after about four
+    minutes, and the login of a replacement is dropped once."""
+    sleeps = []
+    monkeypatch.setattr(mail, "LOGIN_RETRY_DELAY", 1.0)
+    monkeypatch.setattr(
+        mail, "time", SimpleNamespace(sleep=sleeps.append, monotonic=time.monotonic)
+    )
+    box = mailbox(imap_pool_size=2)
+    with box.connect(), box.connect():
+        pass
+    fake_imap.failures = {
+        0: ("noop", imaplib.IMAP4.abort("socket error: [Errno 32] Broken pipe")),
+        1: ("noop", imaplib.IMAP4.abort("socket error: [Errno 104] Connection reset by peer")),
+        2: ("login", imaplib.IMAP4.abort("socket error: EOF")),
+    }
+    with caplog.at_level(logging.INFO, logger="yandex_mail_mcp.mail"):
+        assert box.recent(limit=5)[0]["uid"] == 7
+    assert sleeps == [1.0]
+    assert len(fake_imap.instances) == 4
+    assert fake_imap.instances[2].logins == 0 and fake_imap.instances[2].closed
+    assert fake_imap.instances[3].logins == 1 and "fetch" in fake_imap.instances[3].calls
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "IMAP login for recent dropped: abort: socket error: EOF; logging in again in 1 s"
+    ]
+
+
 @pytest.mark.parametrize(
-    "error", [ConnectionResetError(104, "Connection reset by peer"), imaplib.IMAP4.abort("EOF")]
+    "error",
+    [
+        imaplib.IMAP4.abort("socket error: EOF"),
+        ConnectionResetError(104, "Connection reset by peer"),
+        ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+    ],
 )
-def test_failed_login_is_not_retried(fake_imap, error):
+def test_dropped_login_logs_in_again(fake_imap, error):
     fake_imap.failures = {0: ("login", error)}
-    with pytest.raises(type(error)) as raised:
+    assert mailbox().recent(limit=5)[0]["uid"] == 7
+    assert [imap.logins for imap in fake_imap.instances] == [0, 1]
+
+
+def test_login_dropped_twice_names_the_reason(fake_imap, caplog):
+    fake_imap.failures = {
+        0: ("login", imaplib.IMAP4.abort("socket error: EOF")),
+        1: ("login", imaplib.IMAP4.abort("Too many simultaneous connections")),
+        2: ("login", imaplib.IMAP4.abort("never reached")),
+    }
+    with (
+        caplog.at_level(logging.WARNING, logger="yandex_mail_mcp.mail"),
+        pytest.raises(LoginInterrupted) as raised,
+    ):
         mailbox().recent(limit=5)
-    assert not isinstance(raised.value, ConnectionInterrupted)
+    assert str(raised.value) == ("IMAP login was dropped twice (Too many simultaneous connections)")
+    assert isinstance(raised.value, imaplib.IMAP4.abort)
+    assert len(fake_imap.instances) == 2
+    assert all(imap.closed for imap in fake_imap.instances)
+    assert len(caplog.records) == 2
+    assert caplog.records[-1].getMessage() == (
+        "IMAP login for recent dropped again: abort: Too many simultaneous connections"
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [imaplib.IMAP4.error("AUTHENTICATIONFAILED"), TimeoutError("timed out")],
+)
+def test_login_failures_other_than_drops_are_not_retried(fake_imap, error):
+    fake_imap.failures = {0: ("login", error)}
+    with pytest.raises(type(error)):
+        mailbox().recent(limit=5)
     assert len(fake_imap.instances) == 1
 
 
-def test_failed_login_on_the_retry_is_reported_as_itself(fake_imap):
-    error = ConnectionResetError(104, "Connection reset by peer")
+def test_change_logs_in_again_and_runs_once(fake_imap, monkeypatch):
+    # Nothing but the login was sent, so a change may log in again.
+    monkeypatch.setattr(Mailbox, "_destination", staticmethod(lambda imap, folder, *_: folder))
+    fake_imap.failures = {0: ("login", imaplib.IMAP4.abort("socket error: EOF"))}
+    assert mailbox(allow_write=True).move(7, "Archive", uidvalidity=None)["folder"] == "Archive"
+    first, second = fake_imap.instances
+    assert first.calls == []
+    assert second.calls.count("move") == 1
+
+
+def test_dropped_login_on_the_retry_logs_in_again(fake_imap):
     fake_imap.failures = {
         0: ("fetch", imaplib.IMAP4.abort("socket error: EOF")),
-        1: ("login", error),
+        1: ("login", ConnectionResetError(104, "Connection reset by peer")),
     }
-    with pytest.raises(ConnectionResetError) as raised:
-        mailbox().recent(limit=5)
-    assert raised.value is error
-    assert len(fake_imap.instances) == 2
+    assert mailbox().recent(limit=5)[0]["uid"] == 7
+    assert [imap.logins for imap in fake_imap.instances] == [1, 0, 1]
 
 
 def test_dropped_session_is_logged_without_mail_content(fake_imap, caplog):

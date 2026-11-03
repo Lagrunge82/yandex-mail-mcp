@@ -63,6 +63,7 @@ from .mail import (
     RESET_ERRORS,
     ConnectionInterrupted,
     Draft,
+    LoginInterrupted,
     Mailbox,
     MailError,
     MailSummary,
@@ -242,6 +243,9 @@ def _translate(exc: Exception) -> ToolError | None:
         return ToolError(
             "IMAP authentication failed; check your credentials and whether IMAP is enabled"
         )
+    if isinstance(exc, LoginInterrupted):
+        # Its text names what the server said; it carries no token or mail.
+        return ToolError(f"{exc}; the mail server may be limiting sessions, retry later")
     if isinstance(exc, ConnectionInterrupted):
         # A read already retried on a new connection.
         return ToolError(

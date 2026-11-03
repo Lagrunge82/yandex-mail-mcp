@@ -544,6 +544,15 @@ class ConnectionInterrupted(imaplib.IMAP4.abort):
     """A read failed twice in a row because the IMAP session was dropped."""
 
 
+class LoginInterrupted(imaplib.IMAP4.abort):
+    """A new IMAP connection was dropped while logging in, twice in a row."""
+
+
+# Seconds before a new connection tries to log in again. Yandex drops idle sessions
+# after about four minutes, and a login right after that can be dropped too.
+LOGIN_RETRY_DELAY = 1.0
+
+
 def _failure_reason(exc: BaseException) -> str:
     """Why a session was dropped, without what the server sent about mail.
 
@@ -580,7 +589,8 @@ class ConnectionPool:
     probably dropped them for the same reason.
 
     The open connections, idle ones included, never outnumber ``size``: a new
-    connection is opened only when no idle one is left.
+    connection is opened only when no idle one is left. A new connection dropped
+    while logging in logs in once more after ``LOGIN_RETRY_DELAY`` seconds.
     """
 
     def __init__(
@@ -617,7 +627,7 @@ class ConnectionPool:
         if not self._slots.acquire(timeout=self._wait_timeout):
             raise MailError("All IMAP connections are busy; please retry")
         try:
-            entry = self._checkout(factory, fresh)
+            entry = self._checkout(factory, fresh, label)
             entry.uses += 1
             try:
                 yield entry.imap
@@ -663,7 +673,7 @@ class ConnectionPool:
             close(entry.imap)
             closed += 1
 
-    def _checkout(self, factory: Callable[[], IMAPClient], fresh: bool) -> _Pooled:
+    def _checkout(self, factory: Callable[[], IMAPClient], fresh: bool, label: str) -> _Pooled:
         if fresh:
             # Idle connections count against the size too: close them, untried.
             self._discard_idle(_shutdown)
@@ -691,8 +701,34 @@ class ConnectionPool:
                 _close(entry.imap)
                 continue
             return entry
+        return self._open(factory, label)
+
+    def _open(self, factory: Callable[[], IMAPClient], label: str) -> _Pooled:
+        """A new connection from factory, which logs in again once if dropped meanwhile.
+
+        Safe for every operation, changes included: nothing but the login was sent.
+        """
+        try:
+            imap = factory()
+        except INTERRUPTED as exc:
+            LOG.warning(
+                "IMAP login for %s dropped: %s: %s; logging in again in %.0f s",
+                label,
+                type(exc).__name__,
+                _failure_reason(exc),
+                LOGIN_RETRY_DELAY,
+            )
+            time.sleep(LOGIN_RETRY_DELAY)
+            try:
+                imap = factory()
+            except INTERRUPTED as again:
+                reason = _failure_reason(again)
+                LOG.warning(
+                    "IMAP login for %s dropped again: %s: %s", label, type(again).__name__, reason
+                )
+                raise LoginInterrupted(f"IMAP login was dropped twice ({reason})") from again
         now = self._clock()
-        return _Pooled(factory(), opened=now, last_used=now)
+        return _Pooled(imap, opened=now, last_used=now)
 
     def _checkin(self, entry: _Pooled) -> None:
         """Return a connection to the pool, or close it; never raise.
@@ -922,7 +958,7 @@ class Mailbox:
         Only for operations that change nothing on the server: the whole operation runs
         again, SELECT included. A change is never repeated, since the session may drop
         after the server made it. A second drop in a row raises ConnectionInterrupted.
-        A failure to connect or log in is not a dropped session and is not retried.
+        A dropped login is retried by the pool itself, so it is not retried here.
         """
         started = False
         try:
