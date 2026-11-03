@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import imaplib
 import json
 import logging
 import os
@@ -79,6 +80,23 @@ LOCAL_REAUTH_HINT = "run `yandex-mail-mcp login` with YANDEX_ALLOW_WRITE=true"
 LOCAL_RELOGIN_HINT = "run `yandex-mail-mcp login` again"
 
 
+def _oauth2_login(imap: IMAPClient, email: str, token: str) -> None:
+    """XOAUTH2 login that raises a dropped session as itself.
+
+    IMAPClient wraps every IMAP error of AUTHENTICATE in LoginError, a BYE or end of
+    stream included. A dropped session says nothing about the token, so it must not
+    cost a refresh or a new sign-in: the IMAP4.abort is raised for the pool to retry.
+    """
+    try:
+        imap.oauth2_login(email, token)
+        return
+    except LoginError as exc:
+        dropped = exc.__cause__ or exc.__context__
+        if not isinstance(dropped, imaplib.IMAP4.abort):
+            raise
+    raise dropped
+
+
 class OAuthCredentials:
     """XOAUTH2 login with a token source.
 
@@ -105,7 +123,7 @@ class OAuthCredentials:
             # Refreshing an expiring token failed before IMAP was even tried.
             raise ReauthenticationRequired(f"{exc}; {self.relogin_hint}") from exc
         try:
-            imap.oauth2_login(self.email, token)
+            _oauth2_login(imap, self.email, token)
             return
         except LoginError:
             # An expired or revoked token: refresh once and retry; a second failure is final.
@@ -115,7 +133,7 @@ class OAuthCredentials:
         except LoginError as exc:
             raise ReauthenticationRequired(f"{exc}; {self.relogin_hint}") from exc
         try:
-            imap.oauth2_login(self.email, token)
+            _oauth2_login(imap, self.email, token)
         except LoginError as exc:
             raise ReauthenticationRequired(
                 f"Yandex rejected the refreshed OAuth token for IMAP ({exc}); check that IMAP "

@@ -143,7 +143,11 @@ def main(argv: list[str] | None = None) -> int:
             r.getMessage().startswith("IMAP session dropped") for r in records
         )
         result["retries"] = sum(r.getMessage().startswith("Retrying") for r in records)
-        result["dropped_logins"] = sum(r.getMessage().startswith("IMAP login for") for r in records)
+        # Each login that was dropped and tried again; a second drop is a failure above.
+        result["dropped_logins"] = sum(
+            r.getMessage().startswith("IMAP login for") and " dropped: " in r.getMessage()
+            for r in records
+        )
         result["noop_replacements"] = sum("failed NOOP" in r.getMessage() for r in records)
         result["log"] = [
             f"{r.levelname} {r.getMessage()}" for r in records if r.levelno >= logging.INFO

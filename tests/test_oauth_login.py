@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import imaplib
 import io
 import json
 import os
@@ -114,6 +115,45 @@ def test_oauth_credentials_raise_after_second_failure():
     assert "[AUTHENTICATIONFAILED] Invalid credentials" in message
     assert "IMAP access is enabled in Yandex Mail settings" in message
     assert message.endswith("run `yandex-mail-mcp login` again")
+
+
+class DroppingIMAP:
+    """Like IMAPClient.oauth2_login, which wraps a dropped session in LoginError."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.logins = []
+
+    def oauth2_login(self, user, token):
+        self.logins.append((user, token))
+        outcome = self.outcomes.pop(0)
+        if outcome is None:
+            return
+        try:
+            raise outcome
+        except imaplib.IMAP4.error as exc:
+            raise LoginError(str(exc))  # noqa: B904
+
+
+def test_dropped_authenticate_is_raised_as_itself_without_refresh():
+    dropped = imaplib.IMAP4.abort("socket error: EOF")
+    imap, source = DroppingIMAP([dropped]), CountingSource()
+    with pytest.raises(imaplib.IMAP4.abort) as raised:
+        OAuthCredentials("ivan@yandex.ru", source).login(imap)
+    assert raised.value is dropped
+    assert not isinstance(raised.value, LoginError)
+    assert source.refreshes == 0
+    assert len(imap.logins) == 1
+
+
+def test_dropped_authenticate_after_a_refresh_is_not_reported_as_a_bad_token():
+    rejected = imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials")
+    dropped = imaplib.IMAP4.abort("Server shutting down")
+    imap, source = DroppingIMAP([rejected, dropped]), CountingSource()
+    with pytest.raises(imaplib.IMAP4.abort) as raised:
+        OAuthCredentials("ivan@yandex.ru", source).login(imap)
+    assert raised.value is dropped
+    assert source.refreshes == 1
 
 
 def test_static_token_cannot_refresh():

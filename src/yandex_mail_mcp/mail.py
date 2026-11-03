@@ -719,6 +719,9 @@ class ConnectionPool:
                 LOGIN_RETRY_DELAY,
             )
             time.sleep(LOGIN_RETRY_DELAY)
+            # Connections returned meanwhile were opened before the drop: the server
+            # has probably dropped them too, as after a drop during a call.
+            self._discard_idle(_shutdown)
             try:
                 imap = factory()
             except INTERRUPTED as again:
@@ -913,6 +916,10 @@ class Mailbox:
         )
         try:
             self.credentials.login(imap)
+        except INTERRUPTED:
+            # LOGOUT on a dropped session would wait for the socket timeout.
+            _shutdown(imap)
+            raise
         except BaseException:
             _close(imap)
             raise

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
+from imapclient.exceptions import LoginError
 
 from yandex_mail_mcp import mail
 from yandex_mail_mcp.config import Settings
@@ -39,7 +40,12 @@ class FakeIMAP:
     def oauth2_login(self, user, token):
         command, error = FakeIMAP.failures.get(self.number, (None, None))
         if command == "login":
-            raise error
+            # Like IMAPClient.oauth2_login, which wraps every IMAP error, aborts
+            # included, in LoginError; socket errors on the read pass unwrapped.
+            try:
+                raise error
+            except imaplib.IMAP4.error as exc:
+                raise LoginError(str(exc))  # noqa: B904
         self.logins += 1
         self._imap.state = "AUTH"
 
@@ -295,7 +301,9 @@ def test_idle_connections_dropped_by_the_server_then_a_dropped_login(
         assert box.recent(limit=5)[0]["uid"] == 7
     assert sleeps == [1.0]
     assert len(fake_imap.instances) == 4
-    assert fake_imap.instances[2].logins == 0 and fake_imap.instances[2].closed
+    dropped = fake_imap.instances[2]
+    # Closed without LOGOUT, which would wait on a dropped session.
+    assert dropped.logins == 0 and dropped.closed and not dropped.logged_out
     assert fake_imap.instances[3].logins == 1 and "fetch" in fake_imap.instances[3].calls
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == [
@@ -347,6 +355,26 @@ def test_login_failures_other_than_drops_are_not_retried(fake_imap, error):
     with pytest.raises(type(error)):
         mailbox().recent(limit=5)
     assert len(fake_imap.instances) == 1
+
+
+def test_connection_returned_during_the_login_pause_is_closed_untried(fake_imap, monkeypatch):
+    box = mailbox(imap_pool_size=2)
+    returned = []
+
+    def sleep(seconds):
+        # Another call opens and returns a connection while this one waits.
+        if not returned:
+            with box.connect() as imap:
+                returned.append(imap)
+
+    monkeypatch.setattr(mail, "time", SimpleNamespace(sleep=sleep, monotonic=time.monotonic))
+    fake_imap.failures = {0: ("login", imaplib.IMAP4.abort("socket error: EOF"))}
+    assert box.recent(limit=5)[0]["uid"] == 7
+    dropped, other, fresh = fake_imap.instances
+    assert dropped.closed and not dropped.logged_out
+    assert returned == [other]
+    assert other.calls == [] and other.closed
+    assert "fetch" in fresh.calls and fresh.logins == 1
 
 
 def test_change_logs_in_again_and_runs_once(fake_imap, monkeypatch):
