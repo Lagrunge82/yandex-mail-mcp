@@ -18,6 +18,7 @@ from yandex_mail_mcp.config import Settings
 from yandex_mail_mcp.credentials import ReauthenticationRequired
 from yandex_mail_mcp.mail import (
     ConnectionInterrupted,
+    LoginInterrupted,
     Mailbox,
     MailPermissionError,
     MailValueError,
@@ -121,6 +122,11 @@ def test_dropped_session_is_reported_as_reset(monkeypatch, error):
         (
             imaplib.IMAP4.abort("socket error: EOF"),
             r"IMAP connection was interrupted; please retry$",
+        ),
+        (
+            LoginInterrupted("IMAP login was dropped twice (socket error: EOF)"),
+            r"IMAP login was dropped twice \(socket error: EOF\); the mail server may be "
+            r"limiting sessions, retry later$",
         ),
     ],
 )
