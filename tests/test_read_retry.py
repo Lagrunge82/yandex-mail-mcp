@@ -161,6 +161,32 @@ def test_socket_errors_are_retried_like_abort(fake_imap, error):
     assert fake_imap.instances[0].closed
 
 
+class CountedFolder(FakeIMAP):
+    """A folder that reports EXISTS, so recent() reads its last UIDs by sequence number."""
+
+    use_uid = True
+
+    def select_folder(self, name, readonly=False):
+        super().select_folder(name, readonly)
+        return {b"EXISTS": 1, b"UIDNEXT": 8, b"UIDVALIDITY": 1}
+
+    def fetch(self, uids, fields):
+        if fields == ["UID"]:
+            self._command("fetch_uid")
+            return {1: {b"UID": 7, b"SEQ": 1}}
+        return super().fetch(uids, fields)
+
+
+def test_window_fetch_is_retried_on_a_new_connection(fake_imap, monkeypatch):
+    monkeypatch.setattr(mail, "IMAPClient", CountedFolder)
+    fake_imap.failures = {0: ("fetch_uid", imaplib.IMAP4.abort("socket error: EOF"))}
+    assert mailbox().recent(limit=5)[0]["uid"] == 7
+    first, second = fake_imap.instances
+    assert first.closed and not first.logged_out
+    assert second.calls[:2] == ["select", "fetch_uid"]
+    assert "search" not in first.calls + second.calls
+
+
 def test_second_drop_reaches_the_caller_without_more_retries(fake_imap):
     error = imaplib.IMAP4.abort("command: FETCH => socket error: EOF")
     fake_imap.failures = {0: ("fetch", error), 1: ("fetch", error), 2: ("fetch", error)}
