@@ -2,6 +2,7 @@
 
 import imaplib
 from contextlib import contextmanager
+from itertools import islice
 
 import pytest
 
@@ -21,14 +22,19 @@ def _in(number, sequence, top):
     return False
 
 
+# A message that is one PDF: an attachment, per _text_sections.
+PDF = (b"APPLICATION", b"PDF", None, None, None, b"BASE64", 10, None, None, None)
+
+
 class Folder:
     """A selected folder: UIDs ascending with sequence numbers, some unread."""
 
-    def __init__(self, uids, unread=(), subjects=None, report_exists=True):
+    def __init__(self, uids, unread=(), subjects=None, report_exists=True, report_uidnext=True):
         self.uids = sorted(uids)
         self.unread = set(unread)
         self.subjects = subjects or {}
         self.report_exists = report_exists
+        self.report_uidnext = report_uidnext
         self.use_uid = True
         self.searches = []
         self.fetches = []
@@ -36,11 +42,10 @@ class Folder:
     def select_folder(self, name, readonly=False):
         if not self.report_exists:
             return {b"UIDVALIDITY": 1}
-        return {
-            b"EXISTS": len(self.uids),
-            b"UIDNEXT": (self.uids[-1] if self.uids else 0) + 1,
-            b"UIDVALIDITY": 1,
-        }
+        selected = {b"EXISTS": len(self.uids), b"UIDVALIDITY": 1}
+        if self.report_uidnext:
+            selected[b"UIDNEXT"] = (self.uids[-1] if self.uids else 0) + 1
+        return selected
 
     def _matches(self, uid, criteria):
         items = list(criteria)
@@ -65,12 +70,21 @@ class Folder:
         return [uid for uid in self.uids if self._matches(uid, criteria)]
 
     def fetch(self, messages, fields):
+        if isinstance(messages, list):
+            messages = ",".join(map(str, messages))
         self.fetches.append((self.use_uid, messages, list(fields)))
+        if fields == ["BODYSTRUCTURE"]:
+            return {int(uid): {b"BODYSTRUCTURE": PDF} for uid in messages.split(",")}
         if fields != ["UID"]:
-            return {uid: {} for uid in messages}
+            return {int(uid): {} for uid in messages.split(",")}
         if self.use_uid:
+            # Like IMAPClient: keyed by UID, which it drops from the item, with SEQ kept.
             top = self.uids[-1] if self.uids else 0
-            return {uid: {b"UID": uid} for uid in self.uids if _in(uid, messages, top)}
+            return {
+                uid: {b"SEQ": seq}
+                for seq, uid in enumerate(self.uids, start=1)
+                if _in(uid, messages, top)
+            }
         return {
             seq: {b"UID": uid, b"SEQ": seq}
             for seq, uid in enumerate(self.uids, start=1)
@@ -131,8 +145,9 @@ def test_recent_handles_an_empty_or_small_folder(monkeypatch, count):
     "before_uid", [2, 3, 39, 40, 41, 4999, 5001, 5300, 90000, 90049, 999_999, 1_000_001, 10**9]
 )
 @pytest.mark.parametrize("limit", [1, 5, 100])
-def test_before_uid_matches_the_former_search(monkeypatch, before_uid, limit):
-    folder = Folder(SPARSE)
+@pytest.mark.parametrize("report_uidnext", [True, False])
+def test_before_uid_matches_the_former_search(monkeypatch, before_uid, limit, report_uidnext):
+    folder = Folder(SPARSE, report_uidnext=report_uidnext)
     box = mailbox(folder, monkeypatch)
     assert uids(box.recent(limit=limit, before_uid=before_uid)) == reference(
         folder, limit, before_uid
@@ -151,15 +166,41 @@ def test_before_uid_pages_through_the_whole_folder(monkeypatch):
     assert seen == sorted(SPARSE, reverse=True)
 
 
-def test_window_widens_over_a_gap_below_before_uid(monkeypatch):
-    folder = Folder([1, 2, 3, 900_000])
+# Dense old mail, a wide gap, then a few new messages.
+GAPPED = [*range(1, 20_001), *range(900_000, 900_005)]
+
+
+def fetched_sizes(folder):
+    """How many messages each FETCH (UID) asked for."""
+    top = len(folder.uids) if folder.uids else 0
+    sizes = []
+    for use_uid, messages, _ in folder.fetches:
+        numbers = folder.uids if use_uid else range(1, top + 1)
+        sizes.append(sum(_in(number, messages, numbers[-1]) for number in numbers))
+    return sizes
+
+
+def test_before_uid_of_a_message_is_placed_by_one_uid_fetch(monkeypatch):
+    folder = Folder(GAPPED)
     box = mailbox(folder, monkeypatch)
-    assert uids(box.recent(limit=5, before_uid=900_000)) == [3, 2, 1]
-    # Each window is a UID range, WINDOW_GROWTH times wider than the one above it.
-    ranges = [messages for use_uid, messages, _ in folder.fetches if use_uid]
-    assert ranges[0] == "899800:899999"
-    assert ranges[-1].startswith("1:")
-    assert len(ranges) < 12
+    assert uids(box.recent(limit=5, before_uid=900_000)) == [20_000, 19_999, 19_998, 19_997, 19_996]
+    # Its sequence number, then the five messages below it: no UID range over the gap.
+    assert folder.fetches == [(True, "900000", ["UID"]), (False, "19996:20000", ["UID"])]
+
+
+@pytest.mark.parametrize("report_uidnext", [True, False])
+@pytest.mark.parametrize("before_uid", [500_000, 10**9])
+def test_before_uid_no_message_has_is_placed_by_binary_search(
+    monkeypatch, report_uidnext, before_uid
+):
+    folder = Folder(GAPPED, report_uidnext=report_uidnext)
+    box = mailbox(folder, monkeypatch)
+    assert uids(box.recent(limit=5, before_uid=before_uid)) == reference(folder, 5, before_uid)
+    # Every FETCH names at most `limit` messages, however wide the gap.
+    assert max(fetched_sizes(folder)) <= 5
+    assert len(folder.fetches) <= 18
+    if report_uidnext and before_uid > GAPPED[-1]:
+        assert folder.fetches == [(False, "20001:20005", ["UID"])]
 
 
 @pytest.mark.parametrize("before_uid", [None, 5300, 90010])
@@ -182,6 +223,14 @@ def test_unread_only_stops_once_the_limit_is_met(monkeypatch):
     # The first window's lowest UID by sequence number, then one SEARCH up to the end.
     assert folder.searches == [["UID", "49801:*", "UNSEEN"]]
     assert folder.fetches == [(False, "49801", ["UID"])]
+
+
+def test_window_at_the_folder_start_needs_no_fetch(monkeypatch):
+    folder = Folder(range(1, 101), unread={50})
+    box = mailbox(folder, monkeypatch)
+    assert uids(box.recent(limit=5, unread_only=True)) == [50]
+    assert folder.fetches == []
+    assert folder.searches == [["UID", "1:*", "UNSEEN"]]
 
 
 def test_unread_only_with_no_unread_mail_reaches_the_folder_start(monkeypatch):
@@ -223,11 +272,44 @@ def test_has_attachments_alone_takes_the_last_candidates_without_search(monkeypa
     monkeypatch.setattr(
         Mailbox,
         "_filter_attachments",
-        lambda self, imap, uids, has_attachments, limit: candidates.append(uids) or [],
+        lambda self, imap, uids, has_attachments, limit: (
+            candidates.append(list(islice(uids, 500))) or []
+        ),
     )
     box.search(has_attachments=True)
     assert folder.searches == []
     assert candidates == [list(range(2000, 1500, -1))]
+    assert folder.fetches == [(False, "1501:2000", ["UID"])]
+
+
+def test_has_attachments_with_criteria_stops_searching_once_the_limit_matches(monkeypatch):
+    folder = Folder(range(1, 50_001), unread=range(1, 50_001))
+    box = mailbox(folder, monkeypatch)
+    assert uids(box.search(unread=True, has_attachments=True, limit=5)) == list(
+        range(50_000, 49_995, -1)
+    )
+    # One window answers it; the 500 candidates are never searched for.
+    assert folder.searches == [["UID", "49801:*", "UNSEEN"]]
+
+
+def test_has_attachments_checks_at_most_500_candidates(monkeypatch):
+    folder = Folder(range(1, 50_001), unread=range(1, 50_001))
+    box = mailbox(folder, monkeypatch)
+    checked = []
+    real = Mailbox._filter_attachments
+
+    def spy(self, imap, uids, has_attachments, limit):
+        def counted():
+            for uid in uids:
+                checked.append(uid)
+                yield uid
+
+        return real(self, imap, counted(), has_attachments, limit)
+
+    monkeypatch.setattr(Mailbox, "_filter_attachments", spy)
+    assert box.search(unread=True, has_attachments=False, limit=5) == []
+    assert checked == list(range(50_000, 49_500, -1))
+    assert len(folder.searches) == 2
 
 
 def test_rejected_query_falls_back_to_the_last_300_without_search(monkeypatch):
@@ -248,6 +330,32 @@ def test_rejected_query_falls_back_to_the_last_300_without_search(monkeypatch):
     assert box.search("invoice") == []
     assert seen == list(range(1000, 700, -1))
     assert len(folder.searches) == 1
+
+
+def test_rejected_fetch_does_not_fall_back_to_previews(monkeypatch):
+    folder = Folder(range(1, 1001))
+    box = mailbox(folder, monkeypatch)
+
+    def fetch(messages, fields):
+        raise imaplib.IMAP4.error("FETCH command error: BAD")
+
+    folder.fetch = fetch
+    with pytest.raises(imaplib.IMAP4.error, match="FETCH") as raised:
+        box.search("invoice")
+    assert not isinstance(raised.value, mail.SearchRejected)
+    assert folder.searches == []
+
+
+def test_rejected_search_is_still_an_imap_error(monkeypatch):
+    folder = Folder(range(1, 1001))
+    box = mailbox(folder, monkeypatch)
+
+    def search(criteria, charset=None):
+        raise imaplib.IMAP4.error("SEARCH backend error")
+
+    folder.search = search
+    with pytest.raises(imaplib.IMAP4.error, match="backend error"):
+        box.recent(limit=5, unread_only=True)
 
 
 def test_sequence_fetch_restores_use_uid_after_an_error(monkeypatch):

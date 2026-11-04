@@ -16,7 +16,7 @@ import re
 import ssl
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -35,6 +35,7 @@ from email.utils import (
     unquote,
 )
 from html.parser import HTMLParser
+from itertools import islice
 from typing import Any, TypeVar
 
 from imapclient import IMAPClient
@@ -411,9 +412,22 @@ WINDOW_GROWTH = 4
 ATTACHMENT_CANDIDATES = 500
 
 
+class SearchRejected(imaplib.IMAP4.error):
+    """The server refused a SEARCH, as opposed to another command failing."""
+
+
 def _response_int(response: Any, key: bytes) -> int | None:
     value = response.get(key) if isinstance(response, dict) else None
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _search(imap: IMAPClient, criteria: list[Any], charset: str | None) -> list[int]:
+    try:
+        return list(imap.search(criteria, charset=charset) if charset else imap.search(criteria))
+    except imaplib.IMAP4.abort:
+        raise
+    except imaplib.IMAP4.error as exc:
+        raise SearchRejected(*exc.args) from exc
 
 
 def _uids_at(imap: IMAPClient, sequence: str) -> list[int]:
@@ -431,6 +445,88 @@ def _uids_at(imap: IMAPClient, sequence: str) -> list[int]:
     ]
 
 
+def _position_below(imap: IMAPClient, selected: Any, exists: int, before_uid: int) -> int:
+    """How many messages of the folder have a UID below before_uid.
+
+    Paging passes the last UID of a page, so a UID FETCH of before_uid usually
+    gives its sequence number at once. A UID no message has any more (or one above
+    UIDNEXT, which needs no command) is placed by a binary search over sequence
+    numbers, one message per FETCH: about 16 for 50,000 messages, whatever the
+    gaps between UIDs.
+    """
+    uidnext = _response_int(selected, b"UIDNEXT")
+    if exists == 0 or (uidnext is not None and before_uid >= uidnext):
+        return exists
+    seq = _response_int(imap.fetch([before_uid], ["UID"]).get(before_uid), b"SEQ")
+    if seq is not None and 1 <= seq <= exists:
+        return seq - 1
+    low, high = 0, exists  # The answer lies in [low, high].
+    while low < high:
+        middle = (low + high + 1) // 2
+        uids = _uids_at(imap, str(middle))
+        if uids and uids[0] < before_uid:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def iter_newest_uids(
+    imap: IMAPClient,
+    selected: Any,
+    want: int,
+    *,
+    before_uid: int | None = None,
+    criteria: list[Any] | None = None,
+    charset: str | None = None,
+) -> Iterator[int]:
+    """The selected folder's UIDs, newest first, read only as far as they are taken.
+
+    Only UIDs below before_uid count, and with criteria only those SEARCH matches.
+    selected is the SELECT response: from its EXISTS the folder is read in windows
+    of sequence numbers from its end (or from before_uid's place), so the answers
+    and the server's work grow with what is taken, not with the folder, which UID
+    SEARCH ALL lists whole. Without criteria a window's UIDs come from one FETCH,
+    the first window holding `want` messages; criteria are searched within a
+    window's UID range, the first window holding UID_WINDOW messages. Each next
+    window is WINDOW_GROWTH times wider. A response without EXISTS, or selected
+    None, searches the whole folder at once, as before. A refused SEARCH raises
+    SearchRejected.
+    """
+    criteria = criteria or []
+    exists = _response_int(selected, b"EXISTS")
+    if exists is None:
+        scope = _uid_scope(before_uid)
+        if scope is not None:
+            yield from sorted(_search(imap, criteria + scope or ["ALL"], charset), reverse=True)
+        return
+    hi = exists if before_uid is None else _position_below(imap, selected, exists, before_uid)
+    # The highest UID the next window may hold, so a message is never counted twice
+    # and none at or above before_uid is.
+    upper = None if before_uid is None else before_uid - 1
+    size = UID_WINDOW if criteria else max(1, want)
+    while hi >= 1:
+        lo = max(1, hi - size + 1)
+        if criteria:
+            first = [1] if lo == 1 else _uids_at(imap, str(lo))
+            if not first:
+                return
+            low = min(first)
+            if upper is not None and low > upper:
+                uids = []
+            else:
+                span = f"{low}:{'*' if upper is None else upper}"
+                uids = _search(imap, ["UID", span, *criteria], charset)
+        else:
+            uids = _uids_at(imap, f"{lo}:{hi}")
+            if not uids:
+                return
+            low = min(uids)
+        yield from sorted((uid for uid in uids if upper is None or uid <= upper), reverse=True)
+        upper = low - 1 if upper is None else min(upper, low - 1)
+        hi, size = lo - 1, size * WINDOW_GROWTH
+
+
 def newest_uids(
     imap: IMAPClient,
     selected: Any,
@@ -440,71 +536,15 @@ def newest_uids(
     criteria: list[Any] | None = None,
     charset: str | None = None,
 ) -> list[int]:
-    """The newest `want` UIDs of the selected folder, newest first.
-
-    Only UIDs below before_uid count, and with criteria only those SEARCH matches.
-    selected is the SELECT response: from its EXISTS the folder is read in windows
-    from its end, so the answer and the server's work grow with `want`, not with the
-    folder, which UID SEARCH ALL lists whole. Without criteria the last messages'
-    UIDs come from one FETCH by sequence number; criteria are searched within a
-    window's UID range, and windows widen until `want` match or the folder ends.
-    Below before_uid the windows are UID ranges, since a UID's sequence number is
-    not known. A response without EXISTS, or selected None, searches the whole
-    folder at once, as before.
-    """
-    criteria = criteria or []
-    options = {"charset": charset} if charset else {}
-    exists = _response_int(selected, b"EXISTS")
-    if exists is None:
-        scope = _uid_scope(before_uid)
-        if scope is None:
-            return []
-        return sorted(imap.search(criteria + scope or ["ALL"], **options), reverse=True)[:want]
-    found: list[int] = []
-    uidnext = _response_int(selected, b"UIDNEXT")
-    if before_uid is not None and (uidnext is None or before_uid < uidnext):
-        # UID ranges below before_uid: [lo, hi], widening downwards.
-        hi, size = before_uid - 1, max(want, UID_WINDOW)
-        while hi >= 1 and len(found) < want:
-            lo = max(1, hi - size + 1)
-            if criteria:
-                uids = imap.search(["UID", f"{lo}:{hi}", *criteria], **options)
-            else:
-                uids = list(imap.fetch(f"{lo}:{hi}", ["UID"]))
-            found += sorted((uid for uid in uids if lo <= uid <= hi), reverse=True)
-            hi, size = lo - 1, size * WINDOW_GROWTH
-        return found[:want]
-    # Sequence numbers [lo, hi] from the folder's end; `upper` is the highest UID
-    # the next window may hold, so a message is never counted twice.
-    hi, size, upper = exists, UID_WINDOW if criteria else want, None
-    while hi >= 1 and len(found) < want:
-        lo = max(1, hi - size + 1)
-        if criteria:
-            first = _uids_at(imap, str(lo))
-            if not first:
-                break
-            low = min(first)
-            if upper is not None and low > upper:
-                uids = []
-            else:
-                span = f"{low}:{'*' if upper is None else upper}"
-                uids = imap.search(["UID", span, *criteria], **options)
-        else:
-            uids = _uids_at(imap, f"{lo}:{hi}")
-            low = min(uids, default=0)
-        found += sorted(
-            (
-                uid
-                for uid in uids
-                if (upper is None or uid <= upper) and (before_uid is None or uid < before_uid)
+    """The newest `want` UIDs of the selected folder, newest first; see iter_newest_uids."""
+    return list(
+        islice(
+            iter_newest_uids(
+                imap, selected, want, before_uid=before_uid, criteria=criteria, charset=charset
             ),
-            reverse=True,
+            want,
         )
-        if not uids and not criteria:
-            break
-        upper = low - 1 if upper is None else min(upper, low - 1)
-        hi, size = lo - 1, size * WINDOW_GROWTH
-    return found[:want]
+    )
 
 
 def _text_sections(structure: Any) -> tuple[list[tuple[str, str, str, str]], list[AttachmentInfo]]:
@@ -1222,29 +1262,35 @@ class Mailbox:
         if _uid_scope(before_uid) is None:
             return []
         dated = since is not None or before is not None
-        # _filter_attachments checks at most this many candidates.
-        want = limit if has_attachments is None else ATTACHMENT_CANDIDATES
 
         def operation(imap: IMAPClient) -> list[MailSummary]:
             selected = imap.select_folder(folder, readonly=True)
-            try:
-                uids = newest_uids(
+            if has_attachments is not None:
+                # Candidates are searched window by window only as the MIME check
+                # takes them, so it stops searching once `limit` messages match.
+                candidates = iter_newest_uids(
                     imap,
                     None if dated else selected,
-                    want,
+                    ATTACHMENT_CANDIDATES,
                     before_uid=before_uid,
                     criteria=criteria,
                     charset="UTF-8",
                 )
-            except imaplib.IMAP4.abort:
-                raise
-            except imaplib.IMAP4.error:
-                if query is None or criteria != ["TEXT", query] or has_attachments is not None:
+                return self._filter_attachments(imap, candidates, has_attachments, limit)
+            try:
+                uids = newest_uids(
+                    imap,
+                    None if dated else selected,
+                    limit,
+                    before_uid=before_uid,
+                    criteria=criteria,
+                    charset="UTF-8",
+                )
+            except SearchRejected:
+                if query is None or criteria != ["TEXT", query]:
                     raise
                 return self._search_previews(imap, selected, query, limit, before_uid)
-            if has_attachments is None:
-                return self._fetch(imap, uids[:limit], max_body_chars=2000)
-            return self._filter_attachments(imap, uids, has_attachments, limit)
+            return self._fetch(imap, uids, max_body_chars=2000)
 
         return self._read("search", operation)
 
@@ -1268,13 +1314,15 @@ class Mailbox:
         return found
 
     def _filter_attachments(
-        self, imap: IMAPClient, uids: list[int], has_attachments: bool, limit: int
+        self, imap: IMAPClient, uids: Iterable[int], has_attachments: bool, limit: int
     ) -> list[MailSummary]:
-        """Keep messages whose MIME structure matches, scanning at most 500 candidates."""
+        """Keep messages whose MIME structure matches, scanning at most 500 candidates.
+
+        uids are taken 50 at a time, so an iterator is read no further than needed.
+        """
         found: list[MailSummary] = []
-        candidates = uids[:ATTACHMENT_CANDIDATES]
-        for start in range(0, len(candidates), 50):
-            batch = candidates[start : start + 50]
+        candidates = islice(uids, ATTACHMENT_CANDIDATES)
+        while batch := list(islice(candidates, 50)):
             structures = imap.fetch(batch, ["BODYSTRUCTURE"])
             matching = [
                 uid

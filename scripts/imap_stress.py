@@ -1,10 +1,11 @@
 """Stress the IMAP connection pool with read-only calls against a real mailbox.
 
-First measures how the folder's newest UIDs are found: its EXISTS, the time of
-UID SEARCH ALL over the whole folder and of the windowed FETCH by sequence number
-that list_recent_emails uses. Then runs read-only calls one after another, then all
-at once, and reports failures, response times and the pool's warnings about dropped
-sessions. It changes nothing
+Runs read-only calls one after another, then all at once, and reports failures,
+response times and the pool's warnings about dropped sessions. Then measures how the
+folder's newest UIDs are found: its EXISTS, the time of UID SEARCH ALL over the
+whole folder and of the windowed FETCH by sequence number that list_recent_emails
+uses; it runs last so that the long SEARCH cannot affect the calls above. It
+changes nothing
 in the mailbox and prints no message content: only counts, times and the reasons
 the server gave for closing sessions.
 
@@ -166,8 +167,8 @@ def main(argv: list[str] | None = None) -> int:
     logger.propagate = False
     box = Mailbox(settings)
     try:
-        listed = None if args.no_listing else listing(box, args.folder, 5)
         results = run(args, box, log)
+        listed = None if args.no_listing else listing(box, args.folder, 5)
     finally:
         box.close()
 
