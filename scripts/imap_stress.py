@@ -1,7 +1,11 @@
 """Stress the IMAP connection pool with read-only calls against a real mailbox.
 
 Runs read-only calls one after another, then all at once, and reports failures,
-response times and the pool's warnings about dropped sessions. It changes nothing
+response times and the pool's warnings about dropped sessions. Then measures how the
+folder's newest UIDs are found: its EXISTS, the time of UID SEARCH ALL over the
+whole folder and of the windowed FETCH by sequence number that list_recent_emails
+uses; it runs last so that the long SEARCH cannot affect the calls above. It
+changes nothing
 in the mailbox and prints no message content: only counts, times and the reasons
 the server gave for closing sessions.
 
@@ -28,7 +32,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from yandex_mail_mcp.config import Settings
-from yandex_mail_mcp.mail import Mailbox
+from yandex_mail_mcp.mail import Mailbox, newest_uids
 
 
 @dataclass
@@ -58,12 +62,37 @@ def operations(box: Mailbox, folder: str) -> list[tuple[str, Callable[[], Any]]]
     ]
 
 
+def listing(box: Mailbox, folder: str, limit: int) -> dict[str, Any]:
+    """Time both ways of finding the folder's newest UIDs, on one connection each."""
+    result: dict[str, Any] = {"phase": "listing", "folder_exists": None}
+
+    def measure(name: str, find: Callable[[Any, Any], list[int]]) -> None:
+        started = time.monotonic()
+        try:
+            with box.connect(f"stress-{name}", fresh=True) as imap:
+                selected = imap.select_folder(folder, readonly=True)
+                result["folder_exists"] = selected.get(b"EXISTS")
+                uids = find(imap, selected)
+        except Exception as exc:
+            result[name] = {"seconds": round(time.monotonic() - started, 3), "error": exc_name(exc)}
+            return
+        result[name] = {"seconds": round(time.monotonic() - started, 3), "uids": len(uids)}
+
+    measure("search_all", lambda imap, selected: imap.search(["ALL"]))
+    measure("window_fetch", lambda imap, selected: newest_uids(imap, selected, limit))
+    return result
+
+
+def exc_name(exc: BaseException) -> str:
+    return type(exc).__name__
+
+
 def timed(name: str, operation: Callable[[], Any]) -> Call:
     started = time.monotonic()
     try:
         operation()
     except Exception as exc:
-        return Call(name, time.monotonic() - started, type(exc).__name__)
+        return Call(name, time.monotonic() - started, exc_name(exc))
     return Call(name, time.monotonic() - started, None)
 
 
@@ -117,6 +146,11 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="seconds between sequential calls, to let idle sessions age (default 0)",
     )
+    parser.add_argument(
+        "--no-listing",
+        action="store_true",
+        help="skip timing UID SEARCH ALL against the windowed FETCH",
+    )
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     args = parser.parse_args(argv)
     if args.count < 1:
@@ -134,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
     box = Mailbox(settings)
     try:
         results = run(args, box, log)
+        listed = None if args.no_listing else listing(box, args.folder, 5)
     finally:
         box.close()
 
@@ -152,11 +187,22 @@ def main(argv: list[str] | None = None) -> int:
         result["log"] = [
             f"{r.levelname} {r.getMessage()}" for r in records if r.levelno >= logging.INFO
         ]
-    report = {"pool_size": settings.imap_pool_size, "phases": results}
+    report: dict[str, Any] = {"pool_size": settings.imap_pool_size, "phases": results}
+    if listed is not None:
+        report["listing"] = listed
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
         print(f"IMAP pool size: {settings.imap_pool_size}")
+        if listed is not None:
+            print(f"\n{args.folder}: EXISTS {listed['folder_exists']}")
+            for name, label in (
+                ("search_all", "UID SEARCH ALL"),
+                ("window_fetch", "last 5 UIDs by windowed FETCH"),
+            ):
+                item = listed[name]
+                outcome = item.get("error") or f"{item['uids']} UIDs"
+                print(f"  {label}: {item['seconds']} s, {outcome}")
         for result in results:
             print(
                 f"\n{result['phase']}: {result['calls']} calls, {result['failures']} failed "
