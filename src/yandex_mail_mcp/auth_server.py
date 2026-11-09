@@ -533,18 +533,24 @@ class YandexAuthProvider(
     def _same_origin(self, request: Request) -> bool:
         """Whether a form was posted from a page of this server.
 
-        Modern browsers send Sec-Fetch-Site, which pages cannot set and referrer
-        policies do not touch: "same-origin" is this server's own page, anything else
-        (a sibling subdomain is "same-site") is refused. A Referrer-Policy of
-        no-referrer, from the browser or a reverse proxy, makes Origin "null" and drops
-        Referer, so Sec-Fetch-Site is what still identifies this server's page then.
-        Without it, Origin decides, and Referer stands in when a privacy setting drops
-        Origin. Without either, the request is refused.
+        Origin decides: it must be the public URL. Referer stands in when a privacy
+        setting drops Origin. Without either, the request is refused.
+
+        Modern browsers also send Sec-Fetch-Site, which pages cannot set and referrer
+        policies do not touch. Anything but "same-origin" is refused, whatever Origin
+        says (a sibling subdomain is "same-site"). A Referrer-Policy of no-referrer,
+        from the browser or a reverse proxy, makes Origin "null" and drops Referer;
+        then "same-origin" alone identifies this server's page. A concrete Origin must
+        still be the public URL. Browsers send Sec-Fetch-Site only over HTTPS and to
+        localhost.
         """
         fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
-        if fetch_site:
-            return fetch_site == "same-origin"
-        source = request.headers.get("origin") or request.headers.get("referer") or ""
+        if fetch_site and fetch_site != "same-origin":
+            return False
+        origin = request.headers.get("origin", "").strip()
+        if fetch_site and origin in {"", "null"}:
+            return True
+        source = origin or request.headers.get("referer") or ""
         actual = _origin(source)
         return actual is not None and actual == _origin(self.public_url)
 

@@ -253,6 +253,22 @@ def posted(headers):
         ({"origin": "https://mail.example.com:99999"}, False),
         ({"origin": "javascript:alert(1)"}, False),
         ({}, False),
+        # Sec-Fetch-Site: "same-origin" stands in for a nulled or missing Origin only.
+        ({"sec-fetch-site": "same-origin", "origin": "null"}, True),
+        ({"sec-fetch-site": "same-origin"}, True),
+        ({"sec-fetch-site": " Same-Origin ", "origin": "null"}, True),
+        ({"sec-fetch-site": "same-origin", "origin": "https://mail.example.com"}, True),
+        ({"sec-fetch-site": "same-origin", "origin": "https://evil.example.com"}, False),
+        ({"sec-fetch-site": "same-origin", "origin": "http://mail.example.com"}, False),
+        # Anything else is refused, whatever Origin says.
+        ({"sec-fetch-site": "same-site", "origin": "https://mail.example.com"}, False),
+        ({"sec-fetch-site": "cross-site", "origin": "https://mail.example.com"}, False),
+        ({"sec-fetch-site": "none", "origin": "https://mail.example.com"}, False),
+        ({"sec-fetch-site": "same-site", "origin": "null"}, False),
+        ({"sec-fetch-site": "unknown", "origin": "https://mail.example.com"}, False),
+        # An empty header is no header: Origin decides as before.
+        ({"sec-fetch-site": "", "origin": "https://mail.example.com"}, True),
+        ({"sec-fetch-site": "", "origin": "null"}, False),
     ],
 )
 def test_same_origin_matches_only_the_public_url(provider_at, headers, same):
@@ -300,12 +316,17 @@ def test_fetch_metadata_other_than_same_origin_changes_nothing(monkeypatch, fetc
     async def scenario(flow, park):
         url = await park()
         token = token_of(await flow.client.get(url))
-        return await flow.client.post(
+        forged = await flow.client.post(
             url,
             data={"decision": "approve", "csrf": token},
             headers={"Origin": PUBLIC, "Sec-Fetch-Site": fetch_site},
         )
+        # The change still waits for the user, who can approve it from the page.
+        later = await decide(flow.client, url, "approve")
+        return forged, later
 
-    response, imap = run(scenario, monkeypatch)
-    assert response.status_code == 403
-    assert imap.changes == []
+    (forged, later), imap = run(scenario, monkeypatch)
+    assert forged.status_code == 403
+    assert "did not come from this server" in forged.text
+    assert "Done." in later.text
+    assert imap.changes == [("move", [3], "github")], "once, from the page"
