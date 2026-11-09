@@ -533,11 +533,24 @@ class YandexAuthProvider(
     def _same_origin(self, request: Request) -> bool:
         """Whether a form was posted from a page of this server.
 
-        Browsers send Origin with every POST; Referer stands in when a privacy setting
-        drops it. Without either, the request is refused. A sibling subdomain of the
-        same site carries the user's SameSite=Lax cookie, but not this origin.
+        Origin decides: it must be the public URL. Referer stands in when a privacy
+        setting drops Origin. Without either, the request is refused.
+
+        Modern browsers also send Sec-Fetch-Site, which pages cannot set and referrer
+        policies do not touch. Anything but "same-origin" is refused, whatever Origin
+        says (a sibling subdomain is "same-site"). A Referrer-Policy of no-referrer,
+        from the browser or a reverse proxy, makes Origin "null" and drops Referer;
+        then "same-origin" alone identifies this server's page. A concrete Origin must
+        still be the public URL. Browsers send Sec-Fetch-Site only over HTTPS and to
+        localhost.
         """
-        source = request.headers.get("origin") or request.headers.get("referer") or ""
+        fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+        if fetch_site and fetch_site != "same-origin":
+            return False
+        origin = request.headers.get("origin", "").strip()
+        if fetch_site and origin in {"", "null"}:
+            return True
+        source = origin or request.headers.get("referer") or ""
         actual = _origin(source)
         return actual is not None and actual == _origin(self.public_url)
 
@@ -725,7 +738,14 @@ class YandexAuthProvider(
         # subdomain gets it too. The decision must come from this server's own page,
         # opened in this browser for this change.
         if not self._same_origin(request):
-            LOG.warning("Confirmation %s refused: posted from another origin", pending.name)
+            LOG.warning(
+                "Confirmation %s refused: posted from another origin "
+                "(Sec-Fetch-Site=%r, Origin=%r, Referer present=%s)",
+                pending.name,
+                request.headers.get("sec-fetch-site"),
+                request.headers.get("origin"),
+                "referer" in request.headers,
+            )
             return _page(
                 "This decision did not come from this server's confirmation page. "
                 "Nothing was changed; open the link from the assistant and decide there.",
