@@ -533,10 +533,17 @@ class YandexAuthProvider(
     def _same_origin(self, request: Request) -> bool:
         """Whether a form was posted from a page of this server.
 
-        Browsers send Origin with every POST; Referer stands in when a privacy setting
-        drops it. Without either, the request is refused. A sibling subdomain of the
-        same site carries the user's SameSite=Lax cookie, but not this origin.
+        Modern browsers send Sec-Fetch-Site, which pages cannot set and referrer
+        policies do not touch: "same-origin" is this server's own page, anything else
+        (a sibling subdomain is "same-site") is refused. A Referrer-Policy of
+        no-referrer, from the browser or a reverse proxy, makes Origin "null" and drops
+        Referer, so Sec-Fetch-Site is what still identifies this server's page then.
+        Without it, Origin decides, and Referer stands in when a privacy setting drops
+        Origin. Without either, the request is refused.
         """
+        fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+        if fetch_site:
+            return fetch_site == "same-origin"
         source = request.headers.get("origin") or request.headers.get("referer") or ""
         actual = _origin(source)
         return actual is not None and actual == _origin(self.public_url)
@@ -725,7 +732,14 @@ class YandexAuthProvider(
         # subdomain gets it too. The decision must come from this server's own page,
         # opened in this browser for this change.
         if not self._same_origin(request):
-            LOG.warning("Confirmation %s refused: posted from another origin", pending.name)
+            LOG.warning(
+                "Confirmation %s refused: posted from another origin "
+                "(Sec-Fetch-Site=%r, Origin=%r, Referer present=%s)",
+                pending.name,
+                request.headers.get("sec-fetch-site"),
+                request.headers.get("origin"),
+                "referer" in request.headers,
+            )
             return _page(
                 "This decision did not come from this server's confirmation page. "
                 "Nothing was changed; open the link from the assistant and decide there.",

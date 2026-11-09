@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.4
+
+### Fixed
+
+- A browser confirmation could be refused with "This decision did not come from this server's confirmation page" although the user pressed Approve on this server's own page. The check accepted only an `Origin` or `Referer` of the public URL, and a `Referrer-Policy: no-referrer`, set by a reverse proxy or by a browser privacy setting or extension, makes the browser post the form with `Origin: null` and no `Referer`. The check now reads `Sec-Fetch-Site` first, which the browser sets itself, pages cannot change and referrer policies leave alone: `same-origin` passes, `same-site` (a sibling subdomain), `cross-site` and `none` are refused. Without it, `Origin` and `Referer` decide as before.
+- A refused confirmation logs the `Sec-Fetch-Site` and `Origin` it saw and whether a `Referer` came, so the cause of a refusal shows in the log.
+
 ## 0.8.3
 
 ### Fixed

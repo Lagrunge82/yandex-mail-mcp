@@ -271,3 +271,41 @@ def test_same_origin_matches_only_the_public_url(provider_at, headers, same):
 def test_default_port_written_out_or_not_is_the_same_origin(provider_at, public_url, origin):
     provider = provider_at(public_url)
     assert provider._same_origin(posted({"origin": origin}))
+
+
+def test_same_origin_fetch_metadata_passes_when_a_referrer_policy_nulls_origin(monkeypatch):
+    """Referrer-Policy: no-referrer (browser setting or reverse proxy) makes a browser
+    post its own page's form with Origin: null and no Referer; Sec-Fetch-Site still
+    says the form came from this server's page."""
+
+    async def scenario(flow, park):
+        url = await park()
+        token = token_of(await flow.client.get(url))
+        return await flow.client.post(
+            url,
+            data={"decision": "approve", "csrf": token},
+            headers={"Origin": "null", "Sec-Fetch-Site": "same-origin"},
+        )
+
+    response, imap = run(scenario, monkeypatch)
+    assert "Done." in response.text
+    assert imap.changes == [("move", [3], "github")]
+
+
+@pytest.mark.parametrize("fetch_site", ["same-site", "cross-site", "none"])
+def test_fetch_metadata_other_than_same_origin_changes_nothing(monkeypatch, fetch_site):
+    """A sibling subdomain is same-site: it gets the Lax cookie, but not the decision,
+    even if it could somehow present this server's Origin."""
+
+    async def scenario(flow, park):
+        url = await park()
+        token = token_of(await flow.client.get(url))
+        return await flow.client.post(
+            url,
+            data={"decision": "approve", "csrf": token},
+            headers={"Origin": PUBLIC, "Sec-Fetch-Site": fetch_site},
+        )
+
+    response, imap = run(scenario, monkeypatch)
+    assert response.status_code == 403
+    assert imap.changes == []
